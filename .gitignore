@@ -1,0 +1,52 @@
+# Secrets & credentials
+.env
+.env.*
+*.env
+credentials
+*.pem
+*.key
+*.token
+secrets/
+*secret*
+
+# AWS credentials
+.aws/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Cache & checkpoints
+*.cache
+*.cache.json
+.silver_keys_cache.json
+.silver_manifest_cache.json
+.silver_checkpoint.json
+*_checkpoint.json
+.backfill_checkpoint*.json
+
+# Backup files
+*.bak
+
+# Sample/test data
+sample_*.pdf
+
+# Output / generated data
+*.par
