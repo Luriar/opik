@@ -15,7 +15,6 @@ import argparse
 import asyncio
 import json
 import logging
-import os
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
@@ -23,10 +22,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-import boto3
 import fitz
-from botocore.config import Config
 from botocore.exceptions import ClientError
+
+from opik_config import S3_BUCKET, S3_REGION, load_dotenv
+from opik_s3 import s3
+
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,15 +37,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("opik.silver")
 
-S3_BUCKET = os.getenv("S3_BUCKET", "s3-opik-bucket")
-S3_REGION = os.getenv("S3_REGION", "ap-northeast-2")
 CHECKPOINT_FILE = Path(__file__).parent / ".silver_checkpoint.json"
 MANIFEST_CACHE_FILE = Path(__file__).parent / ".silver_manifest_cache.json"
-
-s3 = boto3.client(
-    "s3", region_name=S3_REGION,
-    config=Config(max_pool_connections=50),
-)
 
 
 def silver_key(meta: dict) -> str:
@@ -386,3 +381,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+                                                                                                                                                                      

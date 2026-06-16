@@ -10,11 +10,11 @@
 ### Phase 1 — 단방향 시황 브리핑 (MVP)
 당일 DART 공시 + 증권사 신규 리포트가 나온 종목만 추출 → LLM이 평어로 요약 → 주가 예측 모델 → 브리핑 전달.
 
-### Phase 2 — 일일 배치 스코어링 및 추천
-장 마감 후 야간 배치로 종목별 종합 점수(a+b+c) 산출 → 장 시작 전 추천 종목 제공.
+### Phase 2 — 일일 배치 스코어링, 추천, 양방향 QA 챗봇
+장 마감 후 야간 배치로 종목별 종합 점수(a+b+c) 산출 → 장 시작 전 추천 종목 제공. 임베딩 기반 RAG 검색으로 증권사 리포트에 대한 양방향 QA 챗봇.
 
 ### Phase 3 — 실시간 AI 주식 비서
-실시간 모니터링, 즉시 스코어링, 선제적 푸시 알림, 양방향 QA 챗봇.
+실시간 모니터링, 즉시 스코어링, 선제적 푸시 알림.
 
 ## 팀 역할 분담
 
@@ -112,25 +112,31 @@ opik/
 │   └── koreainvest.py        # 한국투자증권 수집기
 ├── upload_naver.py           # 네이버 → S3 Bronze
 ├── upload_koreainvest.py     # 한국투자증권 → S3 Bronze
-├── extract_silver.py         # Bronze → Silver
-├── extract_gold_structured.py  # Silver → Gold Structured (정규식 추출)
+├── extract_silver.py               # Bronze → Silver
+├── extract_gold_structured.py      # Silver → Gold Structured (정규식 추출)
+├── extract_gold_llm.py             # Silver → Gold LLM (Haiku: reason/risks/keywords)
+├── telegram_briefing.py            # Gold → 텔레그램 HTML 브리핑 (Structured + LLM 통합)
 ├── spark_jobs/
-│   ├── spark_silver_to_delta.py      # Parquet → Delta Lake MERGE
-│   └── spark_compute_scores.py       # 3-way JOIN + 종합 점수 계산
+│   ├── spark_silver_to_delta.py    # Parquet → Delta Lake MERGE (Phase 2b)
+│   └── spark_compute_scores.py     # 3-way JOIN + 종합 점수 계산 (Phase 2b)
 ├── dags/
-│   └── nightly_batch.py              # Airflow DAG (16:00 daily)
-├── PHASE1_DESIGN.md               # Phase 1 전체 설계 (로컬 VM, 수동 실행, Medallion)
-├── PHASE2_DESIGN.md               # Phase 2 전체 설계 (EC2/Airflow/Spark/LLM/스코어링/텔레그램)
-├── DART_PIPELINE_DESIGN.md        # DART 공시 Bronze→Silver→Gold 재설계 (상용님 파트)
-├── HOW_BRONZE_TO_SILVER_WORKS.md   # Bronze→Silver 파이프라인 문서
-├── HOW_SILVER_TO_GOLD_WORKS.md     # Silver→Gold 파이프라인 문서
-├── debug_pdf.py              # PDF URL 도메인 진단
-├── check_silver.py           # Silver 적재 확인
-├── check_silver_quality.py   # Silver 품질 검증
-└── ARCHITECTURE.md           # 이 문서
+│   └── nightly_batch.py            # Airflow DAG (16:00 daily, 8-task)
+├── README.md                       # 프로젝트 개요, 로드맵, 설치
+├── PHASE1_DESIGN.md                # Phase 1 전체 설계
+├── PHASE2_DESIGN.md                # Phase 2 전체 설계 (EC2/Airflow/Spark/Delta)
+├── DART_PIPELINE_DESIGN.md         # DART 공시 파이프라인 재설계
+├── HOW_BRONZE_TO_SILVER_WORKS.md   # Bronze→Silver 상세
+├── HOW_SILVER_TO_GOLD_WORKS.md     # Silver→Gold 상세
+├── DEVELOPMENT_LOG.md              # 개발 패턴 회고
+├── debug_pdf.py                    # PDF URL 도메인 진단
+├── check_silver.py                 # Silver 적재 확인
+├── check_silver_quality.py         # Silver 품질 검증
+├── _batch_run.py                   # 배치 실행 스크립트
+├── requirements.txt                # Python 의존성
+└── ARCHITECTURE.md                 # 이 문서
 ```
 
-## 현재 상태 (2026-06-13)
+## 현재 상태 (2026-06-15)
 
 | 레이어 | 상태 |
 |--------|------|
@@ -138,10 +144,11 @@ opik/
 | Bronze - 한국투자증권 | 완료 (~30,000건) |
 | Bronze - LS증권 | 보류 (로그인 필요) |
 | Silver | 완료 (51,294건, 2020~2026) |
-| Gold - Structured | 완료 (51,294건, 정규식 추출, Opinion 90.8% / TP 75.0% / Code 87.5%) |
-| Gold - LLM | 예정 (Haiku: reason, risks, keywords, implied TP) |
+| Gold - Structured | 완료 (51,294건, 정규식, Opinion 90.8% / TP 75.0% / Code 87.5%) |
+| Gold - LLM | 완료 (72개월, Haiku: reason/risks/keywords/embedding 384d, 커버리지 97%) |
+| 텔레그램 브리핑 | 완료 (Structured + LLM 통합 HTML 브리핑) |
 | Phase 1 - 전체 파이프라인 | 완료 ([PHASE1_DESIGN.md](PHASE1_DESIGN.md)) |
 | Phase 2 - 설계 | 완료 ([PHASE2_DESIGN.md](PHASE2_DESIGN.md)) |
-| DART - 설계 | 완료 ([DART_PIPELINE_DESIGN.md](DART_PIPELINE_DESIGN.md)) — Bronze 재설계 단계 |
-| 챗봇 | 설계 완료 ([PHASE2_DESIGN.md](PHASE2_DESIGN.md)) |
-| Phase 2 구현 | Phase 2a EC2+Airflow+텔레그램 배포 예정 |
+| Phase 2 - Airflow DAG | 완료 ([dags/nightly_batch.py](dags/nightly_batch.py)) |
+| Phase 2 - Spark jobs | 스켈레톤 완료 (Phase 2b EC2 배포 시 활성화) |
+| DART - 설계 | 완료 ([DART_PIPELINE_DESIGN.md](DART_PIPELINE_DESIGN.md)) — 상용님 구현 중 |

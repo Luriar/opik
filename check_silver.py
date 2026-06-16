@@ -1,9 +1,13 @@
 """Silver 추출 결과 확인"""
-import boto3, json, os
+import json
 from collections import defaultdict
 
-s3 = boto3.client("s3", region_name=os.getenv("S3_REGION", "ap-northeast-2"))
-BUCKET = os.getenv("S3_BUCKET", "s3-opik-bucket")
+from opik_config import S3_BUCKET, S3_REGION, load_dotenv
+from opik_s3 import get_s3_client
+
+load_dotenv()
+s3 = get_s3_client()
+BUCKET = S3_BUCKET
 
 # silver 아래 키 수집
 by_firm = defaultdict(lambda: {"count": 0, "total_text_len": 0, "ocr_needed": 0, "sample_text": ""})
@@ -54,4 +58,4 @@ try:
         ocr_count += len(data)
 except:
     pass
-print(f"\nOCR 필요: {ocr_count}건")
+print(f"\nOCR 필요: {ocr_coun

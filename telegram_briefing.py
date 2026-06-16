@@ -1,11 +1,12 @@
 """OPIK -- Telegram Daily Briefing
 
-Gold Structured Parquet -> format -> Telegram API (HTML)
+Gold Structured Parquet + LLM Gold (embeddings) -> format -> Telegram API (HTML)
 
 Usage:
     python telegram_briefing.py                    # latest date
     python telegram_briefing.py --date 2026-06-12  # specific date
     python telegram_briefing.py --dry-run           # print only, no send
+    python telegram_briefing.py --no-llm            # structured only, skip LLM join
 
 Env vars: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
 """
@@ -14,16 +15,17 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import logging
-import os
 import sys
-from pathlib import Path
 
-import boto3
+import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 import requests
-from botocore.config import Config
+
+from opik_config import S3_BUCKET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, load_dotenv
+from opik_s3 import get_s3_client
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,63 +34,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger("opik.telegram")
 
-S3_BUCKET = os.getenv("S3_BUCKET", "s3-opik-bucket")
-S3_REGION = os.getenv("S3_REGION", "ap-northeast-2")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 TELEGRAM_MAX_LEN = 4000
 
-s3 = boto3.client("s3", region_name=S3_REGION, config=Config(max_pool_connections=10))
+s3 = get_s3_client(max_pool_connections=10)
 
 
-def _list_gold_prefixes(depth: int = 1) -> list[str]:
-    """List gold/structured/ prefixes in S3.
-    depth=1: year-level (year=2026/)
-    depth=2: month-level (year=2026/month=06/)
-    """
-    prefixes = []
-    paginator = s3.get_paginator("list_objects_v2")
-    for page in paginator.paginate(
-        Bucket=S3_BUCKET, Prefix="gold/structured/", Delimiter="/"
-    ):
-        for p in page.get("CommonPrefixes", []):
-            if depth == 1:
-                prefixes.append(p["Prefix"])
-            else:
-                # Go one level deeper for each year prefix
-                sub = s3.get_paginator("list_objects_v2")
-                for sp in sub.paginate(Bucket=S3_BUCKET, Prefix=p["Prefix"], Delimiter="/"):
-                    for sp2 in sp.get("CommonPrefixes", []):
-                        prefixes.append(sp2["Prefix"])
-    return sorted(prefixes)
-
-
-def load_gold(date: str | None = None) -> tuple[pd.DataFrame, str]:
-    """Load Gold Structured Parquet for a specific or latest date.
-    Returns (dataframe, resolved_date_string).
-    Only loads the target month's parquet.
-    """
-
-    # Determine which month to load
-    if date:
-        target_prefix = f"gold/structured/year={date[:4]}/month={date[5:7]}/"
-    else:
-        # Find latest month
-        month_prefixes = _list_gold_prefixes(depth=2)
-        if not month_prefixes:
-            raise RuntimeError("No Gold Parquet files found")
-        target_prefix = month_prefixes[-1]
-
-    # Load parquet for target month only
+def _load_parquet_month(prefix: str) -> pd.DataFrame:
+    """Load all parquet files under a given S3 prefix."""
     keys = []
     paginator = s3.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=target_prefix):
+    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
         for obj in page.get("Contents", []):
             if obj["Key"].endswith(".parquet"):
                 keys.append(obj["Key"])
 
     if not keys:
-        raise RuntimeError(f"No parquet files found at {target_prefix}")
+        raise RuntimeError(f"No parquet files found at {prefix}")
 
     dfs = []
     for key in keys:
@@ -99,33 +60,151 @@ def load_gold(date: str | None = None) -> tuple[pd.DataFrame, str]:
         dfs.append(df)
         logger.info(f"Loaded {key}: {len(df)} rows")
 
-    full = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+    return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+
+
+def _find_latest_month(prefix_base: str) -> str:
+    """Find the latest year=YYYY/month=MM/ prefix under prefix_base."""
+    paginator = s3.get_paginator("list_objects_v2")
+    year_prefixes = []
+    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix_base, Delimiter="/"):
+        for p in page.get("CommonPrefixes", []):
+            year_prefixes.append(p["Prefix"])
+
+    if not year_prefixes:
+        raise RuntimeError(f"No data found at {prefix_base}")
+
+    latest_year = sorted(year_prefixes)[-1]
+    month_prefixes = []
+    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=latest_year, Delimiter="/"):
+        for p in page.get("CommonPrefixes", []):
+            month_prefixes.append(p["Prefix"])
+
+    if not month_prefixes:
+        raise RuntimeError(f"No months found at {latest_year}")
+
+    return sorted(month_prefixes)[-1]
+
+
+def load_gold_structured(date: str | None = None) -> tuple[pd.DataFrame, str]:
+    """Load Gold Structured Parquet, filtered to target date.
+
+    Returns (dataframe, resolved_date_string).
+    """
+    if date:
+        target_prefix = f"gold/structured/year={date[:4]}/month={date[5:7]}/"
+    else:
+        target_prefix = _find_latest_month("gold/structured/")
+
+    full = _load_parquet_month(target_prefix)
     if len(full) == 0:
         return pd.DataFrame(), ""
 
-    # Normalize dates (2026.06.12 -> 2026-06-12)
-    full["발행일_clean"] = full["발행일"].str.replace(".", "-", regex=False)
+    # Normalize dates
+    full["_date_clean"] = full["발행일"].str.replace(".", "-", regex=False)
 
-    # Filter to target date
     if date:
-        full = full[full["발행일_clean"] == date]
+        full = full[full["_date_clean"] == date]
         if len(full) == 0:
             logger.warning(f"No reports for {date}")
             return pd.DataFrame(), date
         result_date = date
     else:
-        result_date = max(full["발행일_clean"].unique())
-        full = full[full["발행일_clean"] == result_date]
+        result_date = max(full["_date_clean"].unique())
+        full = full[full["_date_clean"] == result_date]
 
-    logger.info(
-        f"Date {result_date}: {len(full)} reports from {full['증권사'].nunique()} firms"
-    )
+    n_firms = full["증권사"].nunique()
+    logger.info(f"Date {result_date}: {len(full)} reports from {n_firms} firms")
     return full, result_date
 
 
-def format_briefing(df: pd.DataFrame, date: str) -> str:
-    """Format briefing as Telegram HTML."""
+def load_gold_llm(date: str) -> pd.DataFrame:
+    """Load Gold LLM (embeddings) Parquet for a specific date."""
+    target_prefix = f"gold/embeddings/year={date[:4]}/month={date[5:7]}/"
 
+    try:
+        df = _load_parquet_month(target_prefix)
+    except RuntimeError:
+        logger.warning(f"No LLM Gold data at {target_prefix}")
+        return pd.DataFrame()
+
+    logger.info(f"LLM Gold loaded: {len(df)} rows")
+    return df
+
+
+def join_structured_llm(df_s, df_l):
+    """Left-join structured with LLM Gold on report_id.
+
+    Returns (merged_df, llm_stats).
+    """
+    if df_l.empty:
+        llm_stats = {"total": len(df_s), "matched": 0, "with_reason": 0,
+                      "with_risks": 0, "with_keywords": 0}
+        for col in ["reason", "risks", "keywords"]:
+            df_s[col] = None
+        return df_s, llm_stats
+
+    need_cols = ["report_id", "reason", "risks", "keywords"]
+    avail = [c for c in need_cols if c in df_l.columns]
+    merged = df_s.merge(df_l[avail], on="report_id", how="left")
+
+    llm_stats = {
+        "total": len(df_s),
+        "matched": int(merged["report_id"].isin(df_l["report_id"]).sum()),
+        "with_reason": int(merged["reason"].notna().sum()),
+        "with_risks": int(merged["risks"].notna().sum()),
+        "with_keywords": int(merged["keywords"].notna().sum()),
+    }
+
+    logger.info(
+        f"LLM join: {llm_stats['matched']}/{llm_stats['total']} matched, "
+        f"reason={llm_stats['with_reason']}, risks={llm_stats['with_risks']}, "
+        f"keywords={llm_stats['with_keywords']}"
+    )
+    return merged, llm_stats
+
+
+def _safe_list(val):
+    """Convert risks/keywords from various formats to a Python list."""
+    if val is None:
+        return []
+    try:
+        if isinstance(val, np.ndarray):
+            return val.tolist()
+    except Exception:
+        pass
+    if isinstance(val, list):
+        return val
+    if isinstance(val, str):
+        try:
+            result = json.loads(val)
+            if isinstance(result, list):
+                return result
+        except Exception:
+            pass
+        return [val]
+    try:
+        return list(val)
+    except Exception:
+        return [str(val)]
+
+
+def _escape_html(text):
+    """Escape HTML special chars for Telegram HTML parse_mode."""
+    if not text:
+        return ""
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _truncate(text, max_len=120):
+    """Truncate text to max_len chars, adding ellipsis if cut."""
+    if not text or len(text) <= max_len:
+        return _escape_html(text or "")
+    return _escape_html(text[:max_len].rsplit(" ", 1)[0]) + "..."
+
+
+def format_briefing(df, date, llm_stats=None):
+    """Format integrated briefing as Telegram HTML."""
     total = len(df)
     buy = int((df["투자의견"] == "BUY").sum())
     hold = int((df["투자의견"] == "HOLD").sum())
@@ -137,7 +216,9 @@ def format_briefing(df: pd.DataFrame, date: str) -> str:
     tp_count = int(df["목표주가"].notna().sum())
     tp_rate = tp_count / total * 100 if total > 0 else 0
 
-    with_upside = df[df["상승여력_pct"].notna()].sort_values(
+    has_llm = llm_stats and llm_stats.get("with_reason", 0) > 0
+
+    upside = df[df["상승여력_pct"].notna()].sort_values(
         "상승여력_pct", ascending=False
     )
 
@@ -150,47 +231,69 @@ def format_briefing(df: pd.DataFrame, date: str) -> str:
         f"Total <b>{total}</b> reports from {firms} firms",
         f"BUY {buy} / HOLD {hold} / SELL {sell} / NR {nr} / null {null_op}",
         f"TP extracted: {tp_count}/{total} ({tp_rate:.0f}%)",
-        "",
     ]
 
-    if len(with_upside) > 0:
-        lines.append("<b>Top Upside</b>")
-        for _, row in with_upside.head(10).iterrows():
-            name = str(row["종목명"])
-            firm = row["증권사"]
-            up = row["상승여력_pct"]
-            op = row["투자의견"] if pd.notna(row["투자의견"]) else "N/A"
-            tp = int(row["목표주가"]) if pd.notna(row["목표주가"]) else 0
-            cp = int(row["현재주가"]) if pd.notna(row["현재주가"]) else 0
-            tp_str = f"{tp:,}" if tp else "-"
-            cp_str = f"{cp:,}" if cp else "-"
-            lines.append(
-                f"  <b>{name}</b> ({firm}, {op}) TP={tp_str} CP={cp_str} upside=<b>{up:+.1f}%</b>"
-            )
-        lines.append("")
+    if llm_stats:
+        lines.append(
+            f"LLM: {llm_stats['matched']}/{total} matched "
+            f"(reason {llm_stats['with_reason']}, "
+            f"risks {llm_stats['with_risks']}, "
+            f"kw {llm_stats['with_keywords']})"
+        )
 
-    lines.append("<b>By Firm</b>")
-    for firm, cnt in firm_counts.items():
-        lines.append(f"  {firm}: {cnt}")
     lines.append("")
 
+    # Top Upside with LLM insights
+    if len(upside) > 0:
+        lines.append("<b>Top Picks (by upside)</b>")
+        for _, row in upside.head(8).iterrows():
+            name = _escape_html(row["종목명"])
+            firm = _escape_html(row["증권사"])
+            up_pct = row["상승여력_pct"]
+            op = row["투자의견"] if pd.notna(row["투자의견"]) else "N/A"
+            tp_val = int(row["목표주가"]) if pd.notna(row["목표주가"]) else 0
+            cp_val = int(row["현재주가"]) if pd.notna(row["현재주가"]) else 0
+            tp_s = f"{tp_val:,}" if tp_val else "-"
+            cp_s = f"{cp_val:,}" if cp_val else "-"
+
+            lines.append(
+                f"  <b>{name}</b> ({firm}, {op}) "
+                f"TP={tp_s} CP={cp_s} upside=<b>{up_pct:+.1f}%</b>"
+            )
+
+            # Reason from LLM (full text, no truncation)
+            if has_llm and pd.notna(row.get("reason")):
+                reason = _escape_html(str(row["reason"]))
+                if reason:
+                    lines.append(f"    {reason}")
+
+            # Risks from LLM
+            risks = _safe_list(row.get("risks"))
+            if risks:
+                risk_s = ", ".join(_escape_html(r) for r in risks[:2])
+                lines.append(f"    Risks: {risk_s}")
+
+        lines.append("")
+
+    # By Firm
+    lines.append("<b>By Firm</b>")
+    for firm, cnt in firm_counts.items():
+        lines.append(f"  {_escape_html(firm)}: {cnt}")
+    lines.append("")
+
+    # Stocks covered
     names = df[df["종목명"].notna()]["종목명"].unique()
     if len(names) <= 30:
         lines.append(f"<b>Stocks covered ({len(names)})</b>")
-        names_str = ", ".join(str(n) for n in names)
-        lines.append(names_str)
+        names_s = ", ".join(_escape_html(str(n)) for n in names if str(n).strip())
+        lines.append(names_s)
 
     return "\n".join(lines)
 
 
-def send_telegram(
-    text: str,
-    token: str = TELEGRAM_BOT_TOKEN,
-    chat_id: str = TELEGRAM_CHAT_ID,
-    max_len: int = TELEGRAM_MAX_LEN,
-):
+def send_telegram(text, token=TELEGRAM_BOT_TOKEN, chat_id=TELEGRAM_CHAT_ID,
+                  max_len=TELEGRAM_MAX_LEN):
     """Send HTML message via Telegram. Split if over max_len."""
-
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     chunks = _split_text(text, max_len)
 
@@ -205,19 +308,19 @@ def send_telegram(
         data = resp.json()
 
         if data.get("ok"):
-            logger.info(f"Sent chunk {i+1}/{len(chunks)}: msg_id={data['result']['message_id']}")
+            mid = data["result"]["message_id"]
+            logger.info(f"Sent chunk {i+1}/{len(chunks)}: msg_id={mid}")
         else:
             logger.error(f"Telegram error (chunk {i+1}): {data}")
-            # Fallback: plain text
             payload["parse_mode"] = ""
             resp2 = requests.post(url, json=payload, timeout=10)
             if resp2.json().get("ok"):
-                logger.info(f"Sent chunk {i+1}/{len(chunks)} as plain text (fallback)")
+                logger.info(f"Sent chunk {i+1}/{len(chunks)} as plain text")
             else:
-                logger.error(f"Fallback also failed: {resp2.json()}")
+                logger.error(f"Fallback failed: {resp2.json()}")
 
 
-def _split_text(text: str, max_len: int) -> list[str]:
+def _split_text(text, max_len):
     """Split text on newline boundaries, each under max_len."""
     chunks = []
     while len(text) > max_len:
@@ -235,31 +338,36 @@ def main():
     parser = argparse.ArgumentParser(description="OPIK Telegram Daily Briefing")
     parser.add_argument("--date", help="Target date (YYYY-MM-DD), omit for latest")
     parser.add_argument("--dry-run", action="store_true", help="Print only, no send")
+    parser.add_argument("--no-llm", action="store_true",
+                        help="Skip LLM Gold join (structured only)")
     args = parser.parse_args()
 
-    # Load .env
-    env_path = Path(__file__).parent / ".env"
-    if env_path.exists():
-        with open(env_path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, v = line.split("=", 1)
-                    os.environ.setdefault(k, v)
+    load_dotenv()
 
-    # Load data
+    # Load structured
     try:
-        df, date = load_gold(args.date)
+        df_s, date = load_gold_structured(args.date)
     except RuntimeError as e:
         logger.error(str(e))
         sys.exit(1)
 
-    if len(df) == 0:
+    if len(df_s) == 0:
         logger.info("No reports to send")
         return
 
+    # Load LLM Gold
+    llm_stats = None
+    if not args.no_llm:
+        try:
+            df_l = load_gold_llm(date)
+            df_s, llm_stats = join_structured_llm(df_s, df_l)
+        except Exception as e:
+            logger.warning(f"LLM Gold join failed, proceeding without: {e}")
+            for col in ["reason", "risks", "keywords"]:
+                df_s[col] = None
+
     # Format
-    briefing = format_briefing(df, date)
+    briefing = format_briefing(df_s, date, llm_stats)
     print(briefing)
     print(f"\n[{len(briefing)} chars]")
 
@@ -274,4 +382,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-                                                              
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  

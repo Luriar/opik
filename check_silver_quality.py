@@ -1,9 +1,13 @@
 """Silver 텍스트 품질 전수 검증 + blocks 모드 실험"""
-import boto3, json, os, io
+import json, io
 from collections import defaultdict
 
-s3 = boto3.client("s3", region_name=os.getenv("S3_REGION", "ap-northeast-2"))
-B = os.getenv("S3_BUCKET", "s3-opik-bucket")
+from opik_config import S3_BUCKET, S3_REGION, load_dotenv
+from opik_s3 import get_s3_client
+
+load_dotenv()
+s3 = get_s3_client()
+B = S3_BUCKET
 
 # ── 1. 모든 증권사 Silver 샘플링 ──
 print("=" * 60)
@@ -126,4 +130,4 @@ try:
 except:
     pass
 print(f"OCR 필요: {ocr_total}건")
-print(f"전체 대비: {ocr_total / total_2026 * 100:.1f}%" if total_2026 else "")
+print(f"전체 대비: {ocr_total / total_2026 * 100:.1f}%" if total_2026 e

@@ -49,4 +49,12 @@ env/
 sample_*.pdf
 
 # Output / generated data
-*.par
+*.parquet
+*.csv
+*.jsonl
+*.zip
+data/
+tmp/
+*.tmp
+
+# Batch processing output (Bedrock batc

@@ -32,8 +32,6 @@ from pathlib import Path
 from typing import Optional
 
 import aiohttp
-import boto3
-from botocore.config import Config
 from botocore.exceptions import ClientError
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -42,6 +40,10 @@ from collectors.koreainvest import (
     download_all_pdfs_async,
     fetch_all_async,
 )
+from opik_config import S3_BUCKET, S3_REGION, load_dotenv
+from opik_s3 import get_s3_client
+
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,16 +53,10 @@ logging.basicConfig(
 logger = logging.getLogger("opik.bronze.koreainvest")
 
 # ── 설정 ──────────────────────────────────────────────────────────────
-S3_BUCKET = os.getenv("S3_BUCKET", "s3-opik-bucket")
-S3_REGION = os.getenv("S3_REGION", "ap-northeast-2")
 CHECKPOINT_FILE = Path(__file__).parent / ".backfill_checkpoint_koreainvest.json"
 FIRM_NAME = "한국투자증권"
 
-s3_client = boto3.client(
-    "s3",
-    region_name=S3_REGION,
-    config=Config(max_pool_connections=50, retries={"max_attempts": 3}),
-)
+s3_client = get_s3_client(max_pool_connections=50)
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
@@ -518,3 +514,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+                                                                                                                                      

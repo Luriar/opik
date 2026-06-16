@@ -18,11 +18,14 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-import boto3
 import pyarrow as pa
 import pyarrow.parquet as pq
-from botocore.config import Config
 from botocore.exceptions import ClientError
+
+from opik_config import S3_BUCKET, S3_REGION, load_dotenv
+from opik_s3 import s3
+
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,15 +34,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("opik.gold.structured")
 
-S3_BUCKET = os.getenv("S3_BUCKET", "s3-opik-bucket")
-S3_REGION = os.getenv("S3_REGION", "ap-northeast-2")
 GOLD_STRUCTURED_PREFIX = "gold/structured"
 SILVER_KEYS_CACHE = Path(__file__).parent / ".silver_keys_cache.json"
-
-s3 = boto3.client(
-    "s3", region_name=S3_REGION,
-    config=Config(max_pool_connections=50),
-)
 
 # ── 정규식 패턴 ──────────────────────────────────────────────
 
@@ -135,9 +131,15 @@ def extract_target_price(text: str) -> int | None:
         raw = (m.group(1) or m.group(2) or m.group(3) or m.group(4) or m.group(5) or m.group(6) or "").replace(",", "")
         if not raw:
             continue
-        # Reject 6-digit stock codes (e.g. 000100, 005930) — always start with 0, never real TPs
+        # Reject stock codes: Korean stock codes are exactly 6 digits starting with 0
+        # (e.g. 005930, 000660). Real TPs are never formatted this way —
+        # a TP of 100,000원 becomes "100000" (starts with 1), not "0100000".
+        # Edge case: "095000" could be stock code 095000 or TP 95,000원 with
+        # leading zero. We check surrounding context for TP indicators to resolve.
         if len(raw) == 6 and raw.startswith('0'):
-            continue
+            ctx_check = text[max(0, m.start() - 30):m.start()]
+            if not any(kw in ctx_check for kw in ("목표", "TP", "target", "적정", "상승")):
+                continue
         price = float(raw)
         ctx_start = max(0, m.start() - 10)
         ctx_end = min(len(text), m.end() + 15)
@@ -608,18 +610,3 @@ def main():
     parser.add_argument("--workers", type=int, default=20)
     parser.add_argument("--force-refresh", action="store_true")
     args = parser.parse_args()
-
-    asyncio.run(run_gold_structured(
-        start_date=args.start,
-        end_date=args.end,
-        year=args.year,
-        dry_run=args.dry_run,
-        sample_firms=args.sample_firms,
-        workers=args.workers,
-        force_refresh=args.force_refresh,
-    ))
-
-
-
-if __name__ == "__main__":
-    main()
