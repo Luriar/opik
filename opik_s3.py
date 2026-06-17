@@ -27,6 +27,5 @@ def get_s3_client(max_pool_connections: int = 20) -> "boto3.client":
         config=Config(max_pool_connections=max_pool_connections),
     )
 
-
 # Convenience: default client for most use cases
 s3 = get_s3_client()

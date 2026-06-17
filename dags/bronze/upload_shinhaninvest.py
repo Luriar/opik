@@ -187,3 +187,6 @@ def main():
     key = (
         f"manifest/shinhan_{args.start_date.replace('.', '-')}_"
         f"{args.end_date.replace('.', '-')}_{datetime.now():%Y%m%d%H%M%S}.json"
+    )
+
+
