@@ -1,3 +1,7 @@
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 """Silver 추출 결과 확인"""
 import json
 from collections import defaultdict
@@ -58,4 +62,4 @@ try:
         ocr_count += len(data)
 except:
     pass
-print(f"\nOCR 필요: {ocr_coun
+print(f"\nOCR 필요: {ocr_count}")

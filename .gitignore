@@ -57,4 +57,9 @@ data/
 tmp/
 *.tmp
 
-# Batch processing output (Bedrock batc
+# Batch processing output (Bedrock batch)
+batch_output/
+*.out
+
+# Large dependencies (installed separately)
+pylib/

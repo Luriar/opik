@@ -1,3 +1,7 @@
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 """Silver 텍스트 품질 전수 검증 + blocks 모드 실험"""
 import json, io
 from collections import defaultdict
@@ -130,4 +134,4 @@ try:
 except:
     pass
 print(f"OCR 필요: {ocr_total}건")
-print(f"전체 대비: {ocr_total / total_2026 * 100:.1f}%" if total_2026 e
+print(f"전체 대비: {ocr_total / total_2026 * 100:.1f}%" if total_2026 else "N/A")
