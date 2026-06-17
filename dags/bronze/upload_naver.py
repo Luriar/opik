@@ -34,10 +34,19 @@ from typing import Optional
 import aiohttp
 from botocore.exceptions import ClientError
 
+OPIK_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(OPIK_ROOT))
 sys.path.insert(0, str(Path(__file__).parent))
-from collectors.naver import NaverCollector, fetch_all_since_async
+
 from opik_config import S3_BUCKET, S3_REGION, load_dotenv
 from opik_s3 import get_s3_client
+
+try:
+    from airflow import DAG
+    from airflow.operators.python import PythonOperator
+except ImportError:  # 로컬 CLI 실행 환경에는 Airflow가 없을 수 있다.
+    DAG = None
+    PythonOperator = None
 
 load_dotenv()
 
@@ -291,6 +300,8 @@ async def backfill_async(
     resume_from: Optional[str] = None,
 ) -> dict:
     """단일 패스 수집 → 날짜별 그룹핑 → 크로스데이 병렬 업로드"""
+    from collectors.naver import fetch_all_since_async
+
     batch_start = time.perf_counter()
 
     # ── Phase 1: 병렬 페이지 페칭 (aiohttp, 20페이지씩 동시) ──
@@ -382,6 +393,8 @@ async def process_single_day_full(
     s3_workers: int = 15,
 ) -> dict:
     """당일/특정일: 수집 + PDF + S3"""
+    from collectors.naver import NaverCollector
+
     collector = NaverCollector()
     metas = await asyncio.to_thread(collector.fetch_list, target_date)
     collector.session.close()
@@ -405,7 +418,76 @@ def run_single_day(target_date: date, pdf_workers: int = 20, s3_workers: int = 1
         logger.info("=== 완료: %s → total=%d uploaded=%d (%.1fs) ===",
                      result["date"], result["total"], result["uploaded"], result["elapsed"])
         return result
-    asyncio.run(_run())
+    return asyncio.run(_run())
+
+
+def run_bronze_naver(
+    target_date: str | date | None = None,
+    pdf_workers: int = 20,
+    s3_workers: int = 15,
+    dry_run: bool = False,
+) -> dict:
+    """Airflow PythonOperator 엔트리포인트."""
+    from collectors.naver import NaverCollector
+
+    target = (
+        datetime.strptime(target_date, "%Y-%m-%d").date()
+        if isinstance(target_date, str)
+        else target_date
+        if isinstance(target_date, date)
+        else date.today()
+    )
+
+    if dry_run:
+        collector = NaverCollector()
+        try:
+            metas = collector.fetch_list(target)
+        finally:
+            collector.session.close()
+        logger.info("DRY RUN %s → %d건", target.isoformat(), len(metas))
+        return {
+            "date": target.isoformat(),
+            "total": len(metas),
+            "dry_run": True,
+        }
+
+    return run_single_day(target, pdf_workers, s3_workers)
+
+
+def build_dag():
+    if DAG is None:
+        return None
+
+    default_args = {
+        "owner": "opik",
+        "retries": 1,
+        "retry_delay": timedelta(minutes=10),
+    }
+
+    with DAG(
+        dag_id="opik_bronze_naver",
+        description="네이버 경유 증권사 리포트 PDF를 bronze S3에 일배치 적재",
+        default_args=default_args,
+        start_date=datetime(2026, 1, 1),
+        schedule="@daily",
+        catchup=False,
+        max_active_runs=1,
+        tags=["opik", "bronze", "naver", "reports"],
+    ) as dag_obj:
+        PythonOperator(
+            task_id="upload_naver_reports_to_bronze",
+            python_callable=run_bronze_naver,
+            op_kwargs={
+                "target_date": "{{ ds }}",
+                "pdf_workers": 20,
+                "s3_workers": 15,
+            },
+        )
+
+    return dag_obj
+
+
+dag = build_dag()
 
 
 # ── CLI ────────────────────────────────────────────────────────────────
@@ -424,6 +506,8 @@ def main():
     args = parser.parse_args()
 
     if args.dry_run:
+        from collectors.naver import NaverCollector
+
         collector = NaverCollector()
         target = datetime.strptime(args.date, "%Y-%m-%d").date() if args.date else date.today()
         metas = collector.fetch_list(target)

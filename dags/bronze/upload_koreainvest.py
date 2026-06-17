@@ -34,14 +34,19 @@ from typing import Optional
 import aiohttp
 from botocore.exceptions import ClientError
 
+OPIK_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(OPIK_ROOT))
 sys.path.insert(0, str(Path(__file__).parent))
-from collectors.koreainvest import (
-    KoreaInvestCollector,
-    download_all_pdfs_async,
-    fetch_all_async,
-)
+
 from opik_config import S3_BUCKET, S3_REGION, load_dotenv
 from opik_s3 import get_s3_client
+
+try:
+    from airflow import DAG
+    from airflow.operators.python import PythonOperator
+except ImportError:  # 로컬 CLI 실행 환경에는 Airflow가 없을 수 있다.
+    DAG = None
+    PythonOperator = None
 
 load_dotenv()
 
@@ -280,6 +285,8 @@ def save_checkpoint(date_str: str, stats: dict):
 
 def _collect_today() -> list[dict]:
     """당일 수집: 순차 페이지 순회 (오늘 날짜까지만)"""
+    from collectors.koreainvest import KoreaInvestCollector
+
     collector = KoreaInvestCollector()
     results: list[dict] = []
     page = 1
@@ -317,6 +324,8 @@ async def process_single_day_full(
     s3_workers: int = 15,
 ) -> dict:
     """당일/특정일: 수집 + PDF + S3"""
+    from collectors.koreainvest import fetch_all_async
+
     pub_str = target_date.isoformat()
 
     if target_date == date.today():
@@ -346,7 +355,7 @@ def run_single_day(target_date: date, pdf_workers: int = 25, s3_workers: int = 1
         logger.info("=== %s → total=%d uploaded=%d (%.1fs) ===",
                      result["date"], result["total"], result["uploaded"], result["elapsed"])
         return result
-    asyncio.run(_run())
+    return asyncio.run(_run())
 
 
 # ── 백필 모드 ─────────────────────────────────────────────────────────
@@ -370,6 +379,8 @@ async def backfill_async(
     resume_from: Optional[str] = None,
 ) -> dict:
     """비동기 병렬 백필: 전체 수집 → 날짜별 그룹핑 → 청크 병렬 업로드"""
+    from collectors.koreainvest import fetch_all_async
+
     batch_start = time.perf_counter()
 
     # ── Phase 1: 비동기 병렬 수집 ──
@@ -453,6 +464,82 @@ async def backfill_async(
     return {"total_uploaded": total_uploaded, "days_done": days_done, "elapsed_hours": elapsed / 3600}
 
 
+def run_bronze_koreainvest(
+    target_date: str | date | None = None,
+    pdf_workers: int = 25,
+    s3_workers: int = 15,
+    dry_run: bool = False,
+) -> dict:
+    """Airflow PythonOperator 엔트리포인트."""
+    target = (
+        datetime.strptime(target_date, "%Y-%m-%d").date()
+        if isinstance(target_date, str)
+        else target_date
+        if isinstance(target_date, date)
+        else date.today()
+    )
+
+    if dry_run:
+        from collectors.koreainvest import fetch_all_async
+
+        async def _dry_run():
+            if target == date.today():
+                metas = await asyncio.to_thread(_collect_today)
+            else:
+                from_str = target.strftime("%Y.%m.%d")
+                to_str = target.strftime("%Y.%m.%d")
+                all_items = await fetch_all_async(
+                    page_batch=15,
+                    max_conn=20,
+                    search_date="all",
+                    from_date=from_str,
+                    to_date=to_str,
+                )
+                metas = [m for m in all_items if m.get("발행일") == target.isoformat()]
+            logger.info("DRY RUN %s → %d건", target.isoformat(), len(metas))
+            return {"date": target.isoformat(), "total": len(metas), "dry_run": True}
+
+        return asyncio.run(_dry_run())
+
+    return run_single_day(target, pdf_workers, s3_workers)
+
+
+def build_dag():
+    if DAG is None:
+        return None
+
+    default_args = {
+        "owner": "opik",
+        "retries": 1,
+        "retry_delay": timedelta(minutes=10),
+    }
+
+    with DAG(
+        dag_id="opik_bronze_koreainvest",
+        description="한국투자증권 리서치 리포트 PDF를 bronze S3에 일배치 적재",
+        default_args=default_args,
+        start_date=datetime(2026, 1, 1),
+        schedule="@daily",
+        catchup=False,
+        max_active_runs=1,
+        tags=["opik", "bronze", "koreainvest", "reports"],
+    ) as dag_obj:
+        PythonOperator(
+            task_id="upload_koreainvest_reports_to_bronze",
+            python_callable=run_bronze_koreainvest,
+            op_kwargs={
+                "target_date": "{{ ds }}",
+                "pdf_workers": 25,
+                "s3_workers": 15,
+            },
+        )
+
+    return dag_obj
+
+
+dag = build_dag()
+
+
 # ── CLI ────────────────────────────────────────────────────────────────
 
 def main():
@@ -469,6 +556,8 @@ def main():
     args = parser.parse_args()
 
     if args.dry_run:
+        from collectors.koreainvest import KoreaInvestCollector, fetch_all_async
+
         collector = KoreaInvestCollector()
         if args.date:
             target = datetime.strptime(args.date, "%Y-%m-%d").date()

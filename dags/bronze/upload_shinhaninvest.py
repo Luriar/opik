@@ -1,106 +1,200 @@
+"""OPIK — 신한투자증권 리포트 Bronze 적재 DAG.
+
+핵심 로직은 기존 로컬 수집 스크립트와 동일하다.
+    - 신한 프론트 API: curPage/startPage/startId 페이지네이션
+    - f3 PDF URL 직접 다운로드
+    - report_id = md5(증권사 + 종목코드 + 제목 + 발행일)
+    - bronze/신한투자증권/YYYY-MM-DD/{report_id}.pdf 저장
+    - bronze/신한투자증권/YYYY-MM-DD/_manifest.json 저장
+
+Usage:
+    python upload_shinhaninvest.py --date 2026-06-12
+    python upload_shinhaninvest.py --start 2026-06-01 --end 2026-06-12
+    python upload_shinhaninvest.py --date 2026-06-12 --dry-run
 """
-신한투자증권 기업분석 리포트 수집 (로컬 실행)
-- 수집 범위: 특정 날짜 range
-- 실행: python extract/extract_신한투자증권.py --start-date 2026-06-01 --end-date 2026-06-11
-- 적재: 팀 공용(타 계정) S3 버킷 — .env의 자격증명 사용
-"""
+
+from __future__ import annotations
+
+from pathlib import Path
+import sys
+
+OPIK_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(OPIK_ROOT))
+
 import argparse
-import os
+import hashlib
+import json
+import logging
 import re
 import time
-import json
-import hashlib
-from datetime import datetime, timedelta
-from pathlib import Path
+from collections import defaultdict
+from datetime import date, datetime, timedelta
+from typing import Any
 
 import requests
-import boto3
-from dotenv import load_dotenv
+from botocore.exceptions import ClientError
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-load_dotenv(PROJECT_ROOT / ".env")   # .env에서 AWS 키 / 버킷명 로드
+from opik_config import S3_BUCKET, load_dotenv
+from opik_s3 import get_s3_client
 
-# ── 고정 설정 ──────────────────────────────────────────────
+try:
+    from airflow import DAG
+    from airflow.operators.python import PythonOperator
+except ImportError:  # 로컬 CLI 실행 환경에는 Airflow가 없을 수 있다.
+    DAG = None
+    PythonOperator = None
+
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("opik.bronze.shinhaninvest")
+
 LIST_URL = "https://bbs2.shinhansec.com/bbs/list/gicompanyanalyst"
-S3_BUCKET = os.getenv("S3_BUCKET", "s3-opik-bucket")  # 팀 공용 버킷 이름
-BROKER_NAME = "신한투자증권"
+FIRM_NAME = "신한투자증권"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+    ),
     "Referer": "https://www.shinhansec.com/siw/insights/industry/gicompanyanalyst/view.do",
 }
 
-# 타 계정 버킷이 "버킷 정책으로 내 계정에 쓰기 허용"한 방식이면 아래 ACL 필요할 수 있음
-# (버킷 소유자가 객체에 접근 못 하는 문제 방지. 버킷의 Object Ownership이
-#  'Bucket owner enforced'면 ACL 자체가 무시되므로 빈 dict 그대로 두면 됨)
-PUT_EXTRA = {}   # 필요 시: {"ACL": "bucket-owner-full-control"}
+PUT_EXTRA: dict[str, Any] = {}
+s3_client = get_s3_client(max_pool_connections=20)
 
 
-def normalize_date(value):
-    """YYYY-MM-DD 또는 YYYY.MM.DD를 신한 API 형식(YYYY.MM.DD)으로 정규화."""
-    for fmt in ("%Y-%m-%d", "%Y.%m.%d"):
-        try:
-            return datetime.strptime(value, fmt).strftime("%Y.%m.%d")
-        except ValueError:
-            pass
-    raise ValueError(f"날짜 형식 오류: {value} (YYYY-MM-DD 또는 YYYY.MM.DD)")
+def normalize_date(value: str | date, fmt: str = "iso") -> str:
+    if isinstance(value, date):
+        parsed = value
+    else:
+        parsed = None
+        for pattern in ("%Y-%m-%d", "%Y.%m.%d"):
+            try:
+                parsed = datetime.strptime(str(value), pattern).date()
+                break
+            except ValueError:
+                pass
+        if parsed is None:
+            raise ValueError(f"날짜 형식 오류: {value} (YYYY-MM-DD 또는 YYYY.MM.DD)")
+    return parsed.strftime("%Y.%m.%d") if fmt == "api" else parsed.isoformat()
 
 
-def parse_args():
-    yesterday = datetime.now() - timedelta(days=1)
-    parser = argparse.ArgumentParser(description="신한투자증권 기업분석 리포트 수집")
-    parser.add_argument(
-        "--start-date",
-        default=yesterday.strftime("%Y.%m.%d"),
-        help="수집 시작일(포함). YYYY-MM-DD 또는 YYYY.MM.DD. 기본값: 어제",
+def bronze_key(pub_date: str, report_id: str) -> str:
+    return f"bronze/{FIRM_NAME}/{pub_date}/{report_id}.pdf"
+
+
+def manifest_key(pub_date: str) -> str:
+    return f"bronze/{FIRM_NAME}/{pub_date}/_manifest.json"
+
+
+def s3_exists(key: str) -> bool:
+    try:
+        s3_client.head_object(Bucket=S3_BUCKET, Key=key)
+        return True
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        if code in {"404", "NoSuchKey", "NotFound"}:
+            return False
+        raise
+
+
+def s3_upload_json(key: str, data: Any) -> None:
+    s3_client.put_object(
+        Bucket=S3_BUCKET,
+        Key=key,
+        Body=json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"),
+        ContentType="application/json; charset=utf-8",
     )
-    parser.add_argument(
-        "--end-date",
-        default=yesterday.strftime("%Y.%m.%d"),
-        help="수집 종료일(포함). YYYY-MM-DD 또는 YYYY.MM.DD. 기본값: 어제",
-    )
-    args = parser.parse_args()
-    args.start_date = normalize_date(args.start_date)
-    args.end_date = normalize_date(args.end_date)
-    if args.start_date > args.end_date:
-        raise ValueError("start-date는 end-date보다 늦을 수 없습니다.")
-    return args
 
 
-def get_json(sess, params):
-    resp = sess.get(LIST_URL, params=params, timeout=10)
-    resp.raise_for_status()
-    return resp.json()
+def get_json(session: requests.Session, params: dict[str, Any]) -> dict[str, Any]:
+    response = session.get(LIST_URL, params=params, timeout=15)
+    response.raise_for_status()
+    return response.json()
 
 
-def extract_stock_code(title):
-    """제목에서 종목코드 추출. 예: '(005930) 삼성전자' → '005930'"""
-    m = re.search(r'\((\d{6})\)', title or "")
-    return m.group(1) if m else "000000"
+def extract_stock_code(title: str) -> str:
+    match = re.search(r"\((\d{6})\)", title or "")
+    return match.group(1) if match else "000000"
 
 
-def make_report_id(item, reg_date):
-    stock_code = extract_stock_code(item.get('f1', ''))
-    return hashlib.md5(
-        f"{BROKER_NAME}_{stock_code}_{item.get('f1', '')}_{reg_date}".encode()
-    ).hexdigest()
+def make_report_id(item: dict[str, Any], reg_date: str) -> str:
+    stock_code = extract_stock_code(item.get("f1", ""))
+    raw = f"{FIRM_NAME}_{stock_code}_{item.get('f1', '')}_{reg_date}"
+    return hashlib.md5(raw.encode()).hexdigest()
 
 
-def main():
-    args = parse_args()
-    s3 = boto3.client("s3")
-    sess = requests.Session()
-    sess.headers.update(HEADERS)
+def download_and_upload_pdf(
+    session: requests.Session,
+    pdf_url: str,
+    s3_key: str,
+    dry_run: bool,
+) -> tuple[str, str]:
+    if not pdf_url:
+        return "", "pdf_missing"
+    if s3_exists(s3_key):
+        return s3_key, "pending"
+    if dry_run:
+        return "", "dry_run"
 
-    manifest = []
-    seen_ids = set()        # 페이지네이션 오작동(같은 페이지 반복) 감지용
-    seen_report_ids = {}
-    cur_page, start_page, start_id = 1, 1, None
+    try:
+        response = session.get(pdf_url, timeout=20)
+        response.raise_for_status()
+        content_type = response.headers.get("Content-Type", "").lower()
+        is_pdf = "pdf" in content_type or response.content[:4] == b"%PDF"
+        if not is_pdf:
+            logger.warning("PDF 아님: %s | content-type=%s", pdf_url[:100], content_type)
+            return "", "pdf_missing"
+        s3_client.put_object(
+            Bucket=S3_BUCKET,
+            Key=s3_key,
+            Body=response.content,
+            ContentType="application/pdf",
+            **PUT_EXTRA,
+        )
+        return s3_key, "pending"
+    except Exception as exc:
+        logger.warning("PDF 실패: %s | %s", pdf_url[:100], exc)
+        return "", "pdf_missing"
+
+
+def run_bronze_shinhaninvest(
+    target_date: str | date | None = None,
+    start_date: str | date | None = None,
+    end_date: str | date | None = None,
+    page_sleep: float = 1.5,
+    pdf_sleep: float = 1.0,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Airflow PythonOperator 엔트리포인트."""
+    if target_date:
+        start_api = end_api = normalize_date(target_date, "api")
+    else:
+        default_day = date.today() - timedelta(days=1)
+        start_api = normalize_date(start_date or default_day, "api")
+        end_api = normalize_date(end_date or start_date or default_day, "api")
+    if start_api > end_api:
+        raise ValueError(f"start_date가 end_date보다 늦습니다: {start_api} > {end_api}")
+
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
+    cur_page = 1
+    start_page = 1
+    start_id = None
     stop = False
+    seen_ids: set[str] = set()
+    seen_report_ids: dict[str, str] = {}
+    manifests_by_date: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    stats = Counter()
 
     while not stop:
-        # 신한 프론트 JS와 동일: curPage/startPage를 같이 증가시키고 startId는 매 응답에서 갱신
         params = {
             "v": int(time.time() * 1000),
             "curPage": cur_page,
@@ -110,83 +204,151 @@ def main():
             params["startId"] = start_id
 
         try:
-            data = get_json(sess, params)
-        except Exception as e:
-            print(f"목록 요청 실패: page={cur_page}, startPage={start_page}, startId={start_id}: {e}")
+            data = get_json(session, params)
+        except Exception as exc:
+            logger.error("목록 요청 실패: page=%s startPage=%s startId=%s | %s",
+                         cur_page, start_page, start_id, exc)
+            stats["list_failed"] += 1
             break
 
         items = data.get("list", [])
-
-        # 종료 조건 1: 빈 페이지 / 종료 조건 2: 첫 항목이 이미 본 것 (페이지가 안 넘어감)
         if not items or items[0].get("fn") in seen_ids:
-            print(f"페이지 {cur_page}: 더 이상 새 항목 없음 → 종료")
+            logger.info("페이지 %s: 더 이상 새 항목 없음", cur_page)
             break
 
-        for it in items:
-            fn = it.get("fn")
+        for item in items:
+            fn = item.get("fn")
             if fn in seen_ids:
                 continue
             seen_ids.add(fn)
 
-            reg_date = it.get("f0", "")          # "2026.06.11" — 문자열 비교 가능
-            if reg_date > args.end_date:
+            reg_date = item.get("f0", "")
+            if reg_date > end_api:
                 continue
-            if reg_date < args.start_date:
-                print(f"[{reg_date}] 시작일({args.start_date}) 이전 도달 → 수집 종료")
+            if reg_date < start_api:
+                logger.info("[%s] 시작일(%s) 이전 도달 → 종료", reg_date, start_api)
                 stop = True
                 break
 
-            report_id = make_report_id(it, reg_date)
+            report_id = make_report_id(item, reg_date)
             if report_id in seen_report_ids:
-                print(
-                    f"  중복 report_id 경고: {report_id} "
-                    f"(이전 fn={seen_report_ids[report_id]}, 현재 fn={fn})"
-                )
+                logger.warning("중복 report_id: %s 이전 fn=%s 현재 fn=%s",
+                               report_id, seen_report_ids[report_id], fn)
             seen_report_ids[report_id] = fn
 
-            # PDF 다운로드 (f3 = 직접 다운로드 URL)
-            s3_key = ""
-            pdf_url = it.get("f3", "")
-            if pdf_url:
-                try:
-                    pdf = sess.get(pdf_url, timeout=15)
-                    pdf.raise_for_status()
-                    if "pdf" in pdf.headers.get("Content-Type", "").lower():
-                        s3_key = (
-                            f"bronze/{BROKER_NAME}/{reg_date.replace('.', '-')}/"
-                            f"{report_id}.pdf"
-                        )
-                        s3.put_object(Bucket=S3_BUCKET, Key=s3_key,
-                                      Body=pdf.content, **PUT_EXTRA)
-                    else:
-                        print(f"  PDF 아님 [{it.get('f1')}]: {pdf.headers.get('Content-Type')}")
-                except Exception as e:
-                    print(f"  PDF 실패 [{it.get('f1')}]: {e}")
-                time.sleep(1)                    # 서버 부담 완화
+            pub_date = reg_date.replace(".", "-")
+            pdf_key = bronze_key(pub_date, report_id)
+            s3_key, parse_status = download_and_upload_pdf(
+                session,
+                item.get("f3", ""),
+                pdf_key,
+                dry_run=dry_run,
+            )
+            if pdf_sleep and not dry_run:
+                time.sleep(pdf_sleep)
 
-            manifest.append({
+            entry = {
                 "report_id": report_id,
-                "source": BROKER_NAME,
-                "종목명": it.get("f2", ""),
-                "증권사": BROKER_NAME,
-                "발행일": reg_date,
+                "source": FIRM_NAME,
+                "title": item.get("f1", ""),
+                "종목명": item.get("f2", ""),
+                "증권사": FIRM_NAME,
+                "발행일": pub_date,
                 "s3_key": s3_key,
-                "파싱상태": "pending" if s3_key else "pdf_missing",
-            })
+                "파싱상태": parse_status,
+            }
+            manifests_by_date[pub_date].append(entry)
+            stats[parse_status] += 1
+            stats["total"] += 1
 
-        print(f"페이지 {cur_page} 완료 — 누적 {len(manifest)}건")
+        logger.info("페이지 %s 완료 — 누적 %d건", cur_page, stats["total"])
 
         page_ids = data.get("pageInfo", {}).get("pages", [])
         if len(page_ids) > 1:
             start_id = page_ids[1]
         cur_page += 1
         start_page += 1
-        time.sleep(1.5)
+        if page_sleep:
+            time.sleep(page_sleep)
 
-    # manifest 저장
-    key = (
-        f"manifest/shinhan_{args.start_date.replace('.', '-')}_"
-        f"{args.end_date.replace('.', '-')}_{datetime.now():%Y%m%d%H%M%S}.json"
+    if not dry_run:
+        for pub_date, entries in manifests_by_date.items():
+            s3_upload_json(manifest_key(pub_date), entries)
+            logger.info("manifest 저장: %s (%d건)", manifest_key(pub_date), len(entries))
+
+    result = {
+        "start_date": start_api.replace(".", "-"),
+        "end_date": end_api.replace(".", "-"),
+        "total": stats["total"],
+        "pending": stats["pending"],
+        "pdf_missing": stats["pdf_missing"],
+        "dry_run": stats["dry_run"],
+        "list_failed": stats["list_failed"],
+        "manifest_dates": sorted(manifests_by_date.keys()),
+    }
+    logger.info("신한 bronze 완료: %s", result)
+    return result
+
+
+def build_dag():
+    if DAG is None:
+        return None
+
+    default_args = {
+        "owner": "opik",
+        "retries": 1,
+        "retry_delay": timedelta(minutes=10),
+    }
+
+    with DAG(
+        dag_id="opik_bronze_shinhaninvest",
+        description="신한투자증권 기업분석 리포트 PDF를 bronze S3에 일배치 적재",
+        default_args=default_args,
+        start_date=datetime(2026, 1, 1),
+        schedule="@daily",
+        catchup=False,
+        max_active_runs=1,
+        tags=["opik", "bronze", "shinhaninvest", "reports"],
+    ) as dag_obj:
+        PythonOperator(
+            task_id="upload_shinhaninvest_reports_to_bronze",
+            python_callable=run_bronze_shinhaninvest,
+            op_kwargs={
+                "target_date": "{{ ds }}",
+                "page_sleep": 1.5,
+                "pdf_sleep": 1.0,
+            },
+        )
+
+    return dag_obj
+
+
+dag = build_dag()
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="OPIK Bronze 적재 (신한투자증권)")
+    parser.add_argument("--date", type=str, help="수집일 YYYY-MM-DD")
+    parser.add_argument("--start", type=str, help="시작일 YYYY-MM-DD")
+    parser.add_argument("--end", type=str, help="종료일 YYYY-MM-DD")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--page-sleep", type=float, default=1.5)
+    parser.add_argument("--pdf-sleep", type=float, default=1.0)
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    result = run_bronze_shinhaninvest(
+        target_date=args.date,
+        start_date=args.start,
+        end_date=args.end,
+        page_sleep=args.page_sleep,
+        pdf_sleep=args.pdf_sleep,
+        dry_run=args.dry_run,
     )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
+if __name__ == "__main__":
+    main()
