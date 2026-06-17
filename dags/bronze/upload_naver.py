@@ -1,70 +1,149 @@
-"""OPIK — 네이버 경유 증권사 리포트 Bronze 적재 (Async 병렬 + 단일패스 백필)
+"""OPIK — 네이버 경유 증권사 리포트 Bronze 일배치 DAG.
 
-메달리온 구조:
-    Bronze: s3://s3-opik-bucket/bronze/{증권사}/YYYY-MM-DD/{report_id}.pdf
-            s3://s3-opik-bucket/bronze/{증권사}/YYYY-MM-DD/_manifest.json
+핵심 로직:
+    - NaverCollector로 실행일 하루치 리포트 메타데이터 수집
+    - PDF URL이 있는 항목만 다운로드
+    - bronze/{증권사}/{YYYY-MM-DD}/{report_id}.pdf 저장
+    - bronze/{증권사}/{YYYY-MM-DD}/_manifest.json 저장
 
-사용법:
-    python upload_naver.py                                  # 당일
-    python upload_naver.py --date 2026-06-10                # 특정일
-    python upload_naver.py --backfill --start 2021-06-01 --end 2026-06-10
-    python upload_naver.py --backfill --start 2021-06-01 --end 2026-06-10 --days 5 --resume
-    python upload_naver.py --dry-run [--date ...]           # 수집만, 업로드 X
+일배치 전제:
+    - 백필/checkpoint/resume 로직은 제거
+    - 이미 PDF가 존재해도 manifest에는 pending 상태로 다시 기록
+    - silver DAG는 이 manifest를 읽어 같은 날짜의 PDF만 처리
 
-환경변수: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / S3_BUCKET=s3-opik-bucket
+Usage:
+    python upload_naver.py --date 2026-06-12
+    python upload_naver.py --date 2026-06-12 --dry-run
 """
 
 from __future__ import annotations
 
-import argparse
-import asyncio
-import json
-import logging
-import os
-import random
-import signal
-import sys
-import time
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Optional
-
-import aiohttp
-from botocore.exceptions import ClientError
+import sys
 
 OPIK_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(OPIK_ROOT))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from opik_config import S3_BUCKET, S3_REGION, load_dotenv
-from opik_s3 import get_s3_client
+import argparse
+import asyncio
+import hashlib
+import json
+import logging
+import os
+import random
+import re
+import time
+from collections import Counter, defaultdict
+from datetime import date, datetime, timedelta
+from typing import Any
+
+import pendulum
+import aiohttp
+import boto3
+from botocore.exceptions import ClientError
 
 try:
     from airflow import DAG
     from airflow.operators.python import PythonOperator
-except ImportError:  # 로컬 CLI 실행 환경에는 Airflow가 없을 수 있다.
+except ImportError:
     DAG = None
     PythonOperator = None
 
-load_dotenv()
+
+def load_local_env() -> None:
+    """Load .env without depending on opik_config."""
+    candidates = []
+    if root := os.getenv("OPIK_ROOT"):
+        candidates.append(Path(root) / ".env")
+    candidates.extend([
+        OPIK_ROOT / ".env",
+        Path(__file__).resolve().parents[1] / ".env",
+        Path(__file__).parent / ".env",
+        Path.cwd() / ".env",
+    ])
+
+    for env_path in candidates:
+        if not env_path.exists():
+            continue
+        with open(env_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+        break
+
+
+load_local_env()
+
+S3_BUCKET = (
+    os.getenv("S3_BUCKET")
+    or os.getenv("AWS_S3_BUCKET_NAME")
+    or "s3-opik-bucket"
+).strip("'\"")
+S3_REGION = (
+    os.getenv("S3_REGION")
+    or os.getenv("AWS_REGION")
+    or os.getenv("AWS_DEFAULT_REGION")
+    or "ap-northeast-2"
+).strip("'\"")
+s3_client = boto3.client("s3", region_name=S3_REGION)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%H:%M:%S",
 )
-logger = logging.getLogger("opik.bronze")
+logger = logging.getLogger("opik.bronze.naver")
 
-# ── 설정 ──────────────────────────────────────────────────────────────
-CHECKPOINT_FILE = Path(__file__).parent / ".backfill_checkpoint.json"
+BASE_URL = "https://finance.naver.com/research/company_list.naver"
+DETAIL_URL = "https://finance.naver.com/research/company_read.naver"
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/126.0.0.0 Safari/537.36"
+)
 
-s3_client = get_s3_client(max_pool_connections=50)
+FIRM_MAP: dict[str, str] = {
+    "미래에셋증권": "miraeasset",
+    "삼성증권": "samsung",
+    "NH투자증권": "nh",
+    "KB증권": "kb",
+    "한국투자증권": "koreainv",
+    "신한투자증권": "shinhan",
+    "하나증권": "hana",
+    "키움증권": "kiwoom",
+    "대신증권": "daishin",
+    "유안타증권": "yuanta",
+    "메리츠증권": "meritz",
+    "신영증권": "shinyoung",
+    "한화투자증권": "hanwha",
+    "교보증권": "kyobo",
+    "현대차증권": "hyundai",
+    "DB금융투자": "db",
+    "SK증권": "sk",
+    "IBK투자증권": "ibk",
+    "LS증권": "ls",
+    "BNK투자증권": "bnk",
+    "이베스트투자증권": "ebest",
+    "케이프투자증권": "cape",
+    "다올투자증권": "daol",
+    "부국증권": "bookook",
+    "유진투자증권": "eugene",
+    "상상인증권": "sangsangin",
+    "한양증권": "hanyang",
+    "흥국증권": "heungkuk",
+}
 
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
-_shutdown = False
+def parse_date(value: str | date | None) -> date:
+    if value is None:
+        return date.today()
+    if isinstance(value, date):
+        return value
+    return datetime.strptime(value, "%Y-%m-%d").date()
 
 
 def bronze_key(firm_kr: str, pub_date: str, report_id: str) -> str:
@@ -75,54 +154,202 @@ def manifest_key(firm_kr: str, pub_date: str) -> str:
     return f"bronze/{firm_kr}/{pub_date}/_manifest.json"
 
 
-# ── S3 유틸 ──────────────────────────────────────────────────────────
+def parse_naver_date(raw: str) -> str | None:
+    match = re.match(r"(\d{2})\.(\d{2})\.(\d{2})", raw.strip())
+    if not match:
+        return None
+    year = 2000 + int(match.group(1))
+    return f"{year}-{match.group(2)}-{match.group(3)}"
 
-def _s3_exists(key: str) -> bool:
+
+def parse_naver_rows(soup: Any) -> list[Any]:
+    for selector in [
+        "table.type_1 tbody tr",
+        "div.box_type_m table tbody tr",
+        "table.Nnavi tbody tr",
+    ]:
+        rows = soup.select(selector)
+        if rows:
+            return [row for row in rows if row.select_one("td.file") or row.select_one("a.stock_item")]
+    return [row for row in soup.select("tr") if len(row.select("td")) >= 5]
+
+
+def parse_naver_row(row: Any) -> dict[str, Any] | None:
+    cells = row.select("td")
+    if len(cells) < 5:
+        return None
+
+    stock_name = ""
+    stock_code = ""
+    stock_link = cells[0].select_one("a.stock_item") or cells[0].select_one("a")
+    if stock_link:
+        stock_name = stock_link.get("title") or stock_link.get_text(strip=True)
+        if code_match := re.search(r"code=(\d{6})", stock_link.get("href", "")):
+            stock_code = code_match.group(1)
+
+    title_link = cells[1].select_one("a")
+    if not title_link:
+        return None
+    title = title_link.get_text(strip=True)
+    if not title:
+        return None
+
+    nid = ""
+    if nid_match := re.search(r"nid=(\d+)", title_link.get("href", "")):
+        nid = nid_match.group(1)
+
+    firm_kr = cells[2].get_text(strip=True)
+    if firm_kr == "신한투자증권":
+        return None
+    firm_code = FIRM_MAP.get(firm_kr, firm_kr.lower().replace(" ", ""))
+
+    pdf_url = None
+    pdf_link = cells[3].select_one("a")
+    if pdf_link:
+        href = pdf_link.get("href", "").strip()
+        if href and not href.startswith("#") and not href.startswith("javascript:"):
+            pdf_url = href
+
+    pub_date = parse_naver_date(cells[4].get_text(strip=True))
+    if not pub_date:
+        return None
+
+    report_id = hashlib.sha256(f"naver|{nid or title}|{pub_date}".encode()).hexdigest()[:16]
+    return {
+        "report_id": report_id,
+        "source": firm_kr,
+        "securities_firm": firm_code,
+        "증권사": firm_kr,
+        "title": title,
+        "stock_code": stock_code,
+        "stock_name": stock_name,
+        "종목명": stock_name,
+        "publish_date": pub_date,
+        "발행일": pub_date,
+        "pdf_url": pdf_url,
+        "detail_url": f"{DETAIL_URL}?nid={nid}" if nid else None,
+        "nid": nid,
+        "category": "company",
+        "collected_at": datetime.now().isoformat(),
+    }
+
+
+def naver_has_next(soup: BeautifulSoup, current_page: int) -> bool:
+    pagination = soup.select_one("div.paging, table.Nnavi")
+    if not pagination:
+        return False
+    for link in pagination.select("a"):
+        if match := re.search(r"page=(\d+)", link.get("href", "")):
+            if int(match.group(1)) > current_page:
+                return True
+    return False
+
+
+async def collect_naver_date(target: date) -> list[dict[str, Any]]:
+    from bs4 import BeautifulSoup
+
+    results: list[dict[str, Any]] = []
+    page = 1
+    connector = aiohttp.TCPConnector(limit=5, limit_per_host=3)
+    async with aiohttp.ClientSession(
+        headers={
+            "User-Agent": UA,
+            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ko-KR,ko;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+        },
+        connector=connector,
+    ) as session:
+        while True:
+            try:
+                async with session.get(
+                    f"{BASE_URL}?page={page}",
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as response:
+                    if response.status != 200:
+                        logger.warning("Naver list HTTP %d: page=%d", response.status, page)
+                        break
+                    raw = await response.read()
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                logger.warning("Naver list failed: page=%d | %s", page, exc)
+                break
+
+            try:
+                html = raw.decode("euc-kr")
+            except UnicodeDecodeError:
+                html = raw.decode("utf-8", errors="replace")
+
+            soup = BeautifulSoup(html, "html.parser")
+            rows = parse_naver_rows(soup)
+            if not rows:
+                break
+
+            reached_past = False
+            for row in rows:
+                meta = parse_naver_row(row)
+                if not meta:
+                    continue
+                pub_date = datetime.strptime(meta["발행일"], "%Y-%m-%d").date()
+                if pub_date == target:
+                    results.append(meta)
+                elif pub_date < target:
+                    reached_past = True
+                    break
+
+            if reached_past or not naver_has_next(soup, page):
+                break
+            page += 1
+            await asyncio.sleep(0.3)
+
+    logger.info("Naver %s -> %d reports", target.isoformat(), len(results))
+    return results
+
+
+def s3_exists(key: str) -> bool:
     try:
         s3_client.head_object(Bucket=S3_BUCKET, Key=key)
         return True
-    except ClientError as e:
-        if e.response["Error"]["Code"] == "404":
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        if code in {"404", "NoSuchKey", "NotFound"}:
             return False
         raise
 
 
-def _s3_upload(key: str, body: bytes, content_type: str = "application/pdf") -> bool:
+def s3_upload_pdf(key: str, body: bytes) -> bool:
     try:
-        s3_client.put_object(Bucket=S3_BUCKET, Key=key, Body=body, ContentType=content_type)
+        s3_client.put_object(
+            Bucket=S3_BUCKET,
+            Key=key,
+            Body=body,
+            ContentType="application/pdf",
+        )
         return True
-    except Exception as e:
-        logger.error("S3 업로드 실패: %s → %s", key, e)
+    except Exception as exc:
+        logger.error("S3 PDF upload failed: %s -> %s", key, exc)
         return False
 
 
-async def s3_exists(key: str) -> bool:
-    return await asyncio.to_thread(_s3_exists, key)
+def s3_upload_json(key: str, data: Any) -> None:
+    s3_client.put_object(
+        Bucket=S3_BUCKET,
+        Key=key,
+        Body=json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"),
+        ContentType="application/json; charset=utf-8",
+    )
 
-
-async def s3_upload(key: str, body: bytes, content_type: str = "application/pdf") -> bool:
-    return await asyncio.to_thread(_s3_upload, key, body, content_type)
-
-
-async def s3_upload_json(key: str, data) -> bool:
-    return await s3_upload(key, json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"), "application/json")
-
-
-# ── Async PDF 다운로드 ─────────────────────────────────────────────────
 
 async def download_pdf(
     session: aiohttp.ClientSession,
     semaphore: asyncio.Semaphore,
-    meta: dict,
+    meta: dict[str, Any],
     retries: int = 2,
-) -> Optional[bytes]:
+) -> bytes | None:
     url = meta.get("pdf_url")
     if not url:
         return None
 
     for attempt in range(retries + 1):
-        if _shutdown:
-            return None
         try:
             async with semaphore:
                 await asyncio.sleep(random.uniform(0.02, 0.15))
@@ -131,7 +358,7 @@ async def download_pdf(
                         if attempt < retries:
                             await asyncio.sleep(1.5 * (2 ** attempt))
                             continue
-                        logger.error("PDF HTTP %d: %s", resp.status, url[:80])
+                        logger.warning("PDF HTTP %d: %s", resp.status, url[:100])
                         return None
                     data = await resp.read()
                     if len(data) < 1024:
@@ -139,319 +366,137 @@ async def download_pdf(
                             continue
                         return None
                     return data
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             if attempt < retries:
                 await asyncio.sleep(1.5 * (2 ** attempt))
                 continue
-            logger.error("PDF 다운로드 실패: %s → %s", url[:80], e)
+            logger.warning("PDF download failed: %s -> %s", url[:100], exc)
             return None
     return None
 
 
-async def download_all_pdfs(metas: list[dict], workers: int = 20) -> dict[str, Optional[bytes]]:
+async def download_all_pdfs(metas: list[dict[str, Any]], workers: int) -> dict[str, bytes | None]:
     semaphore = asyncio.Semaphore(workers)
     connector = aiohttp.TCPConnector(limit=workers + 10, limit_per_host=workers + 5)
     async with aiohttp.ClientSession(
         headers={"User-Agent": UA, "Accept": "*/*", "Accept-Encoding": "gzip, deflate, br"},
         connector=connector,
     ) as session:
-        tasks = {meta["report_id"]: download_pdf(session, semaphore, meta) for meta in metas if meta.get("pdf_url")}
+        tasks = {
+            meta["report_id"]: download_pdf(session, semaphore, meta)
+            for meta in metas
+            if meta.get("pdf_url")
+        }
         if not tasks:
             return {}
-        results = dict(zip(tasks.keys(), await asyncio.gather(*tasks.values())))
-    return results
+        return dict(zip(tasks.keys(), await asyncio.gather(*tasks.values())))
 
 
-# ── 단일일 처리 (수집 제외, 메타데이터는 이미 있음) ──────────────────
-
-async def process_date_metas(
-    pub_str: str,
-    metas: list[dict],
-    pdf_workers: int,
-    s3_executor: ThreadPoolExecutor,
-) -> dict:
-    """이미 수집된 메타데이터로 PDF 다운로드 → S3 업로드 → manifest"""
-    t0 = time.perf_counter()
-
-    if not metas:
-        return {"date": pub_str, "total": 0, "uploaded": 0, "skipped": 0, "failed": 0, "no_pdf": 0, "elapsed": 0}
-
-    # 중복 필터링 (S3 exists 병렬)
-    async def _check_dup(meta: dict) -> tuple[dict, bool]:
-        if not meta.get("pdf_url"):
-            return meta, False
-        key = bronze_key(meta["증권사"], meta["발행일"], meta["report_id"])
-        exists = await s3_exists(key)
-        return meta, exists
-
-    check_results = await asyncio.gather(*[_check_dup(m) for m in metas])
-    new_metas = [m for m, is_dup in check_results if not is_dup]
-    skipped = sum(1 for _, is_dup in check_results if is_dup)
-
-    if not new_metas:
-        return {"date": pub_str, "total": len(metas), "uploaded": 0, "skipped": skipped, "failed": 0, "no_pdf": 0, "elapsed": round(time.perf_counter() - t0, 1)}
-
-    # PDF 병렬 다운로드
-    pdf_results = await download_all_pdfs(new_metas, workers=pdf_workers)
-
-    # S3 병렬 업로드
-    uploaded = 0
-    failed = 0
-    no_pdf_cnt = 0
-    firm_entries: dict[str, list[dict]] = defaultdict(list)
-
-    def _do_upload(meta: dict) -> tuple[str, dict]:
-        pdf_data = pdf_results.get(meta["report_id"])
-        firm = meta["증권사"]
-        rid = meta["report_id"]
-        pub = meta["발행일"]
-        key = bronze_key(firm, pub, rid) if pdf_data else None
-
-        entry = {
-            "report_id": rid,
-            "source": firm,
-            "종목명": meta.get("종목명", ""),
-            "증권사": firm,
-            "발행일": pub,
-            "s3_key": key,
-            "파싱상태": "pending" if key else "pdf_missing",
-        }
-
-        if pdf_data is None:
-            return ("no_pdf" if not meta.get("pdf_url") else "failed", entry)
-
-        if _s3_upload(key, pdf_data):
-            return ("uploaded", entry)
-        entry["s3_key"] = None
-        entry["파싱상태"] = "pdf_missing"
-        return ("failed", entry)
-
-    loop = asyncio.get_running_loop()
-    futures = [loop.run_in_executor(s3_executor, _do_upload, m) for m in new_metas]
-    for fut in asyncio.as_completed(futures):
-        status, entry = await fut
-        firm = entry["증권사"]
-        firm_entries[firm].append(entry)
-        if status == "uploaded":
-            uploaded += 1
-        elif status == "failed":
-            failed += 1
-        else:
-            no_pdf_cnt += 1
-
-    # Manifest 업로드
-    await asyncio.gather(*[s3_upload_json(manifest_key(f, pub_str), entries) for f, entries in firm_entries.items()])
-
-    elapsed = time.perf_counter() - t0
+def manifest_entry(meta: dict[str, Any], s3_key: str | None, status: str) -> dict[str, Any]:
+    firm = meta["증권사"]
     return {
-        "date": pub_str,
-        "total": len(metas),
-        "new": len(new_metas),
-        "uploaded": uploaded,
-        "skipped": skipped,
-        "failed": failed,
-        "no_pdf": no_pdf_cnt,
-        "elapsed": round(elapsed, 1),
+        "report_id": meta["report_id"],
+        "source": firm,
+        "title": meta.get("title", ""),
+        "종목명": meta.get("종목명", ""),
+        "종목코드": meta.get("stock_code") or meta.get("종목코드"),
+        "증권사": firm,
+        "발행일": meta["발행일"],
+        "s3_key": s3_key,
+        "파싱상태": status,
     }
 
 
-# ── 체크포인트 ────────────────────────────────────────────────────────
-
-def load_checkpoint() -> Optional[str]:
-    if not CHECKPOINT_FILE.exists():
-        return None
-    try:
-        data = json.loads(CHECKPOINT_FILE.read_text(encoding="utf-8"))
-        return data.get("last_completed_date")
-    except Exception:
-        return None
-
-
-def save_checkpoint(date_str: str, stats: dict):
-    CHECKPOINT_FILE.write_text(
-        json.dumps({
-            "last_completed_date": date_str,
-            "total_uploaded": stats.get("total_uploaded", 0),
-            "days_done": stats.get("days_done", 0),
-            "updated_at": datetime.now().isoformat(),
-        }, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-
-# ── 백필 (단일 패스 수집 + 크로스데이 병렬 업로드) ────────────────────
-
-def _shutdown_handler(signum, frame):
-    global _shutdown
-    if not _shutdown:
-        logger.warning("종료 신호 수신. 현재 청크 완료 후 정지... (한 번 더 누르면 강제종료)")
-        _shutdown = True
-    else:
-        logger.error("강제 종료!")
-        os._exit(1)
-
-
-async def backfill_async(
-    start_date: date,
-    end_date: date,
-    pdf_workers: int = 25,
-    s3_workers: int = 15,
-    days_parallel: int = 5,
-    resume_from: Optional[str] = None,
-) -> dict:
-    """단일 패스 수집 → 날짜별 그룹핑 → 크로스데이 병렬 업로드"""
-    from collectors.naver import fetch_all_since_async
-
-    batch_start = time.perf_counter()
-
-    # ── Phase 1: 병렬 페이지 페칭 (aiohttp, 20페이지씩 동시) ──
-    logger.info("━━━ Phase 1: 병렬 페이지 수집 (%s → %s) ━━━", start_date.isoformat(), date.today().isoformat())
-    t_collect = time.perf_counter()
-
-    all_metas = await fetch_all_since_async(start_date, page_batch=20, max_conn=30)
-
-    collect_elapsed = time.perf_counter() - t_collect
-    logger.info("수집 완료: %d건 (%.1f초)", len(all_metas), collect_elapsed)
-
-    if not all_metas:
-        logger.info("수집된 리포트 없음")
-        return {"total_uploaded": 0, "days_done": 0, "elapsed_hours": 0}
-
-    # ── 날짜별 그룹핑 ──
-    by_date: dict[str, list[dict]] = defaultdict(list)
-    for meta in all_metas:
-        by_date[meta["발행일"]].append(meta)
-
-    # end_date 까지만 필터 + resume 적용
-    target_dates = sorted(d for d in by_date.keys() if start_date.isoformat() <= d <= end_date.isoformat())
-    if resume_from:
-        target_dates = [d for d in target_dates if d > resume_from]
-        logger.info("체크포인트 복구: %s 이후부터 (%d일)", resume_from, len(target_dates))
-
-    total_dates = len(target_dates)
-    logger.info("━━━ Phase 2: 병렬 업로드 (%d일, days=%d, pdf=%d, s3=%d) ━━━",
-                 total_dates, days_parallel, pdf_workers, s3_workers)
-
-    # ── Phase 2: 청크 단위 병렬 업로드 ──
-    total_uploaded = 0
-    days_done = 0
-    s3_executor = ThreadPoolExecutor(max_workers=s3_workers)
-
-    try:
-        for chunk_start_idx in range(0, total_dates, days_parallel):
-            if _shutdown:
-                logger.warning("백필 중단됨")
-                break
-
-            chunk_dates = target_dates[chunk_start_idx:chunk_start_idx + days_parallel]
-            chunk_num = chunk_start_idx // days_parallel + 1
-            total_chunks = (total_dates + days_parallel - 1) // days_parallel
-
-            tasks = [process_date_metas(d, by_date[d], pdf_workers, s3_executor) for d in chunk_dates]
-            day_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            for d, result in zip(chunk_dates, day_results):
-                if isinstance(result, Exception):
-                    logger.error("%s 예외: %s", d, result)
-                    days_done += 1
-                    continue
-
-                days_done += 1
-                total_uploaded += result.get("uploaded", 0)
-
-                # 체크포인트
-                save_checkpoint(d, {"total_uploaded": total_uploaded, "days_done": days_done})
-
-                if result.get("total", 0) > 0:
-                    logger.info("[%s] uploaded=%d / total=%d (%.1fs)",
-                                d, result["uploaded"], result["total"], result.get("elapsed", 0))
-
-            # 진행률
-            elapsed = time.perf_counter() - batch_start
-            rate = elapsed / days_done if days_done > 0 else 0
-            remaining = rate * (total_dates - days_done)
-            logger.info("CHUNK %d/%d 완료 | 진행: %d/%d일 (%d%%) | %.1f초/일 | 남은 약 %.1f시간",
-                         chunk_num, total_chunks, days_done, total_dates,
-                         int(days_done / total_dates * 100), rate, remaining / 3600)
-
-    finally:
-        s3_executor.shutdown(wait=False)
-
-    elapsed = time.perf_counter() - batch_start
-    prefix = "중단:" if _shutdown else ""
-    logger.info("=== %s 백필 %s: %d건 / %d일 (%.1f시간) ===",
-                prefix, "완료" if not _shutdown else "", total_uploaded, days_done, elapsed / 3600)
-
-    return {"total_uploaded": total_uploaded, "days_done": days_done, "elapsed_hours": elapsed / 3600}
-
-
-# ── 단일일 모드 ───────────────────────────────────────────────────────
-
-async def process_single_day_full(
-    target_date: date,
+async def process_date_metas(
+    pub_date: str,
+    metas: list[dict[str, Any]],
     pdf_workers: int = 20,
-    s3_workers: int = 15,
-) -> dict:
-    """당일/특정일: 수집 + PDF + S3"""
-    from collectors.naver import NaverCollector
+) -> dict[str, Any]:
+    """하루치 Naver 메타데이터 -> PDF 업로드 -> firm별 manifest 업로드."""
+    started = time.perf_counter()
+    stats = Counter(total=len(metas))
+    firm_entries: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    download_targets: list[dict[str, Any]] = []
 
-    collector = NaverCollector()
-    metas = await asyncio.to_thread(collector.fetch_list, target_date)
-    collector.session.close()
+    for meta in metas:
+        firm = meta["증권사"]
+        report_id = meta["report_id"]
+        key = bronze_key(firm, meta["발행일"], report_id)
 
-    pub_str = target_date.isoformat()
-    if not metas:
-        logger.info("%s → 0건", pub_str)
-        return {"date": pub_str, "total": 0, "uploaded": 0, "skipped": 0, "failed": 0, "no_pdf": 0, "elapsed": 0}
+        if not meta.get("pdf_url"):
+            firm_entries[firm].append(manifest_entry(meta, None, "pdf_missing"))
+            stats["no_pdf"] += 1
+            continue
 
-    s3_executor = ThreadPoolExecutor(max_workers=s3_workers)
-    try:
-        result = await process_date_metas(pub_str, metas, pdf_workers, s3_executor)
-    finally:
-        s3_executor.shutdown(wait=False)
+        if s3_exists(key):
+            firm_entries[firm].append(manifest_entry(meta, key, "pending"))
+            stats["skipped"] += 1
+            continue
+
+        download_targets.append(meta)
+
+    pdf_results = await download_all_pdfs(download_targets, workers=pdf_workers)
+
+    for meta in download_targets:
+        firm = meta["증권사"]
+        report_id = meta["report_id"]
+        key = bronze_key(firm, meta["발행일"], report_id)
+        pdf_data = pdf_results.get(report_id)
+
+        if pdf_data and s3_upload_pdf(key, pdf_data):
+            firm_entries[firm].append(manifest_entry(meta, key, "pending"))
+            stats["uploaded"] += 1
+        else:
+            firm_entries[firm].append(manifest_entry(meta, None, "pdf_missing"))
+            stats["failed"] += 1
+
+    for firm, entries in firm_entries.items():
+        s3_upload_json(manifest_key(firm, pub_date), entries)
+        logger.info("manifest uploaded: %s (%d rows)", manifest_key(firm, pub_date), len(entries))
+
+    elapsed = round(time.perf_counter() - started, 1)
+    result = {
+        "date": pub_date,
+        "total": stats["total"],
+        "uploaded": stats["uploaded"],
+        "skipped": stats["skipped"],
+        "failed": stats["failed"],
+        "no_pdf": stats["no_pdf"],
+        "manifest_firms": len(firm_entries),
+        "elapsed": elapsed,
+    }
+    logger.info("Naver bronze done: %s", result)
     return result
 
 
-def run_single_day(target_date: date, pdf_workers: int = 20, s3_workers: int = 15):
-    async def _run():
-        result = await process_single_day_full(target_date, pdf_workers, s3_workers)
-        logger.info("=== 완료: %s → total=%d uploaded=%d (%.1fs) ===",
-                     result["date"], result["total"], result["uploaded"], result["elapsed"])
-        return result
-    return asyncio.run(_run())
+async def collect_date(target_date: date) -> list[dict[str, Any]]:
+    return await collect_naver_date(target_date)
+
+
+async def run_bronze_naver_async(
+    target_date: str | date | None = None,
+    pdf_workers: int = 20,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    target = parse_date(target_date)
+    pub_date = target.isoformat()
+    metas = await collect_date(target)
+
+    logger.info("Naver target: %s -> %d reports", pub_date, len(metas))
+    if dry_run:
+        by_firm = dict(sorted(Counter(m.get("증권사", "") for m in metas).items()))
+        return {"date": pub_date, "total": len(metas), "by_firm": by_firm, "dry_run": True}
+
+    return await process_date_metas(pub_date, metas, pdf_workers=pdf_workers)
 
 
 def run_bronze_naver(
     target_date: str | date | None = None,
     pdf_workers: int = 20,
-    s3_workers: int = 15,
     dry_run: bool = False,
-) -> dict:
+) -> dict[str, Any]:
     """Airflow PythonOperator 엔트리포인트."""
-    from collectors.naver import NaverCollector
-
-    target = (
-        datetime.strptime(target_date, "%Y-%m-%d").date()
-        if isinstance(target_date, str)
-        else target_date
-        if isinstance(target_date, date)
-        else date.today()
-    )
-
-    if dry_run:
-        collector = NaverCollector()
-        try:
-            metas = collector.fetch_list(target)
-        finally:
-            collector.session.close()
-        logger.info("DRY RUN %s → %d건", target.isoformat(), len(metas))
-        return {
-            "date": target.isoformat(),
-            "total": len(metas),
-            "dry_run": True,
-        }
-
-    return run_single_day(target, pdf_workers, s3_workers)
+    return asyncio.run(run_bronze_naver_async(target_date, pdf_workers, dry_run))
 
 
 def build_dag():
@@ -468,8 +513,8 @@ def build_dag():
         dag_id="opik_bronze_naver",
         description="네이버 경유 증권사 리포트 PDF를 bronze S3에 일배치 적재",
         default_args=default_args,
-        start_date=datetime(2026, 1, 1),
-        schedule="@daily",
+        start_date=pendulum.datetime(2026, 1, 1, tz="Asia/Seoul"),
+        schedule="50 1 * * *",
         catchup=False,
         max_active_runs=1,
         tags=["opik", "bronze", "naver", "reports"],
@@ -480,7 +525,6 @@ def build_dag():
             op_kwargs={
                 "target_date": "{{ ds }}",
                 "pdf_workers": 20,
-                "s3_workers": 15,
             },
         )
 
@@ -490,60 +534,18 @@ def build_dag():
 dag = build_dag()
 
 
-# ── CLI ────────────────────────────────────────────────────────────────
+def parse_args():
+    parser = argparse.ArgumentParser(description="OPIK Bronze daily upload via Naver")
+    parser.add_argument("--date", type=str, help="수집일 YYYY-MM-DD")
+    parser.add_argument("--workers", type=int, default=20, help="PDF 동시 다운로드 수")
+    parser.add_argument("--dry-run", action="store_true")
+    return parser.parse_args()
+
 
 def main():
-    parser = argparse.ArgumentParser(description="OPIK Bronze 적재 (네이버 경유, Async + 단일패스 백필)")
-    parser.add_argument("--date", type=str, help="수집일 (YYYY-MM-DD)")
-    parser.add_argument("--backfill", action="store_true", help="백필 모드")
-    parser.add_argument("--start", type=str, help="백필 시작일")
-    parser.add_argument("--end", type=str, help="백필 종료일")
-    parser.add_argument("--workers", type=int, default=25, help="PDF 동시 다운로드 수 (기본 25)")
-    parser.add_argument("--s3-workers", type=int, default=15, help="S3 동시 업로드 수 (기본 15)")
-    parser.add_argument("--days", type=int, default=5, help="크로스데이 동시 처리 일수 (기본 5)")
-    parser.add_argument("--resume", action="store_true", help="체크포인트에서 이어서")
-    parser.add_argument("--dry-run", action="store_true", help="수집만, 업로드 X")
-    args = parser.parse_args()
-
-    if args.dry_run:
-        from collectors.naver import NaverCollector
-
-        collector = NaverCollector()
-        target = datetime.strptime(args.date, "%Y-%m-%d").date() if args.date else date.today()
-        metas = collector.fetch_list(target)
-        print(f"\n=== Dry Run: {target.isoformat()} → {len(metas)}건 ===\n")
-        for m in metas:
-            print(f"  [{m['증권사']}] {m.get('종목명','-')} ({m.get('stock_code','-')})")
-            print(f"    {m['title'][:70]}")
-            print(f"    PDF: {m.get('pdf_url','없음')}")
-            print()
-        return
-
-    if args.backfill:
-        start = datetime.strptime(args.start, "%Y-%m-%d").date()
-        end = datetime.strptime(args.end, "%Y-%m-%d").date()
-
-        resume_from = None
-        if args.resume:
-            cp = load_checkpoint()
-            if cp:
-                resume_from = cp
-                logger.info("체크포인트 복구: %s 이후부터 재개", cp)
-            else:
-                logger.info("체크포인트 없음, 처음부터")
-
-        logger.info("백필: %s → %s (pdf=%d, s3=%d, days=%d, resume=%s)",
-                     start.isoformat(), end.isoformat(),
-                     args.workers, args.s3_workers, args.days, resume_from or "처음부터")
-
-        signal.signal(signal.SIGINT, _shutdown_handler)
-        try:
-            asyncio.run(backfill_async(start, end, args.workers, args.s3_workers, args.days, resume_from))
-        except KeyboardInterrupt:
-            logger.info("Ctrl+C 감지, 체크포인트 저장됨. --resume 으로 이어서 실행 가능")
-    else:
-        target = datetime.strptime(args.date, "%Y-%m-%d").date() if args.date else date.today()
-        run_single_day(target, args.workers, args.s3_workers)
+    args = parse_args()
+    result = run_bronze_naver(args.date, args.workers, args.dry_run)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

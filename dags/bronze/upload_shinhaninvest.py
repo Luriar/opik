@@ -25,17 +25,17 @@ import argparse
 import hashlib
 import json
 import logging
+import os
 import re
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
 from typing import Any
 
+import pendulum
 import requests
+import boto3
 from botocore.exceptions import ClientError
-
-from opik_config import S3_BUCKET, load_dotenv
-from opik_s3 import get_s3_client
 
 try:
     from airflow import DAG
@@ -45,7 +45,45 @@ except ImportError:  # 로컬 CLI 실행 환경에는 Airflow가 없을 수 있�
     PythonOperator = None
 
 
-load_dotenv()
+def load_local_env() -> None:
+    """Load .env without depending on opik_config."""
+    candidates = []
+    if root := os.getenv("OPIK_ROOT"):
+        candidates.append(Path(root) / ".env")
+    candidates.extend([
+        OPIK_ROOT / ".env",
+        Path(__file__).resolve().parents[1] / ".env",
+        Path(__file__).parent / ".env",
+        Path.cwd() / ".env",
+    ])
+
+    for env_path in candidates:
+        if not env_path.exists():
+            continue
+        with open(env_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+        break
+
+
+load_local_env()
+
+S3_BUCKET = (
+    os.getenv("S3_BUCKET")
+    or os.getenv("AWS_S3_BUCKET_NAME")
+    or "s3-opik-bucket"
+).strip("'\"")
+S3_REGION = (
+    os.getenv("S3_REGION")
+    or os.getenv("AWS_REGION")
+    or os.getenv("AWS_DEFAULT_REGION")
+    or "ap-northeast-2"
+).strip("'\"")
+s3_client = boto3.client("s3", region_name=S3_REGION)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -66,7 +104,6 @@ HEADERS = {
 }
 
 PUT_EXTRA: dict[str, Any] = {}
-s3_client = get_s3_client(max_pool_connections=20)
 
 
 def normalize_date(value: str | date, fmt: str = "iso") -> str:
@@ -252,6 +289,7 @@ def run_bronze_shinhaninvest(
                 "source": FIRM_NAME,
                 "title": item.get("f1", ""),
                 "종목명": item.get("f2", ""),
+                "종목코드": extract_stock_code(item.get("f1", "")),
                 "증권사": FIRM_NAME,
                 "발행일": pub_date,
                 "s3_key": s3_key,
@@ -304,8 +342,8 @@ def build_dag():
         dag_id="opik_bronze_shinhaninvest",
         description="신한투자증권 기업분석 리포트 PDF를 bronze S3에 일배치 적재",
         default_args=default_args,
-        start_date=datetime(2026, 1, 1),
-        schedule="@daily",
+        start_date=pendulum.datetime(2026, 1, 1, tz="Asia/Seoul"),
+        schedule="50 1 * * *",
         catchup=False,
         max_active_runs=1,
         tags=["opik", "bronze", "shinhaninvest", "reports"],

@@ -40,17 +40,45 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from botocore.exceptions import ClientError
 
-from opik_config import (
-    S3_BUCKET as CONFIG_S3_BUCKET,
-    S3_REGION as CONFIG_S3_REGION,
-    load_dotenv,
-)
+
+def load_local_env() -> None:
+    """Load .env without depending on project-local helper modules."""
+    candidates: list[Path] = []
+    if root := os.getenv("OPIK_ROOT"):
+        candidates.append(Path(root) / ".env")
+    candidates.extend([
+        OPIK_ROOT / ".env",
+        OPIK_ROOT.parent / ".env",
+        Path(__file__).resolve().parents[1] / ".env",
+        Path(__file__).parent / ".env",
+        Path.cwd() / ".env",
+    ])
+
+    for env_path in candidates:
+        if not env_path.exists():
+            continue
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+        return
 
 
-load_dotenv()
+load_local_env()
 
-S3_BUCKET = os.getenv("S3_BUCKET", CONFIG_S3_BUCKET)
-S3_REGION = os.getenv("S3_REGION", CONFIG_S3_REGION)
+S3_BUCKET = (
+    os.getenv("S3_BUCKET")
+    or os.getenv("AWS_S3_BUCKET_NAME")
+    or "s3-opik-bucket"
+).strip("'\"")
+S3_REGION = (
+    os.getenv("S3_REGION")
+    or os.getenv("AWS_REGION")
+    or os.getenv("AWS_DEFAULT_REGION")
+    or "ap-northeast-2"
+).strip("'\"")
 s3 = boto3.client("s3", region_name=S3_REGION)
 
 logging.basicConfig(

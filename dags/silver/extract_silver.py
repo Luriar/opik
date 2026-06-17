@@ -1,38 +1,88 @@
-"""OPIK — Silver 텍스트 추출 파이프라인
+"""OPIK — Silver 텍스트 추출 DAG.
 
-S3 bronze PDF → PyMuPDF 텍스트 추출 → S3 silver JSON 적재
+Bronze PDF -> PyMuPDF text extraction -> Silver JSON
 
-사용법:
-    python extract_silver.py --dry-run
-    python extract_silver.py --start 2026-01-01 --end 2026-12-31 --workers 10
-    python extract_silver.py --days 5 --workers 40
-    python extract_silver.py --resume
+일배치 전제:
+    - 기존 5만 건 백필용 전체 manifest scan/cache/checkpoint 로직은 제거
+    - 실행일 하루치 bronze/{증권사}/{YYYY-MM-DD}/_manifest.json만 조회
+    - manifest의 s3_key가 있는 PDF만 다운로드/파싱
+    - silver/{증권사}/{YYYY-MM-DD}/{report_id}.json 저장
+    - 텍스트가 부족한 PDF는 silver/_ocr_needed/{YYYY-MM-DD}.json에 기록
+
+Usage:
+    python extract_silver.py --date 2026-06-12
+    python extract_silver.py --start 2026-06-01 --end 2026-06-12
+    python extract_silver.py --date 2026-06-12 --dry-run
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 import sys
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+OPIK_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(OPIK_ROOT))
 
 import argparse
 import asyncio
 import json
 import logging
+import os
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-from datetime import datetime
-from pathlib import Path
-from typing import Optional
+from datetime import date, datetime, timedelta
+from typing import Any
 
-import fitz
+import pendulum
+import boto3
 from botocore.exceptions import ClientError
 
-from opik_config import S3_BUCKET, S3_REGION, load_dotenv
-from opik_s3 import s3
+try:
+    from airflow import DAG
+    from airflow.operators.python import PythonOperator
+except ImportError:  # 로컬 CLI 실행 환경에는 Airflow가 없을 수 있다.
+    DAG = None
+    PythonOperator = None
 
-load_dotenv()
+
+def load_local_env() -> None:
+    """Load .env without depending on opik_config."""
+    candidates = []
+    if root := os.getenv("OPIK_ROOT"):
+        candidates.append(Path(root) / ".env")
+    candidates.extend([
+        OPIK_ROOT / ".env",
+        Path(__file__).resolve().parents[1] / ".env",
+        Path(__file__).parent / ".env",
+        Path.cwd() / ".env",
+    ])
+
+    for env_path in candidates:
+        if not env_path.exists():
+            continue
+        with open(env_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+        break
+
+
+load_local_env()
+S3_BUCKET = (
+    os.getenv("S3_BUCKET")
+    or os.getenv("AWS_S3_BUCKET_NAME")
+    or "s3-opik-bucket"
+).strip("'\"")
+S3_REGION = (
+    os.getenv("S3_REGION")
+    or os.getenv("AWS_REGION")
+    or os.getenv("AWS_DEFAULT_REGION")
+    or "ap-northeast-2"
+).strip("'\"")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,89 +91,196 @@ logging.basicConfig(
 )
 logger = logging.getLogger("opik.silver")
 
-CHECKPOINT_FILE = Path(__file__).parent / ".silver_checkpoint.json"
-MANIFEST_CACHE_FILE = Path(__file__).parent / ".silver_manifest_cache.json"
+s3 = boto3.client("s3", region_name=S3_REGION)
+
+BRONZE_PREFIX = "bronze/"
+SILVER_PREFIX = "silver/"
+EXTRACT_TIMEOUT = 30
+SILVER_SCHEDULE = os.getenv("SILVER_SCHEDULE", "30 2 * * *")
 
 
-def silver_key(meta: dict) -> str:
-    return f"silver/{meta['증권사']}/{meta['발행일']}/{meta['report_id']}.json"
-
-
-def bronze_pdf_key(meta: dict) -> str:
-    return f"bronze/{meta['증권사']}/{meta['발행일']}/{meta['report_id']}.pdf"
-
-
-async def s3_download(key: str) -> Optional[bytes]:
-    def _dl():
-        try:
-            return s3.get_object(Bucket=S3_BUCKET, Key=key)["Body"].read()
-        except ClientError as e:
-            if "NoSuchKey" in str(e):
-                return None
-            raise
-    return await asyncio.to_thread(_dl)
-
-
-async def s3_exists(key: str) -> bool:
+def parse_date(value: str | date, label: str = "date") -> date:
+    if isinstance(value, date):
+        return value
     try:
-        await asyncio.to_thread(s3.head_object, Bucket=S3_BUCKET, Key=key)
+        return datetime.strptime(str(value), "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise ValueError(f"{label}는 YYYY-MM-DD 형식이어야 합니다: {value}") from exc
+
+
+def iter_dates(start_date: str | date, end_date: str | date):
+    current = parse_date(start_date, "start_date")
+    end = parse_date(end_date, "end_date")
+    if current > end:
+        raise ValueError(f"start_date가 end_date보다 늦습니다: {current} > {end}")
+    while current <= end:
+        yield current.isoformat()
+        current += timedelta(days=1)
+
+
+def default_target_date(lag_days: int = 1) -> str:
+    return (date.today() - timedelta(days=lag_days)).isoformat()
+
+
+def silver_key(meta: dict[str, Any]) -> str:
+    return f"{SILVER_PREFIX}{meta['증권사']}/{meta['발행일']}/{meta['report_id']}.json"
+
+
+def bronze_pdf_key(meta: dict[str, Any]) -> str:
+    return normalize_s3_key(meta.get("s3_key")) or (
+        f"{BRONZE_PREFIX}{meta['증권사']}/{meta['발행일']}/{meta['report_id']}.pdf"
+    )
+
+
+def bronze_manifest_key(broker: str, date_str: str) -> str:
+    return f"{BRONZE_PREFIX}{broker}/{date_str}/_manifest.json"
+
+
+def ocr_needed_key(date_str: str) -> str:
+    return f"{SILVER_PREFIX}_ocr_needed/{date_str}.json"
+
+
+def s3_exists(key: str) -> bool:
+    try:
+        s3.head_object(Bucket=S3_BUCKET, Key=key)
         return True
-    except ClientError:
-        return False
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        if code in {"404", "NoSuchKey", "NotFound"}:
+            return False
+        raise
 
 
-async def s3_upload_json(key: str, data) -> bool:
+def s3_download(key: str) -> bytes | None:
     try:
-        body = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
-        await asyncio.to_thread(
-            s3.put_object, Bucket=S3_BUCKET, Key=key,
-            Body=body, ContentType="application/json",
+        return s3.get_object(Bucket=S3_BUCKET, Key=key)["Body"].read()
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        if code in {"404", "NoSuchKey", "NotFound"}:
+            return None
+        raise
+
+
+def s3_load_json(key: str) -> Any | None:
+    body = s3_download(key)
+    if body is None:
+        return None
+    return json.loads(body.decode("utf-8"))
+
+
+def s3_upload_json(key: str, data: Any) -> None:
+    s3.put_object(
+        Bucket=S3_BUCKET,
+        Key=key,
+        Body=json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"),
+        ContentType="application/json; charset=utf-8",
+    )
+
+
+def normalize_s3_key(value: str | None) -> str:
+    if not value:
+        return ""
+    value = value.strip()
+    if value.startswith("s3://"):
+        without_scheme = value[5:]
+        parts = without_scheme.split("/", 1)
+        return parts[1] if len(parts) == 2 else ""
+    return value
+
+
+def normalize_manifest_entry(
+    item: Any,
+    broker: str,
+    date_str: str,
+    manifest_key_for_log: str,
+) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        logger.warning("manifest 항목이 dict가 아님: %s", manifest_key_for_log)
+        return None
+
+    status = item.get("파싱상태")
+    if status in {"pdf_missing", "dry_run"}:
+        return None
+
+    s3_key = normalize_s3_key(item.get("s3_key"))
+    if not s3_key:
+        return None
+
+    report_id = item.get("report_id")
+    if not report_id:
+        logger.warning("report_id 없는 manifest 항목 skip: %s", manifest_key_for_log)
+        return None
+
+    normalized = dict(item)
+    normalized["s3_key"] = s3_key
+    normalized.setdefault("증권사", broker)
+    normalized.setdefault("발행일", date_str)
+    normalized.setdefault("source", normalized.get("증권사", broker))
+
+    if normalized["발행일"] != date_str:
+        logger.warning(
+            "manifest 날짜 불일치 skip: %s item_date=%s target=%s",
+            manifest_key_for_log,
+            normalized["발행일"],
+            date_str,
         )
-        return True
-    except Exception as e:
-        logger.error("S3 upload fail %s: %s", key, e)
-        return False
+        return None
+
+    return normalized
 
 
-async def discover_manifests() -> list[str]:
-    keys = []
+def list_bronze_brokers() -> list[str]:
+    brokers = []
     paginator = s3.get_paginator("list_objects_v2")
-    page_n = 0
-    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix="bronze/"):
-        page_n += 1
-        for obj in page.get("Contents", []):
-            k = obj["Key"]
-            if k.endswith("_manifest.json"):
-                keys.append(k)
-        if page_n % 10 == 0:
-            logger.info("  listing page %d... (manifests %d)", page_n, len(keys))
-    return keys
+    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=BRONZE_PREFIX, Delimiter="/"):
+        for prefix in page.get("CommonPrefixes", []):
+            broker = prefix["Prefix"].rstrip("/").split("/")[-1]
+            if broker and not broker.startswith("_"):
+                brokers.append(broker)
+    return sorted(set(brokers))
 
 
-async def load_manifest_entries(manifest_key: str) -> list[dict]:
-    try:
-        body = await s3_download(manifest_key)
-        if not body:
-            return []
-        entries = json.loads(body.decode("utf-8"))
-        return [e for e in entries if e.get("s3_key") and e.get("파싱상태") != "pdf_missing"]
-    except Exception as e:
-        logger.warning("manifest load fail %s: %s", manifest_key, e)
-        return []
+def load_daily_manifest_entries(date_str: str) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for broker in list_bronze_brokers():
+        key = bronze_manifest_key(broker, date_str)
+        manifest = s3_load_json(key)
+        if not manifest:
+            continue
+        if not isinstance(manifest, list):
+            logger.warning("manifest 형식이 list가 아님: %s", key)
+            continue
+
+        for item in manifest:
+            normalized = normalize_manifest_entry(item, broker, date_str, key)
+            if normalized:
+                entries.append(normalized)
+    return entries
 
 
-_EXTRACT_TIMEOUT = 30
+def load_manifest_entries_for_range(start_date: str, end_date: str) -> dict[str, list[dict[str, Any]]]:
+    by_date: dict[str, list[dict[str, Any]]] = {}
+    for date_str in iter_dates(start_date, end_date):
+        by_date[date_str] = load_daily_manifest_entries(date_str)
+    return by_date
 
 
 def _fitz_open_safe(pdf_bytes: bytes):
-    """fitz.open() 자체가 C++ 콜백 충돌로 죽는 PDF 방어"""
+    try:
+        import fitz
+    except ImportError as exc:
+        raise RuntimeError(
+            "PyMuPDF가 설치되어 있지 않아 PDF 텍스트 추출을 실행할 수 없습니다. "
+            "Airflow 이미지/컨테이너에 `pymupdf`를 설치하세요."
+        ) from exc
+
     try:
         return fitz.open(stream=pdf_bytes, filetype="pdf")
     except Exception:
         return None
 
 
-def extract_text(pdf_bytes: bytes) -> tuple:
+def extract_text(pdf_bytes: bytes) -> tuple[str, int, int]:
     doc = _fitz_open_safe(pdf_bytes)
     if doc is None:
         return "", 0, 0
@@ -144,17 +301,17 @@ def extract_text(pdf_bytes: bytes) -> tuple:
         doc.close()
 
 
-def extract_text_safe(pdf_bytes: bytes) -> tuple:
+def extract_text_safe(pdf_bytes: bytes) -> tuple[str, int, int]:
     with ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(extract_text, pdf_bytes)
         try:
-            return future.result(timeout=_EXTRACT_TIMEOUT)
-        except (FutureTimeoutError, SystemError, RuntimeError) as e:
-            logger.debug("extract timeout/error: %s", e)
-            return _fallback_extract(pdf_bytes)
+            return future.result(timeout=EXTRACT_TIMEOUT)
+        except (FutureTimeoutError, SystemError, RuntimeError) as exc:
+            logger.debug("extract timeout/error: %s", exc)
+            return fallback_extract(pdf_bytes)
 
 
-def _fallback_extract(pdf_bytes: bytes) -> tuple:
+def fallback_extract(pdf_bytes: bytes) -> tuple[str, int, int]:
     doc = _fitz_open_safe(pdf_bytes)
     if doc is None:
         return "", 0, 0
@@ -165,222 +322,281 @@ def _fallback_extract(pdf_bytes: bytes) -> tuple:
         for page in doc:
             try:
                 text = page.get_text()
-                if text.strip():
-                    pages.append(text.strip())
-                    pages_with_text += 1
             except Exception:
                 continue
+            if text.strip():
+                pages.append(text.strip())
+                pages_with_text += 1
         return "\n\n".join(pages), total_pages, pages_with_text
     finally:
         doc.close()
 
 
-def _do_extract(meta: dict, pdf_bytes: bytes) -> dict:
+def build_silver_payload(meta: dict[str, Any], pdf_bytes: bytes) -> dict[str, Any]:
     text, total_pages, pages_with_text = extract_text_safe(pdf_bytes)
     result = {
         "report_id": meta["report_id"],
-        "source": meta.get("source", ""),
+        "source": meta.get("source") or meta.get("증권사", ""),
         "증권사": meta["증권사"],
         "종목명": meta.get("종목명", ""),
+        "종목코드": meta.get("종목코드"),
         "발행일": meta["발행일"],
-        "title": meta.get("title", meta.get("제목", "")),
+        "title": meta.get("title") or meta.get("제목", ""),
         "text": text,
         "text_len": len(text),
         "pages_total": total_pages,
         "pages_with_text": pages_with_text,
+        "bronze_s3_key": bronze_pdf_key(meta),
+        "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
     }
-    if pages_with_text == 0 or (pages_with_text < total_pages * 0.3 and len(text) < 200):
+    if total_pages == 0 or pages_with_text == 0 or (
+        pages_with_text < total_pages * 0.3 and len(text) < 200
+    ):
         result["needs_ocr"] = True
     return result
 
 
-async def process_one(meta: dict) -> tuple:
-    pdf_key = bronze_pdf_key(meta)
-    slv_key = silver_key(meta)
-
-    if await s3_exists(slv_key):
+def process_one(meta: dict[str, Any], overwrite: bool = False) -> tuple[str, dict[str, Any] | None]:
+    out_key = silver_key(meta)
+    if not overwrite and s3_exists(out_key):
         return "skipped", None
 
-    pdf_data = await s3_download(pdf_key)
-    if not pdf_data:
+    pdf_key = bronze_pdf_key(meta)
+    pdf_bytes = s3_download(pdf_key)
+    if not pdf_bytes:
         return "no_pdf", None
 
     try:
-        result = await asyncio.to_thread(_do_extract, meta, pdf_data)
-    except Exception as e:
-        logger.error("extract fail %s: %s", meta.get("report_id", "?")[:12], e)
+        payload = build_silver_payload(meta, pdf_bytes)
+    except Exception as exc:
+        logger.error("extract fail %s: %s", meta.get("report_id", "?")[:12], exc)
         return "extract_failed", None
 
-    if await s3_upload_json(slv_key, result):
-        return ("ocr_needed" if result.get("needs_ocr") else "extracted"), result
-    return "upload_failed", None
+    s3_upload_json(out_key, payload)
+    return ("ocr_needed" if payload.get("needs_ocr") else "extracted"), payload
 
 
-async def process_date(date_str: str, entries: list[dict], workers: int) -> dict:
+async def process_date(
+    date_str: str,
+    entries: list[dict[str, Any]],
+    workers: int = 10,
+    overwrite: bool = False,
+    dry_run: bool = False,
+) -> dict[str, Any]:
     t0 = time.perf_counter()
+    stats = Counter({"total": len(entries)})
+
+    if dry_run:
+        stats["dry_run"] = len(entries)
+        return {
+            "date": date_str,
+            "total": len(entries),
+            "dry_run": len(entries),
+            "elapsed": round(time.perf_counter() - t0, 1),
+        }
+
     sem = asyncio.Semaphore(workers)
 
     async def bounded(meta):
         async with sem:
-            return await process_one(meta)
+            return await asyncio.to_thread(process_one, meta, overwrite)
 
-    results = await asyncio.gather(*[bounded(e) for e in entries], return_exceptions=True)
-
-    stats = {
-        "date": date_str, "total": len(entries),
-        "extracted": 0, "skipped": 0, "no_pdf": 0, "failed": 0, "ocr_needed": 0,
-    }
+    results = await asyncio.gather(*[bounded(entry) for entry in entries], return_exceptions=True)
     ocr_entries = []
 
-    for r in results:
-        if isinstance(r, Exception):
+    for result in results:
+        if isinstance(result, Exception):
             stats["failed"] += 1
             continue
-        status, result = r
-        stats[status] = stats.get(status, 0) + 1
-        if status == "ocr_needed" and result:
+
+        status, payload = result
+        stats[status] += 1
+        if status == "ocr_needed" and payload:
             ocr_entries.append({
-                "report_id": result["report_id"],
-                "증권사": result["증권사"],
-                "종목명": result.get("종목명", ""),
-                "발행일": result["발행일"],
-                "title": result.get("title", ""),
-                "pages_total": result.get("pages_total", 0),
-                "pages_with_text": result.get("pages_with_text", 0),
-                "text_len": result.get("text_len", 0),
+                "report_id": payload["report_id"],
+                "증권사": payload["증권사"],
+                "종목명": payload.get("종목명", ""),
+                "발행일": payload["발행일"],
+                "title": payload.get("title", ""),
+                "pages_total": payload.get("pages_total", 0),
+                "pages_with_text": payload.get("pages_with_text", 0),
+                "text_len": payload.get("text_len", 0),
+                "bronze_s3_key": payload.get("bronze_s3_key", ""),
             })
 
     if ocr_entries:
-        ocr_key = f"silver/_ocr_needed/{date_str}.json"
-        await s3_upload_json(ocr_key, ocr_entries)
+        s3_upload_json(ocr_needed_key(date_str), ocr_entries)
 
-    stats["elapsed"] = round(time.perf_counter() - t0, 1)
-    return stats
-
-
-def load_checkpoint() -> Optional[str]:
-    if not CHECKPOINT_FILE.exists():
-        return None
-    try:
-        return json.loads(CHECKPOINT_FILE.read_text(encoding="utf-8")).get("last_date")
-    except Exception:
-        return None
-
-
-def save_checkpoint(date_str: str):
-    CHECKPOINT_FILE.write_text(json.dumps({
-        "last_date": date_str,
-        "updated_at": datetime.now().isoformat(),
-    }, ensure_ascii=False), encoding="utf-8")
+    elapsed = round(time.perf_counter() - t0, 1)
+    return {
+        "date": date_str,
+        "total": stats["total"],
+        "extracted": stats["extracted"],
+        "skipped": stats["skipped"],
+        "no_pdf": stats["no_pdf"],
+        "extract_failed": stats["extract_failed"],
+        "upload_failed": stats["upload_failed"],
+        "failed": stats["failed"],
+        "ocr_needed": stats["ocr_needed"],
+        "dry_run": stats["dry_run"],
+        "elapsed": elapsed,
+    }
 
 
-async def run_silver(days_parallel: int = 3, workers: int = 10, resume: bool = False,
-                    start_date: str = None, end_date: str = None):
-    t0 = time.perf_counter()
-    all_entries: dict[str, list[dict]] = defaultdict(list)
+def summarize_by_broker(entries: list[dict[str, Any]]) -> dict[str, int]:
+    return dict(sorted(Counter(e.get("증권사", "") for e in entries).items()))
 
-    if MANIFEST_CACHE_FILE.exists():
-        logger.info("loading manifest cache...")
-        cached = json.loads(MANIFEST_CACHE_FILE.read_text(encoding="utf-8"))
-        for date_str, entries in cached.items():
-            all_entries[date_str] = entries
-        logger.info("cache: %d entries (%d days)",
-                     sum(len(v) for v in all_entries.values()), len(all_entries))
+
+async def run_silver_async(
+    target_date: str | date | None = None,
+    start_date: str | date | None = None,
+    end_date: str | date | None = None,
+    workers: int = 10,
+    days_parallel: int = 1,
+    overwrite: bool = False,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    if target_date:
+        start = end = parse_date(target_date, "date").isoformat()
     else:
-        logger.info("scanning S3 manifests...")
-        manifest_keys = await discover_manifests()
-        logger.info("%d manifests found, parallel loading (20)...", len(manifest_keys))
+        start = parse_date(start_date or default_target_date(), "start").isoformat()
+        end = parse_date(end_date or start, "end").isoformat()
 
-        sem = asyncio.Semaphore(20)
-        async def _load_one(mk):
-            async with sem:
-                return await load_manifest_entries(mk)
+    by_date = load_manifest_entries_for_range(start, end)
+    total_entries = sum(len(entries) for entries in by_date.values())
+    broker_counts = Counter()
+    for entries in by_date.values():
+        broker_counts.update(e.get("증권사", "") for e in entries)
 
-        all_lists = await asyncio.gather(*[_load_one(mk) for mk in manifest_keys])
-        for entries in all_lists:
-            for e in entries:
-                all_entries[e["발행일"]].append(e)
+    logger.info(
+        "Silver target: %s ~ %s | entries=%d | workers=%d | days_parallel=%d",
+        start,
+        end,
+        total_entries,
+        workers,
+        days_parallel,
+    )
+    if dry_run:
+        logger.info("broker counts: %s", dict(sorted(broker_counts.items())))
 
-        total = sum(len(v) for v in all_entries.values())
-        logger.info("total %d entries (%d days)", total, len(all_entries))
+    dates = sorted(by_date.keys())
+    date_results = []
+    for idx in range(0, len(dates), days_parallel):
+        chunk = dates[idx:idx + days_parallel]
+        results = await asyncio.gather(*[
+            process_date(d, by_date[d], workers=workers, overwrite=overwrite, dry_run=dry_run)
+            for d in chunk
+        ])
+        date_results.extend(results)
+        for result in results:
+            logger.info(
+                "[%s] extracted=%d skipped=%d ocr=%d total=%d (%.1fs)",
+                result["date"],
+                result.get("extracted", 0),
+                result.get("skipped", 0),
+                result.get("ocr_needed", 0),
+                result["total"],
+                result["elapsed"],
+            )
 
-        MANIFEST_CACHE_FILE.write_text(
-            json.dumps({k: v for k, v in all_entries.items()}, ensure_ascii=False),
-            encoding="utf-8",
+    totals = Counter()
+    for result in date_results:
+        totals.update({k: v for k, v in result.items() if isinstance(v, int)})
+
+    return {
+        "start_date": start,
+        "end_date": end,
+        "total_entries": total_entries,
+        "broker_counts": dict(sorted(broker_counts.items())),
+        "date_results": date_results,
+        "totals": dict(totals),
+        "dry_run": dry_run,
+    }
+
+
+def run_silver(
+    target_date: str | date | None = None,
+    start_date: str | date | None = None,
+    end_date: str | date | None = None,
+    workers: int = 10,
+    days_parallel: int = 1,
+    overwrite: bool = False,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Airflow PythonOperator 엔트리포인트."""
+    return asyncio.run(run_silver_async(
+        target_date=target_date,
+        start_date=start_date,
+        end_date=end_date,
+        workers=workers,
+        days_parallel=days_parallel,
+        overwrite=overwrite,
+        dry_run=dry_run,
+    ))
+
+
+def build_dag():
+    if DAG is None:
+        return None
+
+    default_args = {
+        "owner": "opik",
+        "retries": 1,
+        "retry_delay": timedelta(minutes=10),
+    }
+
+    with DAG(
+        dag_id="opik_silver_extract",
+        description="bronze PDF를 silver JSON 텍스트로 일배치 변환",
+        default_args=default_args,
+        start_date=pendulum.datetime(2026, 1, 1, tz="Asia/Seoul"),
+        # Bronze DAGs run at 01:50 KST. Silver is delayed so daily manifests exist.
+        schedule=SILVER_SCHEDULE,
+        catchup=False,
+        max_active_runs=1,
+        tags=["opik", "silver", "pdf", "reports"],
+    ) as dag_obj:
+        PythonOperator(
+            task_id="extract_bronze_pdf_to_silver_json",
+            python_callable=run_silver,
+            op_kwargs={
+                "target_date": "{{ ds }}",
+                "workers": 10,
+                "days_parallel": 1,
+                "overwrite": False,
+            },
         )
 
-    dates = sorted(all_entries.keys())
-    if start_date:
-        dates = [d for d in dates if d >= start_date]
-    if end_date:
-        dates = [d for d in dates if d <= end_date]
-    if start_date or end_date:
-        logger.info("date filter: %s~%s -> %d days", start_date or "first", end_date or "last", len(dates))
-    if resume:
-        cp = load_checkpoint()
-        if cp:
-            dates = [d for d in dates if d > cp]
-            logger.info("resume from %s: %d days", cp, len(dates))
+    return dag_obj
 
-    total_extracted = 0
-    days_done = 0
 
-    for i in range(0, len(dates), days_parallel):
-        chunk = dates[i:i + days_parallel]
-        tasks = [process_date(d, all_entries[d], workers) for d in chunk]
-        day_results = await asyncio.gather(*tasks)
+dag = build_dag()
 
-        for dr in day_results:
-            days_done += 1
-            total_extracted += dr.get("extracted", 0)
-            save_checkpoint(dr["date"])
-            logger.info("[%s] extracted=%d / total=%d (%.1fs)",
-                        dr["date"], dr["extracted"], dr["total"], dr["elapsed"])
 
-        elapsed = time.perf_counter() - t0
-        remaining = elapsed / days_done * (len(dates) - days_done) if days_done else 0
-        logger.info("progress: %d/%d days | extracted: %d | ~%.1fh remaining",
-                     days_done, len(dates), total_extracted, remaining / 3600)
-
-    logger.info("=== Silver done: %d / %d days (%.1fh) ===",
-                 total_extracted, days_done, (time.perf_counter() - t0) / 3600)
+def parse_args():
+    parser = argparse.ArgumentParser(description="OPIK Silver extract")
+    parser.add_argument("--date", type=str, help="처리일 YYYY-MM-DD")
+    parser.add_argument("--start", type=str, help="시작일 YYYY-MM-DD")
+    parser.add_argument("--end", type=str, help="종료일 YYYY-MM-DD")
+    parser.add_argument("--workers", type=int, default=10)
+    parser.add_argument("--days", type=int, default=1, help="동시에 처리할 날짜 수")
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    return parser.parse_args()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="OPIK Silver extract")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--days", type=int, default=3)
-    parser.add_argument("--workers", type=int, default=10)
-    parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--date", type=str)
-    parser.add_argument("--start", type=str)
-    parser.add_argument("--end", type=str)
-    args = parser.parse_args()
-
-    if args.dry_run:
-        async def _dry():
-            mks = await discover_manifests()
-            by_firm = defaultdict(int)
-            for mk in mks:
-                parts = mk.split("/")
-                if len(parts) >= 2:
-                    by_firm[parts[1]] += 1
-            logger.info("%d manifests", len(mks))
-            logger.info("by firm: %s", dict(sorted(by_firm.items())))
-            if mks:
-                sample = await load_manifest_entries(mks[0])
-                logger.info("sample: %d entries", len(sample))
-                if sample:
-                    e = sample[0]
-                    logger.info("  id=%s firm=%s date=%s",
-                                e.get("report_id", "?")[:12],
-                                e.get("증권사", "?"),
-                                e.get("발행일", "?"))
-            logger.info("est total: ~%d", len(mks) * 22)
-        asyncio.run(_dry())
-        return
-
-    asyncio.run(run_silver(args.days, args.workers, args.resume, args.start, args.end))
+    args = parse_args()
+    result = run_silver(
+        target_date=args.date,
+        start_date=args.start,
+        end_date=args.end,
+        workers=args.workers,
+        days_parallel=args.days,
+        overwrite=args.overwrite,
+        dry_run=args.dry_run,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
