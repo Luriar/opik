@@ -1,0 +1,159 @@
+﻿backtest:
+  version: "v1.0"
+
+  initial_capital: 100000000
+  currency: "KRW"
+
+  universe:
+    source: "KOSPI200_PLUS_KOSDAQ150"
+    use_daily_universe: true
+
+  portfolio:
+    candidate_size: 30
+    portfolio_size: 10
+    weighting_method: "equal_weight"
+
+  selection:
+    primary_sort: "ranking_score"
+    candidate_sort_order: "descending"
+
+    secondary_sort: "expected_return"
+    final_sort_order: "descending"
+
+    expected_return_formula: "(1 + pred_gap) * (1 + pred_intraday) - 1"
+
+  execution:
+    holding_period: "intraday"
+    buy_price: "open"
+    sell_price: "close"
+    buy_time: "market_open"
+    sell_time: "market_close"
+    allow_short: false
+    allow_leverage: false
+
+  transaction_cost:
+    buy_cost: 0.0015
+    sell_cost: 0.0015
+
+  slippage:
+    buy_slippage: 0.001
+    sell_slippage: 0.001
+
+  filters:
+    liquidity:
+      enabled: true
+      min_trading_value_ma20: 5000000000
+      alternative_min_trading_value_rank_pct: 0.20
+
+    risk:
+      enabled: true
+      max_atr_percent: 0.08
+      max_volatility_20d: 0.08
+      max_abs_pred_gap: 0.10
+
+  diversification:
+    enabled: true
+    max_names_per_sector: 3
+    max_sector_weight: 0.30
+    max_market_weight: 0.70
+
+  benchmark:
+    enabled: true
+    benchmarks:
+      - KOSPI200
+      - KOSDAQ150
+      - EQUAL_WEIGHT_UNIVERSE
+
+  metrics:
+    daily:
+      - daily_return
+      - cumulative_return
+      - drawdown
+      - turnover
+      - num_positions
+
+    performance:
+      - cumulative_return
+      - annual_return
+      - annual_volatility
+      - sharpe_ratio
+      - sortino_ratio
+      - maximum_drawdown
+      - calmar_ratio
+      - win_rate
+      - average_daily_return
+      - average_trade_return
+      - turnover
+      - hit_ratio
+      - profit_factor
+
+  output:
+    base_dir: "outputs/backtests"
+
+    files:
+      daily_portfolio: "outputs/backtests/daily_portfolio.csv"
+      daily_positions: "outputs/backtests/daily_positions.csv"
+      daily_trades: "outputs/backtests/daily_trades.csv"
+      performance_metrics: "outputs/backtests/performance_metrics.json"
+      benchmark_comparison: "outputs/backtests/benchmark_comparison.csv"
+      drawdown: "outputs/backtests/drawdown.csv"
+
+    save_parquet: true
+    save_csv: true
+    save_json: true
+
+  leakage_guard:
+    forbid_actual_return_for_selection: true
+    forbid_target_columns_for_selection: true
+    forbid_t_day_volume_filter: true
+    forbid_t_day_volatility_filter: true
+    require_prediction_before_portfolio: true
+
+  required_columns:
+    prediction_input:
+      - date
+      - ticker
+      - ranking_score
+      - pred_gap
+      - pred_intraday
+      - pred_open
+      - pred_close
+      - expected_return
+      - sector
+      - market_type
+      - atr_percent
+      - volatility_20d
+      - trading_value_ma20
+      - trading_value_rank_pct
+
+    market_data:
+      - date
+      - ticker
+      - open
+      - close
+      - volume
+      - trading_value
+
+    daily_positions:
+      - date
+      - ticker
+      - weight
+      - ranking_score
+      - pred_gap
+      - pred_intraday
+      - expected_return
+      - buy_price
+      - sell_price
+      - gross_return
+      - net_return
+      - sector
+
+    daily_portfolio:
+      - date
+      - daily_return
+      - cumulative_return
+      - benchmark_return
+      - benchmark_cumulative_return
+      - drawdown
+      - turnover
+      - num_positions
