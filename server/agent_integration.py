@@ -1,0 +1,330 @@
+"""
+Agent Integration — wires server/agents/ into the existing FastAPI server.
+
+Provides:
+  - init_agents(): wire global FAISS index, embedder, report IDs to agents
+  - v2_chat_handler(): the /v2/chat endpoint implementation
+  - get_agent_status(): health-check info about agent readiness
+
+Usage (in opik_server.py):
+  from agent_integration import init_agents, v2_chat_handler
+
+  # After FAISS index loads:
+  init_agents(faiss_index, report_ids, report_texts, embedder)
+
+  # Add route:
+  @app.post("/v2/chat", response_model=ChatResponse)
+  async def v2_chat(req: ChatRequest):
+      return await v2_chat_handler(req)
+"""
+
+import json
+import logging
+import os
+import time
+from typing import Optional, List
+
+import boto3
+
+logger = logging.getLogger("opik.agent_integration")
+
+# Agent singletons — lazy init
+_safety = None
+_intent = None
+_report = None
+_dart = None
+_analysis = None
+_composer = None
+_supervisor = None
+_ready = False
+
+AWS_REGION = os.environ.get("AWS_REGION", "ap-northeast-2")
+AGENT_ENABLED = os.environ.get("OPIK_AGENT_ENABLED", "true").lower() != "false"
+
+
+def init_agents(faiss_index, report_ids: list, report_texts: dict, embedder):
+    """Wire server globals into the agent singletons. Call after FAISS loads."""
+    global _safety, _intent, _report, _dart, _analysis, _composer, _supervisor, _ready
+
+    from server.agents.safety_agent import SafetyAgent
+    from server.agents.intent_agent import IntentAgent
+    from server.agents.report_agent import ReportAgent
+    from server.agents.dart_agent import DartAgent
+    from server.agents.analysis_agent import AnalysisAgent
+    from server.agents.response_composer import ResponseComposer
+    from server.agents.supervisor import SupervisorAgent
+
+    _safety = SafetyAgent()
+    _intent = IntentAgent()
+    _report = ReportAgent(
+        faiss_index=faiss_index,
+        report_ids=report_ids,
+        report_texts=report_texts,
+        embedder=embedder,
+    )
+    _dart = DartAgent()
+    _analysis = AnalysisAgent()
+    _composer = ResponseComposer()
+    _supervisor = SupervisorAgent()
+
+    _ready = True
+    logger.info("Agent framework initialised: 7 agents wired, FAISS=%d vectors",
+                faiss_index.ntotal if faiss_index else 0)
+
+
+def get_agent_status() -> dict:
+    """Return agent readiness for /health."""
+    return {
+        "agent_framework": "v2" if _ready else "not_initialised",
+        "agents": {
+            "safety": _safety is not None,
+            "intent": _intent is not None,
+            "report": _report is not None,
+            "dart": _dart is not None,
+            "analysis": _analysis is not None,
+            "composer": _composer is not None,
+            "supervisor": _supervisor is not None,
+        },
+        "enabled": AGENT_ENABLED,
+    }
+
+
+def _run_agent_pipeline(user_message: str) -> dict:
+    """Run the full agent pipeline for one user message.
+
+    Returns dict with keys: answer, sources, intent, confidence, violation_type
+    """
+    if not _ready:
+        return {
+            "answer": "Agent system is initialising. Please try again in a moment.",
+            "sources": [],
+            "intent": "error",
+            "confidence": "low",
+            "violation_type": None,
+        }
+
+    t0 = time.time()
+
+    # Step 1: Safety check
+    safety_result = _safety.check(user_message)
+    if not safety_result.get("is_safe", True):
+        answer = _safety.build_refusal_message(
+            safety_result.get("violation_type"),
+            safety_result.get("redirect_suggestion", ""),
+        )
+        elapsed = (time.time() - t0) * 1000
+        logger.info("Agent pipeline: SAFETY REFUSAL type=%s (%.0fms)",
+                     safety_result.get("violation_type"), elapsed)
+        return {
+            "answer": answer,
+            "sources": [],
+            "intent": "refused",
+            "confidence": "high",
+            "violation_type": safety_result.get("violation_type"),
+            "elapsed_ms": elapsed,
+        }
+
+    # Step 2: Intent parsing
+    intent_result = _intent.parse(user_message)
+    intent = intent_result["intent"]
+    params = intent_result.get("intent_params", {})
+
+    # Step 3: Route and execute
+    route = _supervisor.route(True, intent, params)
+
+    logger.info("Agent pipeline: intent=%s route=%s compare=%s cause=%s interpret=%s",
+                 intent, route,
+                 params.get("compare"),
+                 params.get("cause_tracking"),
+                 params.get("interpret"))
+
+    answer = ""
+    sources = []
+    confidence = "medium"
+
+    if route == "general_response":
+        if params.get("is_greeting"):
+            answer = (
+                "안녕하세요! OPIK 금융 정보 챗봇입니다.\n\n"
+                "다음과 같은 정보를 검색하실 수 있습니다:\n"
+                "• 증권사 애널리스트 리포트 검색 및 요약\n"
+                "• DART 공시 이벤트 조회\n"
+                "• 애널리스트 의견 비교 및 목표주가 확인\n\n"
+                "원하시는 종목명이나 질문을 입력해 주세요."
+            )
+        else:
+            answer = (
+                "OPIK은 증권사 애널리스트 리포트와 DART 공시 데이터를 "
+                "검색·요약해드리는 금융 정보 챗봇입니다. 무엇을 도와드릴까요?"
+            )
+        confidence = "high"
+
+    elif route == "report_agent":
+        search_results = _report.search(user_message, top_k=10)
+        if search_results:
+            answer = _report.summarise(user_message, search_results)
+            sources = [r.get("report_id", "") for r in search_results]
+            confidence = "high"
+        else:
+            ticker_names = params.get("ticker_names", [])
+            names_str = ", ".join(ticker_names) if ticker_names else "해당 조건"
+            answer = f"{names_str}으로 검색된 애널리스트 리포트가 없습니다."
+            confidence = "low"
+
+    elif route == "report_with_analysis":
+        search_results = _report.search(user_message, top_k=10)
+        report_summary = _report.summarise(user_message, search_results) if search_results else ""
+        ticker_name = params.get("ticker_names", [""])[0] if params.get("ticker_names") else ""
+
+        analysis = ""
+        if params.get("compare") and len(search_results) >= 2:
+            analysis = _analysis.compare_reports(search_results, ticker_name)
+        elif params.get("cause_tracking"):
+            analysis = _analysis.trace_cause(ticker_name, "최근 1주일", search_results, [])
+
+        answer = _composer.compose_chat_response(
+            intent="report_search",
+            report_summary=report_summary or None,
+            analysis=analysis or None,
+            sources=[r.get("report_id", "") for r in search_results],
+            confidence="medium",
+        )
+        sources = [r.get("report_id", "") for r in search_results]
+
+    elif route in ("dart_agent", "dart_with_analysis"):
+        ticker_names = params.get("ticker_names", [])
+        time_range = params.get("time_range")
+        dart_result = _dart.query_disclosure_events(
+            companies=ticker_names,
+            date_from=time_range.get("from") if time_range else None,
+            date_to=time_range.get("to") if time_range else None,
+        )
+
+        if params.get("interpret") and dart_result:
+            interpretation = _dart.interpret_disclosure(dart_result, "")
+            answer = _composer.compose_chat_response(
+                intent="dart_query",
+                dart_summary=f"{dart_result}\n\n[공시 해석]\n{interpretation}",
+                confidence="medium",
+            )
+        else:
+            answer = dart_result
+            confidence = "high" if dart_result and "데이터가 없습니다" not in dart_result else "low"
+
+    elif route == "hybrid_parallel":
+        report_summary = ""
+        dart_summary = ""
+        search_results = _report.search(user_message, top_k=10)
+        if search_results:
+            report_summary = _report.summarise(user_message, search_results)
+            sources = [r.get("report_id", "") for r in search_results]
+
+        ticker_names = params.get("ticker_names", [])
+        dart_result = _dart.query_disclosure_events(companies=ticker_names)
+        if dart_result and "데이터가 없습니다" not in dart_result:
+            dart_summary = dart_result
+
+        answer = _composer.compose_chat_response(
+            intent="hybrid",
+            report_summary=report_summary or None,
+            dart_summary=dart_summary or None,
+            sources=sources,
+            confidence="medium",
+        )
+
+    else:
+        answer = "처리할 수 없는 요청입니다."
+
+    elapsed = (time.time() - t0) * 1000
+    logger.info("Agent pipeline: intent=%s route=%s (%.0fms, %d sources)",
+                 intent, route, elapsed, len(sources))
+
+    return {
+        "answer": answer,
+        "sources": sources,
+        "intent": intent,
+        "confidence": confidence,
+        "violation_type": None,
+        "elapsed_ms": elapsed,
+    }
+
+
+async def v2_chat_handler(req) -> dict:
+    """Handler for /v2/chat endpoint. Takes ChatRequest, returns ChatResponse dict."""
+    from conversation_store import store as conversation_store
+
+    t0 = time.time()
+    session_id = getattr(req, "session_id", "default")
+
+    # Session reset
+    _reset_triggers = ["새로 시작", "처음부터", "리셋", "세션 초기화"]
+    msg = req.message
+    if any(t in msg for t in _reset_triggers) and len(msg) < 15:
+        conversation_store.reset_session(session_id)
+        return {
+            "answer": "새로운 대화를 시작합니다. 무엇을 도와드릴까요?",
+            "sources": [],
+            "elapsed_ms": round((time.time() - t0) * 1000, 1),
+            "intent": {"intent": "general"},
+            "dart_results": None,
+            "total": 0,
+            "page": 1,
+            "page_size": 20,
+            "has_next": False,
+            "context_full": False,
+            "turn_count": 0,
+        }
+
+    # Fallback: if agents not ready, delegate to old chat
+    if not _ready or not AGENT_ENABLED:
+        logger.warning("/v2/chat called but agents not ready — returning fallback")
+        return {
+            "answer": "Agent system is not available. Please use /chat endpoint instead.",
+            "sources": [],
+            "elapsed_ms": round((time.time() - t0) * 1000, 1),
+            "intent": {"intent": "general"},
+            "dart_results": None,
+            "total": 0,
+            "page": 1,
+            "page_size": 20,
+            "has_next": False,
+            "context_full": False,
+            "turn_count": 0,
+        }
+
+    # Run agent pipeline
+    result = _run_agent_pipeline(msg)
+
+    # Save conversation turn
+    conversation_store.add_turn(session_id, "user", msg)
+    conversation_store.add_turn(session_id, "assistant", result["answer"])
+    ctx_full = conversation_store.is_context_full(session_id)
+    turn_count = conversation_store.get_turn_count(session_id)
+
+    answer = result["answer"]
+    if ctx_full:
+        answer += (
+            "\n\n---\n"
+            "[대화가 길어져 이전 맥락 일부가 요약되었습니다.]\n"
+            "[위 내용은 최근 대화를 바탕으로 한 응답입니다.]\n"
+            '[대화를 새로 시작하려면 "새로 시작"이라고 입력해주세요.]'
+        )
+
+    return {
+        "answer": answer,
+        "sources": [
+            {"report_id": s} for s in result.get("sources", [])
+        ],
+        "elapsed_ms": round(result.get("elapsed_ms", (time.time() - t0) * 1000), 1),
+        "intent": {
+            "intent": result.get("intent", "general"),
+            "confidence": result.get("confidence", "medium"),
+        },
+        "dart_results": None,
+        "total": len(result.get("sources", [])),
+        "page": 1,
+        "page_size": 20,
+        "has_next": False,
+        "context_full": ctx_full,
+        "turn_count": turn_count,
+    }

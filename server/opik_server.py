@@ -43,6 +43,9 @@ from dart_query import query_dart as query_dart_engine
 # Conversation memory — session-based context management (v2)
 from conversation_store import store as conversation_store
 
+# Phase 2a: LangGraph multi-agent framework (optional — toggled by OPIK_AGENT_ENABLED)
+from agent_integration import init_agents, v2_chat_handler, get_agent_status
+
 # config
 S3_BUCKET = os.environ.get("S3_BUCKET", "s3-opik-bucket")
 EMBEDDING_MODEL_NAME = os.environ.get("EMBEDDING_MODEL", "intfloat/multilingual-e5-small")
@@ -52,6 +55,7 @@ FAISS_IDMAP_PATH = os.environ.get("FAISS_IDMAP_PATH", "/data/opik/report_ids.jso
 AWS_REGION = os.environ.get("AWS_REGION", "ap-northeast-2")
 BEDROCK_MODEL = os.environ.get("BEDROCK_MODEL", "apac.anthropic.claude-3-haiku-20240307-v1:0")
 SEARCH_TOP_K = int(os.environ.get("SEARCH_TOP_K", "10"))
+AGENT_ENABLED_STR = os.environ.get("OPIK_AGENT_ENABLED", "true")
 
 os.makedirs("/data/opik", exist_ok=True)
 
@@ -207,6 +211,14 @@ async def lifespan(app: FastAPI):
             logger.warning("Could not build index from S3 on startup: %s", e)
             logger.warning("Index will be empty. Call POST /index/rebuild to retry.")
 
+    # Phase 2a: Wire agents to server globals (non-blocking — agents work without it)
+    if AGENT_ENABLED_STR != "false":
+        try:
+            init_agents(faiss_index, report_ids, report_texts, embedder)
+            logger.info("Agent framework wired successfully")
+        except Exception as e:
+            logger.warning("Agent init failed (non-fatal): %s", e)
+
     yield
     logger.info("Shutting down.")
 
@@ -237,11 +249,17 @@ async def root():
 # health
 @app.get("/health")
 async def health():
+    agent_status = {}
+    try:
+        agent_status = get_agent_status()
+    except Exception:
+        pass
     return {
         "status": "ok",
         "model": EMBEDDING_MODEL_NAME,
         "index_size": faiss_index.ntotal if faiss_index else 0,
         "dim": EMBEDDING_DIM,
+        "agent_framework": agent_status.get("agent_framework", "not_loaded"),
     }
 
 
@@ -947,6 +965,25 @@ def _query_dart(intent: IntentResult, page: int = 1, page_size: int = 20,
     )
 
 
+# ── v2 Agent-powered chat (Phase 2a) ──
+
+@app.post("/v2/chat", response_model=ChatResponse)
+async def v2_chat(req: ChatRequest):
+    """Chat endpoint powered by the multi-agent framework (Safety → Intent → Agents → Compose).
+
+    Falls back gracefully if agents are not initialised.
+    Use OPIK_AGENT_ENABLED=false to disable.
+    """
+    if embedder is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    try:
+        result = await v2_chat_handler(req)
+        return ChatResponse(**result)
+    except Exception as e:
+        logger.exception("/v2/chat error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # index management
 @app.post("/index/rebuild")
 async def rebuild_index():
@@ -1017,24 +1054,24 @@ def build_index_from_s3():
     if n == 0:
         raise RuntimeError("No embeddings found in S3")
 
-    logger.info("Loaded %d embeddings. Building FAISS index...", n)
+    vectors = np.array(all_embeddings, dtype=np.float32).copy()
+    dim = vectors.shape[1]
+    faiss.normalize_L2(vectors)
 
-    dim = len(all_embeddings[0])
     index = faiss.IndexIDMap(faiss.IndexFlatIP(dim))
-    vectors = np.array(all_embeddings, dtype=np.float32)
-    ids = np.arange(n, dtype=np.int64)
-
-    index.add_with_ids(vectors, ids)
-
-    os.makedirs(os.path.dirname(FAISS_INDEX_PATH), exist_ok=True)
-    faiss.write_index(index, FAISS_INDEX_PATH)
-    with open(FAISS_IDMAP_PATH, "w") as f:
-        json.dump(all_ids, f, ensure_ascii=False)
-
-    logger.info("FAISS index saved: %d vectors, dim=%d", n, dim)
+    index.add_with_ids(vectors, np.arange(n, dtype=np.int64))
 
     with index_lock:
         faiss_index = index
         report_ids = all_ids
 
+    faiss.write_index(faiss_index, FAISS_INDEX_PATH)
+    with open(FAISS_IDMAP_PATH, "w") as f:
+        json.dump(all_ids, f, ensure_ascii=False)
+
+    info_path = "/data/opik/report_info.json"
+    with open(info_path, "w") as f:
+        json.dump(report_texts, f, ensure_ascii=False)
+
+    logger.info("FAISS index rebuilt: %d vectors, dim=%d", n, dim)
     return n
