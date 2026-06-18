@@ -100,7 +100,7 @@ EMBEDDING_INPUT_PREFIX = "silver/embedding_input/"
 GOLD_EMBEDDING_PREFIX = "gold/embeddings/"
 REPORT_PIPELINE_SCHEDULE = os.getenv("OPIK_REPORT_PIPELINE_SCHEDULE", "0 0 * * *")
 KST_TARGET_DATE_TEMPLATE = (
-    "{{ data_interval_end.in_timezone('Asia/Seoul').to_date_string() }}"
+    "{{ data_interval_end.in_timezone('Asia/Seoul').subtract(days=1).to_date_string() }}"
 )
 
 
@@ -645,12 +645,30 @@ def merge_and_upload_monthly_gold(
         existing_rows = read_existing_gold_rows(s3, out_key)
         merged_rows = merge_rows(existing_rows, new_rows)
         write_gold_rows(s3, out_key, merged_rows)
+        metadata = s3.head_object(Bucket=S3_BUCKET, Key=out_key)
+        content_length = int(metadata.get("ContentLength") or 0)
+        if content_length <= 0:
+            raise RuntimeError(f"업로드된 embedding Parquet가 비어 있습니다: {s3_uri(out_key)}")
+        last_modified = metadata["LastModified"].isoformat()
         uploaded[yyyymm] = {
             "uri": s3_uri(out_key),
             "existing_rows": len(existing_rows),
             "daily_rows": len(new_rows),
             "merged_rows": len(merged_rows),
+            "content_length": content_length,
+            "last_modified": last_modified,
         }
+        logger.info(
+            "Gold embeddings upsert complete: month=%s existing=%d daily=%d merged=%d "
+            "bytes=%d last_modified=%s uri=%s",
+            yyyymm,
+            len(existing_rows),
+            len(new_rows),
+            len(merged_rows),
+            content_length,
+            last_modified,
+            s3_uri(out_key),
+        )
     return uploaded
 
 
@@ -686,6 +704,7 @@ def run_daily_embedding(
     keys = list_daily_silver_keys(s3, start, end)
     if limit:
         keys = keys[:limit]
+    logger.info("Gold embeddings target=%s~%s silver=%d", start, end, len(keys))
 
     broker_counts = Counter()
     skipped = Counter()
@@ -818,6 +837,17 @@ def run_daily_embedding(
             f"Haiku 추출 실패 {llm_failed}건. 성공 행은 저장했으며 Airflow 재시도에서 "
             "실패한 embedding_input만 다시 호출합니다."
         )
+    if keys and not embedding_rows:
+        raise RuntimeError(
+            f"Silver 입력 {len(keys)}건이 있지만 embedding Gold 행이 0건입니다. "
+            f"skipped={dict(skipped)}"
+        )
+    if embedding_rows and not uploaded:
+        raise RuntimeError(
+            f"embedding Gold 행 {len(embedding_rows)}건을 생성했지만 S3 업로드 결과가 없습니다."
+        )
+    if not keys:
+        logger.info("Gold embeddings no-op: %s~%s Silver JSON이 없습니다.", start, end)
 
     return DailyEmbeddingResult(
         start_date=start,

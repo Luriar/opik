@@ -100,7 +100,7 @@ SILVER_PREFIX = "silver/"
 EXTRACT_TIMEOUT = 30
 REPORT_PIPELINE_SCHEDULE = os.getenv("OPIK_REPORT_PIPELINE_SCHEDULE", "0 0 * * *")
 KST_TARGET_DATE_TEMPLATE = (
-    "{{ data_interval_end.in_timezone('Asia/Seoul').to_date_string() }}"
+    "{{ data_interval_end.in_timezone('Asia/Seoul').subtract(days=1).to_date_string() }}"
 )
 
 
