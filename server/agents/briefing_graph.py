@@ -294,25 +294,60 @@ def check_triple_consensus(state: BriefingState) -> BriefingState:
             {},
         )
 
-        # Find matching DART events
-        dart_events = []
-        if state.dart_events_df is not None:
-            dart_mask = (
-                (state.dart_events_df["stock_code"].astype(str).str.zfill(6) == ticker) &
-                (state.dart_events_df["sentiment"] == "positive")
-            )
-            dart_events = state.dart_events_df[dart_mask].to_dict("records")
+        # ★ DART content: last quarter's most recent 정기보고서 summary
+        # + most recent 주요사항보고서 event title
+        dart_quarterly_summary = ""
+        dart_recent_event_title = ""
+        if state.dart_events_df is not None and not state.dart_events_df.empty:
+            df = state.dart_events_df
+            ticker_mask = df["stock_code"].astype(str).str.zfill(6) == ticker
+            
+            # Last quarter date range
+            target_dt_q = datetime.strptime(state.date, "%Y%m%d")
+            q_start = (target_dt_q - timedelta(days=90)).strftime("%Y%m%d")
+            date_mask = (df["rcept_dt"] >= q_start) & (df["rcept_dt"] <= state.date)
+            
+            ticker_df = df[ticker_mask & date_mask].copy()
+            
+            if not ticker_df.empty:
+                # Most recent 정기보고서 (A-type: 분기/반기/사업보고서)
+                regular_reports = ticker_df[
+                    ticker_df["report_nm"].str.contains(
+                        "분기보고서|반기보고서|사업보고서|정기공시", na=False
+                    )
+                ]
+                if not regular_reports.empty:
+                    latest = regular_reports.sort_values("rcept_dt", ascending=False).iloc[0]
+                    dart_quarterly_summary = str(latest.get("report_nm", ""))
+                
+                # Most recent 주요사항보고서 event title
+                b_type = ticker_df[
+                    ticker_df["report_nm"].str.contains(
+                        "주요사항보고|유상증자|무상증자|감자|부도발생|회생절차|합병|분할|"
+                        "영업양도|주요자산처분|타법인|최대주주변경|자기주식취득|"
+                        "단일판매|소송제기|CB발행|BW발행|EB발행", na=False
+                    )
+                ]
+                if not b_type.empty:
+                    latest_b = b_type.sort_values("rcept_dt", ascending=False).iloc[0]
+                    dart_recent_event_title = str(latest_b.get("report_nm", ""))
+        
+        # Build dart_info dict instead of full events list
+        dart_info = {
+            "quarterly_summary": dart_quarterly_summary,
+            "recent_event_title": dart_recent_event_title,
+        }
 
         # Get 종목명 from the first report
         종목명 = reports[0].get("종목명", "")
-        if not 종목명 and dart_events:
-            종목명 = dart_events[0].get("corp_name", ticker)
+        if not 종목명:
+            종목명 = ticker  # fallback to ticker code
 
         stars.append({
             "ticker": ticker,
             "종목명": 종목명,
             "reports": reports,
-            "dart_events": dart_events,
+            "dart_info": dart_info,
             "model_pred": model_pred,
         })
 
@@ -337,7 +372,17 @@ def filter_major_disclosures(state: BriefingState) -> BriefingState:
         return state
 
     df = state.dart_events_df
-
+    
+    # Filter to today only (! is daily — not 1 month)
+    if "rcept_dt" in df.columns:
+        df = df[df["rcept_dt"] == state.date]
+        logger.info("Step 7: DART events filtered to %s — %d rows", state.date, len(df))
+    
+    if df.empty:
+        logger.info("Step 7: No DART events for today — skipping ! filter")
+        state.exclamation_items = []
+        return state
+    
     # Filter to B-type (주요사항보고) major disclosures
     b_type_keywords = [
         "주요사항보고", "유상증자", "무상증자", "감자", "부도발생",
