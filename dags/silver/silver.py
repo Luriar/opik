@@ -41,9 +41,11 @@ from botocore.exceptions import ClientError
 try:
     from airflow import DAG
     from airflow.operators.python import PythonOperator
+    from airflow.sensors.external_task import ExternalTaskSensor
 except ImportError:  # 로컬 CLI 실행 환경에는 Airflow가 없을 수 있다.
     DAG = None
     PythonOperator = None
+    ExternalTaskSensor = None
 
 
 def load_local_env() -> None:
@@ -96,7 +98,16 @@ s3 = boto3.client("s3", region_name=S3_REGION)
 BRONZE_PREFIX = "bronze/"
 SILVER_PREFIX = "silver/"
 EXTRACT_TIMEOUT = 30
-SILVER_SCHEDULE = os.getenv("SILVER_SCHEDULE", "30 2 * * *")
+REPORT_PIPELINE_SCHEDULE = os.getenv("OPIK_REPORT_PIPELINE_SCHEDULE", "0 0 * * *")
+KST_TARGET_DATE_TEMPLATE = (
+    "{{ data_interval_end.in_timezone('Asia/Seoul').to_date_string() }}"
+)
+
+
+def upstream_logical_date_for_target(logical_date, data_interval_end=None, **_):
+    """Map this run to the scheduled upstream run that owns the same KST target date."""
+    interval_end = pendulum.instance(data_interval_end or logical_date).in_timezone("Asia/Seoul")
+    return interval_end.start_of("day").subtract(days=1)
 
 
 def parse_date(value: str | date, label: str = "date") -> date:
@@ -550,22 +561,59 @@ def build_dag():
         description="bronze PDF를 silver JSON 텍스트로 일배치 변환",
         default_args=default_args,
         start_date=pendulum.datetime(2026, 1, 1, tz="Asia/Seoul"),
-        # Bronze DAGs run at 01:50 KST. Silver is delayed so daily manifests exist.
-        schedule=SILVER_SCHEDULE,
+        schedule=REPORT_PIPELINE_SCHEDULE,
         catchup=False,
         max_active_runs=1,
         tags=["opik", "silver", "pdf", "reports"],
     ) as dag_obj:
-        PythonOperator(
+        wait_for_naver = ExternalTaskSensor(
+            task_id="wait_for_bronze_naver",
+            external_dag_id="opik_bronze_naver",
+            external_task_id="upload_naver_reports_to_bronze",
+            execution_date_fn=upstream_logical_date_for_target,
+            allowed_states=["success"],
+            failed_states=["failed", "skipped"],
+            check_existence=True,
+            mode="reschedule",
+            poll_interval=60,
+            timeout=6 * 60 * 60,
+        )
+        wait_for_koreainvest = ExternalTaskSensor(
+            task_id="wait_for_bronze_koreainvest",
+            external_dag_id="opik_bronze_koreainvest",
+            external_task_id="upload_koreainvest_reports_to_bronze",
+            execution_date_fn=upstream_logical_date_for_target,
+            allowed_states=["success"],
+            failed_states=["failed", "skipped"],
+            check_existence=True,
+            mode="reschedule",
+            poll_interval=60,
+            timeout=6 * 60 * 60,
+        )
+        wait_for_shinhaninvest = ExternalTaskSensor(
+            task_id="wait_for_bronze_shinhaninvest",
+            external_dag_id="opik_bronze_shinhaninvest",
+            external_task_id="upload_shinhaninvest_reports_to_bronze",
+            execution_date_fn=upstream_logical_date_for_target,
+            allowed_states=["success"],
+            failed_states=["failed", "skipped"],
+            check_existence=True,
+            mode="reschedule",
+            poll_interval=60,
+            timeout=6 * 60 * 60,
+        )
+        extract_task = PythonOperator(
             task_id="extract_bronze_pdf_to_silver_json",
             python_callable=run_silver,
             op_kwargs={
-                "target_date": "{{ ds }}",
+                "target_date": KST_TARGET_DATE_TEMPLATE,
                 "workers": 10,
                 "days_parallel": 1,
                 "overwrite": False,
             },
         )
+
+        [wait_for_naver, wait_for_koreainvest, wait_for_shinhaninvest] >> extract_task
 
     return dag_obj
 

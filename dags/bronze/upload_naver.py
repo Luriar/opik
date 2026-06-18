@@ -51,6 +51,12 @@ except ImportError:
     PythonOperator = None
 
 
+REPORT_PIPELINE_SCHEDULE = os.getenv("OPIK_REPORT_PIPELINE_SCHEDULE", "0 0 * * *")
+KST_TARGET_DATE_TEMPLATE = (
+    "{{ data_interval_end.in_timezone('Asia/Seoul').to_date_string() }}"
+)
+
+
 def load_local_env() -> None:
     """Load .env without depending on opik_config."""
     candidates = []
@@ -514,7 +520,7 @@ def build_dag():
         description="네이버 경유 증권사 리포트 PDF를 bronze S3에 일배치 적재",
         default_args=default_args,
         start_date=pendulum.datetime(2026, 1, 1, tz="Asia/Seoul"),
-        schedule="50 1 * * *",
+        schedule=REPORT_PIPELINE_SCHEDULE,
         catchup=False,
         max_active_runs=1,
         tags=["opik", "bronze", "naver", "reports"],
@@ -523,7 +529,7 @@ def build_dag():
             task_id="upload_naver_reports_to_bronze",
             python_callable=run_bronze_naver,
             op_kwargs={
-                "target_date": "{{ ds }}",
+                "target_date": KST_TARGET_DATE_TEMPLATE,
                 "pdf_workers": 20,
             },
         )

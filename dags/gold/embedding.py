@@ -1,5 +1,4 @@
-"""
-Airflow 일배치용 gold/embeddings 생성 모듈.
+"""Airflow 일배치용 gold/embeddings 생성 모듈.
 
 하루 50건 내외의 증권사 리포트를 처리한다는 전제에서 Bedrock Batch Inference를
 사용하지 않고 동기 호출만 사용한다.
@@ -11,13 +10,13 @@ Airflow 일배치용 gold/embeddings 생성 모듈.
 4. intfloat/multilingual-e5-small로 embedding 생성
 5. gold/embeddings/year=YYYY/month=MM/data.parquet에 월 단위 merge 저장
 
-Airflow DAG에서는 run_daily_embedding()을 PythonOperator에서 호출하면 된다.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import re
 import tempfile
@@ -30,14 +29,47 @@ from typing import Any
 
 import boto3
 from botocore.exceptions import ClientError
-from dotenv import load_dotenv
+
+try:
+    import pendulum
+    from airflow import DAG
+    from airflow.operators.python import PythonOperator
+    from airflow.sensors.external_task import ExternalTaskSensor
+except ImportError:  # 로컬 CLI 실행 환경에는 Airflow가 없을 수 있다.
+    DAG = None
+    PythonOperator = None
+    ExternalTaskSensor = None
 
 
 BASE_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = BASE_DIR.parent
+OPIK_ROOT = Path(__file__).resolve().parents[2]
 
-load_dotenv(BASE_DIR / ".env")
-load_dotenv(PROJECT_ROOT / ".env", override=False)
+
+def load_local_env() -> None:
+    """프로젝트 helper 모듈이나 python-dotenv 없이 로컬 실행용 .env를 읽는다."""
+    candidates: list[Path] = []
+    if root := os.getenv("OPIK_ROOT"):
+        candidates.append(Path(root) / ".env")
+    candidates.extend([
+        OPIK_ROOT / ".env",
+        OPIK_ROOT.parent / ".env",
+        BASE_DIR.parent / ".env",
+        BASE_DIR / ".env",
+        Path.cwd() / ".env",
+    ])
+    for env_path in candidates:
+        if not env_path.exists():
+            continue
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+        return
+
+
+load_local_env()
 
 S3_BUCKET = (
     os.getenv("S3_BUCKET")
@@ -66,9 +98,25 @@ if BEDROCK_API_KEY and not os.getenv("AWS_BEARER_TOKEN_BEDROCK"):
 RAW_SILVER_PREFIX = "silver/"
 EMBEDDING_INPUT_PREFIX = "silver/embedding_input/"
 GOLD_EMBEDDING_PREFIX = "gold/embeddings/"
+REPORT_PIPELINE_SCHEDULE = os.getenv("OPIK_REPORT_PIPELINE_SCHEDULE", "0 0 * * *")
+KST_TARGET_DATE_TEMPLATE = (
+    "{{ data_interval_end.in_timezone('Asia/Seoul').to_date_string() }}"
+)
+
+
+def upstream_logical_date_for_target(logical_date, data_interval_end=None, **_):
+    """Map this run to the scheduled upstream run that owns the same KST target date."""
+    interval_end = pendulum.instance(data_interval_end or logical_date).in_timezone("Asia/Seoul")
+    return interval_end.start_of("day").subtract(days=1)
 
 EMBEDDING_MODEL_NAME = "intfloat/multilingual-e5-small"
 EMBEDDING_DIM = 384
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("opik.gold.embeddings")
 
 BOILERPLATE_MARKERS = [
     r"Compliance\s*Notice",
@@ -111,7 +159,7 @@ class DailyEmbeddingResult:
     embedding_input_reused: int
     llm_failed: int
     gold_rows: int
-    uploaded: dict[str, str]
+    uploaded: dict[str, Any]
     skipped: dict[str, int]
     broker_counts: dict[str, int]
     dry_run: bool = False
@@ -553,7 +601,14 @@ def read_existing_gold_rows(s3, key: str):
     with tempfile.TemporaryDirectory() as tmp_dir:
         local_path = Path(tmp_dir) / "existing.parquet"
         s3.download_file(S3_BUCKET, key, str(local_path))
-        return pq.read_table(local_path).to_pylist()
+        table = pq.read_table(local_path)
+        expected = parquet_schema().names
+        if table.schema.names != expected:
+            raise ValueError(
+                f"기존 embedding Parquet 스키마가 다릅니다: "
+                f"expected={expected}, actual={table.schema.names}, key={key}"
+            )
+        return table.to_pylist()
 
 
 def write_gold_rows(s3, key: str, rows: list[dict[str, Any]]):
@@ -567,21 +622,35 @@ def write_gold_rows(s3, key: str, rows: list[dict[str, Any]]):
         s3.upload_file(str(local_path), S3_BUCKET, key)
 
 
+def merge_rows(existing_rows: list[dict], new_rows: list[dict]) -> list[dict]:
+    """Idempotent append: report_id가 같으면 이번 일배치 결과가 기존 행을 대체한다."""
+    merged = {
+        str(row["report_id"]): row
+        for row in existing_rows
+        if row.get("report_id")
+    }
+    for row in new_rows:
+        if row.get("report_id"):
+            merged[str(row["report_id"])] = row
+    return [merged[report_id] for report_id in sorted(merged)]
+
+
 def merge_and_upload_monthly_gold(
     s3,
     rows_by_month: dict[str, list[dict[str, Any]]],
-    overwrite_existing_report_ids: bool = True,
 ):
     uploaded = {}
     for yyyymm, new_rows in sorted(rows_by_month.items()):
         out_key = gold_key_for_month(yyyymm)
         existing_rows = read_existing_gold_rows(s3, out_key)
-        if overwrite_existing_report_ids:
-            new_ids = {row["report_id"] for row in new_rows}
-            existing_rows = [row for row in existing_rows if row.get("report_id") not in new_ids]
-        merged_rows = existing_rows + new_rows
+        merged_rows = merge_rows(existing_rows, new_rows)
         write_gold_rows(s3, out_key, merged_rows)
-        uploaded[yyyymm] = s3_uri(out_key)
+        uploaded[yyyymm] = {
+            "uri": s3_uri(out_key),
+            "existing_rows": len(existing_rows),
+            "daily_rows": len(new_rows),
+            "merged_rows": len(merged_rows),
+        }
     return uploaded
 
 
@@ -595,6 +664,7 @@ def run_daily_embedding(
     overwrite_embedding_input: bool = False,
     write_embedding_input: bool = True,
     include_failed_llm: bool = False,
+    fail_on_llm_error: bool = True,
     dry_run: bool = False,
 ) -> DailyEmbeddingResult:
     """
@@ -648,6 +718,9 @@ def run_daily_embedding(
         row = normalize_silver(doc, key)
         broker_counts[row["증권사"]] += 1
 
+        if row["발행일"] < start or row["발행일"] > end:
+            skipped["date_mismatch"] += 1
+            continue
         if not row["text"]:
             skipped["empty_text"] += 1
             continue
@@ -655,8 +728,16 @@ def run_daily_embedding(
             skipped["missing_stock_code"] += 1
 
         out_key = embedding_input_key(row)
+        existing_payload = None
         if not overwrite_embedding_input and object_exists(s3, out_key):
-            payload = load_json_from_s3(s3, out_key)
+            existing_payload = load_json_from_s3(s3, out_key)
+
+        if (
+            existing_payload
+            and existing_payload.get("llm_status") != "failed"
+            and clean_text(existing_payload.get("embedding_text") or "")
+        ):
+            payload = existing_payload
             embedding_input_reused += 1
         else:
             llm_status = "ok"
@@ -691,11 +772,14 @@ def run_daily_embedding(
         gold_row["_month"] = month_key(payload["발행일"])
         embedding_rows.append(gold_row)
 
-        if idx % 25 == 0:
-            print(
-                f"진행: {idx:,}/{len(keys):,} "
-                f"(embedding_input write={embedding_input_written:,}, reuse={embedding_input_reused:,}, "
-                f"llm_failed={llm_failed:,})"
+        if idx % 10 == 0 or idx == len(keys):
+            logger.info(
+                "Embedding progress %d/%d (input_write=%d reuse=%d llm_failed=%d)",
+                idx,
+                len(keys),
+                embedding_input_written,
+                embedding_input_reused,
+                llm_failed,
             )
 
     uploaded = {}
@@ -703,14 +787,18 @@ def run_daily_embedding(
         import numpy as np
         from sentence_transformers import SentenceTransformer
 
-        print(f"임베딩 모델 로드: {EMBEDDING_MODEL_NAME}")
+        logger.info("Loading embedding model: %s", EMBEDDING_MODEL_NAME)
         embedder = SentenceTransformer(EMBEDDING_MODEL_NAME)
         vectors = embedder.encode(
             [row["_embedding_input"] for row in embedding_rows],
             batch_size=16,
             normalize_embeddings=True,
-            show_progress_bar=True,
+            show_progress_bar=False,
         )
+        if vectors.ndim != 2 or vectors.shape[1] != EMBEDDING_DIM:
+            raise ValueError(
+                f"임베딩 차원이 예상과 다릅니다: expected={EMBEDDING_DIM}, actual={vectors.shape}"
+            )
 
         rows_by_month = defaultdict(list)
         for row, vector in zip(embedding_rows, vectors):
@@ -724,6 +812,12 @@ def run_daily_embedding(
             })
 
         uploaded = merge_and_upload_monthly_gold(s3, rows_by_month)
+
+    if llm_failed and fail_on_llm_error:
+        raise RuntimeError(
+            f"Haiku 추출 실패 {llm_failed}건. 성공 행은 저장했으며 Airflow 재시도에서 "
+            "실패한 embedding_input만 다시 호출합니다."
+        )
 
     return DailyEmbeddingResult(
         start_date=start,
@@ -740,6 +834,56 @@ def run_daily_embedding(
     )
 
 
+def build_dag():
+    if DAG is None:
+        return None
+
+    default_args = {
+        "owner": "opik",
+        "retries": 1,
+        "retry_delay": timedelta(minutes=10),
+    }
+    with DAG(
+        dag_id="opik_gold_embeddings",
+        description="Silver 일배치에서 Haiku 의미 추출과 E5 임베딩을 생성해 월별 Gold에 upsert",
+        default_args=default_args,
+        start_date=pendulum.datetime(2026, 1, 1, tz="Asia/Seoul"),
+        schedule=REPORT_PIPELINE_SCHEDULE,
+        catchup=False,
+        max_active_runs=1,
+        tags=["opik", "gold", "embeddings", "bedrock", "reports"],
+    ) as dag_obj:
+        wait_for_silver = ExternalTaskSensor(
+            task_id="wait_for_silver_extract",
+            external_dag_id="opik_silver_extract",
+            external_task_id="extract_bronze_pdf_to_silver_json",
+            execution_date_fn=upstream_logical_date_for_target,
+            allowed_states=["success"],
+            failed_states=["failed", "skipped"],
+            check_existence=True,
+            mode="reschedule",
+            poll_interval=60,
+            timeout=6 * 60 * 60,
+        )
+        embedding_task = PythonOperator(
+            task_id="upsert_daily_embeddings_to_monthly_parquet",
+            python_callable=run_daily_embedding,
+            op_kwargs={
+                "target_date": KST_TARGET_DATE_TEMPLATE,
+                "overwrite_embedding_input": False,
+                "write_embedding_input": True,
+                "include_failed_llm": False,
+                "fail_on_llm_error": True,
+            },
+            execution_timeout=timedelta(hours=1),
+        )
+        wait_for_silver >> embedding_task
+    return dag_obj
+
+
+dag = build_dag()
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Daily gold/embeddings builder")
     parser.add_argument("--date", help="처리할 하루. 예: 2026-06-16")
@@ -750,6 +894,7 @@ def parse_args():
     parser.add_argument("--overwrite-embedding-input", action="store_true")
     parser.add_argument("--no-write-embedding-input", action="store_true")
     parser.add_argument("--include-failed-llm", action="store_true")
+    parser.add_argument("--allow-llm-failures", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
@@ -765,6 +910,7 @@ def main():
         overwrite_embedding_input=args.overwrite_embedding_input,
         write_embedding_input=not args.no_write_embedding_input,
         include_failed_llm=args.include_failed_llm,
+        fail_on_llm_error=not args.allow_llm_failures,
         dry_run=args.dry_run,
     )
     print(json.dumps(asdict(result), ensure_ascii=False, indent=2))

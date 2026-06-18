@@ -1,0 +1,14 @@
+FROM apache/airflow:2.10.0-python3.12
+
+COPY requirements.txt /opt/airflow/requirements.txt
+
+# Pin Airflow while installing project packages so pip cannot replace the
+# version bundled in the base image.
+RUN python -m pip install --no-cache-dir \
+        "apache-airflow==2.10.0" \
+        -r /opt/airflow/requirements.txt \
+    && python -m pip check \
+    && python -c 'from importlib.metadata import version; assert version("apache-airflow") == "2.10.0"' \
+    && python -c 'from importlib.metadata import version; assert version("apache-airflow-providers-celery") == "3.7.3"' \
+    && python -c 'from importlib.metadata import version; assert version("celery") == "5.4.0"' \
+    && python -c 'from importlib.metadata import version; assert version("click") == "8.1.7"'
