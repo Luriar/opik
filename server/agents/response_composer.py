@@ -179,7 +179,10 @@ class ResponseComposer:
 
     def compose_refusal(self, violation_type: str, redirect: str = "") -> str:
         """Compose a refusal response."""
-        from .safety_agent import SafetyAgent
+        try:
+            from .safety_agent import SafetyAgent
+        except ImportError:
+            from safety_agent import SafetyAgent
         return SafetyAgent().build_refusal_message(violation_type, redirect)
 
     def compose_error(self, error_msg: str) -> str:

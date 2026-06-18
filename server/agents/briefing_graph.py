@@ -187,7 +187,10 @@ def run_dart_sentiment(state: BriefingState) -> BriefingState:
         logger.info("Step 4: No DART events to classify — skipping")
         return state
 
-    from .dart_sentiment_agent import DartSentimentAgent
+    try:
+        from .dart_sentiment_agent import DartSentimentAgent
+    except ImportError:
+        from dart_sentiment_agent import DartSentimentAgent
 
     agent = DartSentimentAgent()
     try:
@@ -382,7 +385,10 @@ def filter_major_disclosures(state: BriefingState) -> BriefingState:
 
 def compose_briefing(state: BriefingState) -> BriefingState:
     """Step 8: Compose the final briefing text."""
-    from .response_composer import ResponseComposer
+    try:
+        from .response_composer import ResponseComposer
+    except ImportError:
+        from response_composer import ResponseComposer
 
     composer = ResponseComposer()
 
