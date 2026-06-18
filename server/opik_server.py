@@ -143,7 +143,7 @@ class SearchRequest(BaseModel):
 
 class SearchResult(BaseModel):
     report_id: str
-    score: float
+    score: Optional[float] = None
     종목코드: Optional[str] = None
     reason: Optional[str] = None
     keywords: Optional[List[str]] = None

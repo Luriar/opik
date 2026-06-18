@@ -46,13 +46,13 @@ def init_agents(faiss_index, report_ids: list, report_texts: dict, embedder):
     """Wire server globals into the agent singletons. Call after FAISS loads."""
     global _safety, _intent, _report, _dart, _analysis, _composer, _supervisor, _ready
 
-    from server.agents.safety_agent import SafetyAgent
-    from server.agents.intent_agent import IntentAgent
-    from server.agents.report_agent import ReportAgent
-    from server.agents.dart_agent import DartAgent
-    from server.agents.analysis_agent import AnalysisAgent
-    from server.agents.response_composer import ResponseComposer
-    from server.agents.supervisor import SupervisorAgent
+    from agents.safety_agent import SafetyAgent
+    from agents.intent_agent import IntentAgent
+    from agents.report_agent import ReportAgent
+    from agents.dart_agent import DartAgent
+    from agents.analysis_agent import AnalysisAgent
+    from agents.response_composer import ResponseComposer
+    from agents.supervisor import SupervisorAgent
 
     _safety = SafetyAgent()
     _intent = IntentAgent()
