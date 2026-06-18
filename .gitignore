@@ -1,6 +1,7 @@
 # Secrets & credentials
 .env
 .env.*
+!.env.example
 *.env
 credentials
 *.pem
@@ -61,5 +62,4 @@ tmp/
 batch_output/
 *.out
 
-# Large dependencies (installed separately)
-pylib/
+# Large dependencies (installed sepa
