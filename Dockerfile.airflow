@@ -1,5 +1,7 @@
 FROM apache/airflow:2.10.0-python3.12
 
+ENV OPIK_HF_CACHE_DIR=/tmp/opik-huggingface
+
 COPY requirements.txt /opt/airflow/requirements.txt
 
 # Pin Airflow while installing project packages so pip cannot replace the

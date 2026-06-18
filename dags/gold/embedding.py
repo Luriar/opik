@@ -111,12 +111,36 @@ def upstream_logical_date_for_target(logical_date, data_interval_end=None, **_):
 
 EMBEDDING_MODEL_NAME = "intfloat/multilingual-e5-small"
 EMBEDDING_DIM = 384
+DEFAULT_MODEL_CACHE_DIR = Path("/tmp/opik-huggingface")
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("opik.gold.embeddings")
+
+
+def model_cache_dir() -> Path:
+    """Return a writable Hugging Face cache directory for the Airflow worker."""
+    configured = (
+        os.getenv("OPIK_HF_CACHE_DIR")
+        or os.getenv("SENTENCE_TRANSFORMERS_HOME")
+        or os.getenv("HF_HOME")
+    )
+    candidates = [Path(configured)] if configured else []
+    candidates.append(DEFAULT_MODEL_CACHE_DIR)
+
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            probe = candidate / ".write-test"
+            probe.touch(exist_ok=True)
+            probe.unlink(missing_ok=True)
+            return candidate
+        except OSError:
+            logger.warning("Embedding model cache is not writable: %s", candidate)
+
+    raise RuntimeError("쓰기 가능한 Hugging Face 모델 캐시 경로가 없습니다.")
 
 BOILERPLATE_MARKERS = [
     r"Compliance\s*Notice",
@@ -806,8 +830,16 @@ def run_daily_embedding(
         import numpy as np
         from sentence_transformers import SentenceTransformer
 
-        logger.info("Loading embedding model: %s", EMBEDDING_MODEL_NAME)
-        embedder = SentenceTransformer(EMBEDDING_MODEL_NAME)
+        cache_dir = model_cache_dir()
+        logger.info(
+            "Loading embedding model: %s (cache=%s)",
+            EMBEDDING_MODEL_NAME,
+            cache_dir,
+        )
+        embedder = SentenceTransformer(
+            EMBEDDING_MODEL_NAME,
+            cache_folder=str(cache_dir),
+        )
         vectors = embedder.encode(
             [row["_embedding_input"] for row in embedding_rows],
             batch_size=16,
