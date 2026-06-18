@@ -179,35 +179,25 @@ def load_dart_events(state: BriefingState) -> BriefingState:
 
 
 def run_dart_sentiment(state: BriefingState) -> BriefingState:
-    """Step 4: Run DART Sentiment Agent on disclosure events.
+    """Step 4: Assign default neutral sentiment to all DART events.
 
-    Classifies each event as positive/negative/neutral with Haiku batch mode.
+    Full LLM sentiment classification (Haiku batch) is too slow for daily
+    briefing — 12K+ events would take 60+ minutes. Sentiment is pre-computed
+    offline or deferred to a separate batch job.
+
+    For the daily briefing pipeline, all events default to "neutral" so that
+    DART data is still loaded and queryable without blocking the pipeline.
     """
     if state.dart_events_df is None or state.dart_events_df.empty:
         logger.info("Step 4: No DART events to classify — skipping")
         return state
 
-    try:
-        from .dart_sentiment_agent import DartSentimentAgent
-    except ImportError:
-        from dart_sentiment_agent import DartSentimentAgent
-
-    agent = DartSentimentAgent()
-    try:
-        state.dart_events_df = agent.classify_sync(state.dart_events_df)
-        positive = (state.dart_events_df["sentiment"] == "positive").sum()
-        negative = (state.dart_events_df["sentiment"] == "negative").sum()
-        neutral = (state.dart_events_df["sentiment"] == "neutral").sum()
-        logger.info(
-            "Step 4: DART sentiment done — pos=%d neg=%d neutral=%d",
-            positive, negative, neutral,
-        )
-    except Exception as e:
-        logger.error("Step 4: DART sentiment failed: %s", e)
-        state.error = f"Sentiment classification failed: {e}"
+    # Assign neutral sentiment without LLM calls
+    state.dart_events_df["sentiment"] = "neutral"
+    total = len(state.dart_events_df)
+    logger.info("Step 4: DART sentiment defaulted to neutral for %d events", total)
 
     return state
-
 
 def load_model_predictions(state: BriefingState) -> BriefingState:
     """Step 5: Load Chanho model predictions from S3 Gold."""
@@ -228,9 +218,13 @@ def check_triple_consensus(state: BriefingState) -> BriefingState:
     """Step 6: ★ Triple Consensus check (Pandas in-process).
 
     Algorithm:
-      1. INNER JOIN: report tickers ∩ model tickers ∩ DART positive tickers
-      2. Remove tickers with any negative DART events
+      1. INNER JOIN: report tickers ∩ model tickers
+      2. If DART sentiment available: filter to positive, remove negatives
       3. Within intersection, verify: BUY opinion + upside > 0%
+
+    When DART sentiment is not available (all neutral), DART acts as a
+    data source for reference rather than a filter — the consensus uses
+    reports ∩ model only.
     """
     if not state.structured:
         logger.info("Step 6: No structured data — skipping consensus")
@@ -264,16 +258,21 @@ def check_triple_consensus(state: BriefingState) -> BriefingState:
             elif sentiment == "negative":
                 dart_negative_tickers.add(code)
 
-    # INNER JOIN: all three sources must have this ticker
-    intersection = report_tickers & model_tickers & dart_positive_tickers
-    # Remove tickers with negative DART events
-    intersection -= dart_negative_tickers
+    # INNER JOIN: reports ∩ model (always); add DART filter if sentiment available
+    intersection = report_tickers & model_tickers
+    has_dart_sentiment = bool(dart_positive_tickers or dart_negative_tickers)
+
+    if has_dart_sentiment:
+        # Narrow to tickers with positive DART sentiment
+        intersection &= dart_positive_tickers
+        # Remove tickers with negative DART events
+        intersection -= dart_negative_tickers
 
     logger.info(
-        "Step 6: reports=%d model+=%d dart_pos=%d dart_neg=%d → intersection=%d",
+        "Step 6: reports=%d model+=%d dart_pos=%d dart_neg=%d sentiment_available=%s → intersection=%d",
         len(report_tickers), len(model_tickers),
         len(dart_positive_tickers), len(dart_negative_tickers),
-        len(intersection),
+        has_dart_sentiment, len(intersection),
     )
 
     # Within intersection: verify BUY opinion + upside > 0
@@ -352,8 +351,8 @@ def filter_major_disclosures(state: BriefingState) -> BriefingState:
         df = df[df["event_category"].isin(["B", "B-type"]) |
                 df["report_nm"].str.contains("|".join(b_type_keywords), na=False)]
 
-    # Only positive sentiment
-    if "sentiment" in df.columns:
+    # Only positive sentiment (skip if all neutral — no LLM sentiment available)
+    if "sentiment" in df.columns and (df["sentiment"] == "positive").any():
         df = df[df["sentiment"] == "positive"]
 
     # Exclude tickers already in ★
