@@ -4,6 +4,8 @@ ENV OPIK_HF_CACHE_DIR=/tmp/opik-huggingface
 
 COPY requirements.txt /opt/airflow/requirements.txt
 
+RUN umask 0002; mkdir -p "${OPIK_HF_CACHE_DIR}"
+
 # Pin Airflow while installing project packages so pip cannot replace the
 # version bundled in the base image.
 RUN python -m pip install --no-cache-dir \
