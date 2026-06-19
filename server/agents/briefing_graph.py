@@ -596,8 +596,8 @@ def send_telegram(state: BriefingState) -> BriefingState:
         return state
 
     # Import telegram sender (from existing pipeline)
-    telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
     if not telegram_token or not telegram_chat_id:
         logger.warning("Step 9: Telegram credentials not configured — skipping send")
@@ -792,5 +792,4 @@ def run_briefing_pipeline(date: str) -> dict:
         "report_count": len(state.structured),
         "dart_count": len(state.dart_events_df) if state.dart_events_df is not None else 0,
         "briefing_length": len(state.final_briefing),
-        "error": state.error,
-    }
+        "error": sta
