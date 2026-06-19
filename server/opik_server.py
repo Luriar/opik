@@ -165,24 +165,23 @@ def _run_analysis_with_data(analysis_type: str, sources: list,
     try:
         from agent_integration import _report, _dart, _analysis, _composer
         converted = _convert_sources(sources)
+
+        # Extract ticker info from intent or message
+        companies = intent_info.get("companies", [])
+        ticker_name = companies[0] if companies else _extract_ticker_from_message(req_message)
+
+        # If no sources from Stage 2, try direct FAISS search with ticker
+        if not converted and ticker_name:
+            logger.info("Analysis: Stage 2 had 0 sources, trying direct FAISS with ticker=%s", ticker_name)
+            converted = _report.search(ticker_name, top_k=20)
         if not converted:
             logger.warning("Analysis: no converted sources for %s", analysis_type)
             return None
 
-        ticker = intent_info.get("companies", [None])[0] or "종목"
-        ticker_name = ticker
-
         if analysis_type == "compare":
-            # Search for multiple tickers if available
-            companies = intent_info.get("companies", [])
-            all_reports = {}
-            for comp in (companies if len(companies) > 1 else [ticker_name]):
-                r = _report.search(comp)
-                if r:
-                    all_reports[comp] = r
-            if len(all_reports) < 2:
-                all_reports[ticker_name] = converted
-            result = _analysis.compare_reports(all_reports, ticker_name)
+            # compare_reports expects List[dict] — pass converted directly
+            # (Stage 2 already fetched data for all companies in the query)
+            result = _analysis.compare_reports(converted, ticker_name)
             if result:
                 return _composer.compose(result, req_message)
         elif analysis_type == "cause_tracking":
@@ -197,17 +196,40 @@ def _run_analysis_with_data(analysis_type: str, sources: list,
         elif analysis_type == "interpret":
             raw_text = ""
             if dart_results and len(dart_results) > 0:
-                raw_text = dart_results[0].get("report_nm", "") if hasattr(dart_results[0], 'get') else str(dart_results[0])
+                first = dart_results[0]
+                raw_text = first.get("report_nm", "") if hasattr(first, 'get') else str(first)
             elif converted:
-                raw_text = converted[0].get("text", "") if isinstance(converted[0], dict) else str(converted[0])
+                first = converted[0]
+                raw_text = first.get("text", first.get("reason", "")) if isinstance(first, dict) else str(first)
             if raw_text:
-                result = _dart.interpret_disclosure(raw_text, ticker_name)
+                result = _dart.interpret_disclosure(raw_text, ticker_name or "종목")
                 if result:
                     return _composer.compose(result, req_message)
         return None
     except Exception as e:
         logger.warning("Analysis pipeline failed (%s): %s", analysis_type, e)
+        import traceback
+        traceback.print_exc()
         return None
+
+
+def _extract_ticker_from_message(message: str) -> Optional[str]:
+    """Extract ticker name from a message like '삼성전자 왜 올랐어?'."""
+    import re
+    # Common Korean stock names
+    _known_tickers = [
+        "삼성전자", "SK하이닉스", "LG에너지솔루션", "삼성바이오로직스",
+        "현대차", "기아", "셀트리온", "POSCO홀딩스", "NAVER", "카카오",
+        "카카오뱅크", "KB금융", "신한지주", "하나금융지주",
+        "삼성SDI", "LG화학", "현대모비스", "삼성물산", "SK텔레콤",
+        "KT", "LG전자", "한화에어로스페이스", "두산에너빌리티",
+        "HD현대중공업", "삼성중공업", "한화오션", "HMM",
+        "대한항공", "하이브", "JYP Ent.", "에코프로", "포스코퓨처엠",
+    ]
+    for name in _known_tickers:
+        if name in message:
+            return name
+    return None
 
 
 
