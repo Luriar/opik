@@ -527,6 +527,193 @@ def _scan_reports_by_date(date_from: str, date_to: str, limit: int = 50,
     return results, total
 
 
+
+def _detect_analysis_request(message: str) -> Optional[str]:
+    """Detect if the user wants report comparison, cause tracking, or disclosure interpretation.
+    
+    Returns one of: "compare", "cause_tracking", "interpret", or None.
+    """
+    msg = message.strip()
+    
+    # Compare: cross-brokerage report comparison
+    _compare_kw = ["비교", "차이", "증권사별", "의견 차이", "다른 증권사", "증권사 차이",
+                   "어디가 더", "어느 증권사", "어떤 증권사가"]
+    if any(kw in msg for kw in _compare_kw):
+        return "compare"
+    
+    # Cause tracking: why did stock price move
+    _cause_kw = ["왜 올랐", "왜 떨어졌", "왜 내렸", "원인", "급등", "급락", 
+                 "하락 이유", "상승 이유", "왜 급", "무슨 일이"]
+    if any(kw in msg for kw in _cause_kw):
+        return "cause_tracking"
+    
+    # Interpret: disclosure/event interpretation
+    _interpret_kw = ["해석", "공시 뜻", "무슨 의미", "어떤 의미",
+                     "호재", "악재", "무슨 영향", "영향 분석",
+                     "이 공시", "이게 무슨", "무슨 뜻"]
+    if any(kw in msg for kw in _interpret_kw):
+        return "interpret"
+    
+    return None
+
+
+def _run_analysis_with_data(
+    message: str, sources: list, dart_context: str, 
+    analysis_type: str, intent_info: dict
+) -> Optional[str]:
+    """Delegate analysis requests to the V2 agent pipeline.
+    
+    The V2 agent framework (safety_agent → intent_agent → supervisor → agents → composer)
+    handles the full pipeline including its own data retrieval. This function acts as
+    a bridge from the V1 /chat endpoint to the V2 agent pipeline for complex queries.
+    
+    Returns formatted answer string, or None if agents are not available.
+    """
+    try:
+        from agent_integration import _ready, _analysis, _composer, _report, _dart
+    except ImportError:
+        logger.warning("Agent integration not available for analysis routing")
+        return None
+    
+    if not _ready:
+        logger.warning("Agents not ready for analysis routing")
+        return None
+    
+    try:
+        # ── compare: cross-brokerage report comparison ──
+        if analysis_type == "compare":
+            companies = intent_info.get("companies", []) or []
+            ticker_name = companies[0] if companies else ""
+            
+            # Use report_agent for FAISS search with enriched context
+            if _report is not None and _analysis is not None:
+                search_results = _report.search(message, top_k=10)
+                if search_results and len(search_results) >= 2:
+                    analysis = _analysis.compare_reports(search_results, ticker_name)
+                    if analysis and _composer is not None:
+                        return _composer.compose_chat_response(
+                            intent="report_search",
+                            report_summary=None,
+                            analysis=analysis,
+                            sources=[r.get("report_id", "") for r in search_results],
+                            confidence="medium",
+                        )
+                    elif analysis:
+                        return str(analysis)
+            
+            # Fallback: use V1 data
+            if _analysis is not None and len(sources) >= 2:
+                agent_sources = _convert_sources(sources)
+                analysis = _analysis.compare_reports(agent_sources, ticker_name)
+                if analysis and _composer is not None:
+                    return _composer.compose_chat_response(
+                        intent="report_search", analysis=analysis,
+                        sources=[s.get("report_id", "") for s in agent_sources],
+                        confidence="medium",
+                    )
+                elif analysis:
+                    return str(analysis)
+            
+            return "비교 분석을 위한 충분한 데이터를 찾을 수 없습니다. 구체적인 종목명을 포함해 다시 질문해 주세요."
+        
+        # ── cause_tracking: price movement cause tracing ──
+        elif analysis_type == "cause_tracking":
+            companies = intent_info.get("companies", []) or []
+            ticker_name = companies[0] if companies else ""
+            
+            if _report is not None and _analysis is not None:
+                # Search for recent reports about this ticker
+                enriched_query = f"{ticker_name} {message}" if ticker_name else message
+                search_results = _report.search(enriched_query, top_k=10)
+                if search_results:
+                    analysis = _analysis.trace_cause(
+                        ticker_name, "최근 1주일", search_results, []
+                    )
+                    if analysis and _composer is not None:
+                        return _composer.compose_chat_response(
+                            intent="report_search",
+                            report_summary=None,
+                            analysis=analysis,
+                            sources=[r.get("report_id", "") for r in search_results],
+                            confidence="medium",
+                        )
+                    elif analysis:
+                        return str(analysis)
+            
+            if _analysis is not None and sources:
+                agent_sources = _convert_sources(sources)
+                analysis = _analysis.trace_cause(ticker_name, "최근 1주일", agent_sources, [])
+                if analysis and _composer is not None:
+                    return _composer.compose_chat_response(
+                        intent="report_search", analysis=analysis,
+                        sources=[s.get("report_id", "") for s in agent_sources],
+                        confidence="medium",
+                    )
+                elif analysis:
+                    return str(analysis)
+            
+            return "주가 변동 원인을 분석할 데이터가 충분하지 않습니다. 종목명과 함께 다시 질문해 주세요."
+        
+        # ── interpret: disclosure/event interpretation ──
+        elif analysis_type == "interpret":
+            if _dart is not None and dart_context:
+                interpretation = _dart.interpret_disclosure(dart_context, "")
+                if interpretation:
+                    result = (
+                        f"## 공시 해석\n\n{interpretation}\n\n"
+                        "※ 본 분석은 공시 텍스트의 해석이며 투자 권유가 아닙니다."
+                    )
+                    return result
+            
+            if _analysis is not None and dart_context:
+                # Use Opus for deeper analysis with provided DART data
+                context = f"사용자 질문: {message}\n\nDART 공시 데이터:\n{dart_context[:3000]}"
+                industry_prompt = (
+                    "당신은 OPIK 금융 분석가입니다. 주어진 DART 공시 데이터를 분석하여 "
+                    "사용자 질문에 답변하세요.\n\n"
+                    "## 중요 규칙\n"
+                    "- 확정적 표현 대신 \"~로 보입니다\", \"~로 해석됩니다\" 사용\n"
+                    "- 투자 판단 유도 금지\n"
+                    "- 정보가 불충분하면 솔직히 표기\n"
+                    "- 답변 말미에 \"※ 본 분석은 공시 데이터의 해석이며 투자 권유가 아닙니다.\" 추가"
+                )
+                analysis = _analysis._call_opus(industry_prompt, context)
+                if analysis:
+                    return analysis
+            
+            return "공시 해석을 위한 충분한 데이터를 찾을 수 없습니다."
+        
+        return None
+    
+    except Exception as e:
+        logger.exception("Analysis pipeline failed: %s", e)
+        return None
+
+
+def _convert_sources(sources: list) -> list:
+    """Convert V1 SearchResult objects to agent-compatible dicts."""
+    result = []
+    for s in (sources or []):
+        if hasattr(s, 'report_id'):
+            rid = s.report_id
+            info = report_texts.get(rid, {})
+            result.append({
+                "report_id": rid,
+                "증권사": info.get("증권사", getattr(s, '종목코드', '')),
+                "발행일": info.get("발행일", ''),
+                "투자의견": info.get("투자의견", ''),
+                "목표주가": info.get("목표주가", ''),
+                "현재주가": info.get("현재주가", ''),
+                "reason": getattr(s, 'reason', info.get("reason", '')),
+                "keywords": getattr(s, 'keywords', info.get("keywords", [])),
+                "risks": getattr(s, 'risks', info.get("risks", [])),
+                "score": getattr(s, 'score', 0.0),
+            })
+        elif isinstance(s, dict):
+            result.append(s)
+    return result
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     global faiss_index, report_ids
@@ -581,8 +768,14 @@ async def chat(req: ChatRequest):
         })
         intent_info = intent.to_dict()
 
+    # v3: Analysis pre-check — detect analysis requests BEFORE refusal gate.
+    # The intent parser may classify cause_tracking/interpret as "refuse" because
+    # Haiku doesn't have those intent types. Override refusal for analysis queries.
+    _analysis_type = _detect_analysis_request(_original_message if '_original_message' in dir() else req.message)
+    
     # v2: REFUSAL GATE — intent parser said refuse → return immediately, no search
-    if intent.is_refusal:
+    # v3 EXCEPTION: analysis requests (compare/cause_tracking/interpret) skip this gate
+    if intent.is_refusal and not _analysis_type:
         logger.warning("Refusal intent detected: %s — blocking search", req.message[:80])
         refusal_msg = _build_refusal_message(req.message)
         return ChatResponse(
@@ -593,6 +786,11 @@ async def chat(req: ChatRequest):
             context_full=conversation_store.is_context_full(session_id),
             turn_count=conversation_store.get_turn_count(session_id),
         )
+    
+    if intent.is_refusal and _analysis_type:
+        logger.info("Analysis request (%s) bypassed refusal gate — intent was 'refuse' but keywords detected", _analysis_type)
+        # Override intent to proceed with data retrieval
+        intent_info["intent"] = "report_search"
 
     # v2: SAFETY NET — catch out-of-scope questions missed by intent parser
     # Category 1: Investment advice keywords (Zone C)
@@ -609,7 +807,7 @@ async def chat(req: ChatRequest):
     ]
     _all_block_keywords = _invest_keywords + _out_of_scope_keywords
 
-    if intent.intent == "general" and any(kw in req.message for kw in _all_block_keywords):
+    if intent.intent == "general" and any(kw in req.message for kw in _all_block_keywords) and not _analysis_type:
         logger.warning("Out-of-scope question misrouted to general, refusing: %s", req.message[:80])
         refusal_msg = _build_refusal_message(req.message)
         return ChatResponse(
@@ -764,6 +962,42 @@ async def chat(req: ChatRequest):
         else:
             dart_context = ""
 
+    # v3: Analysis routing for complex queries (compare/cause_tracking/interpret)
+    # When the user wants analysis beyond simple search, delegate to the V2 agent pipeline.
+    # NOTE: _analysis_type is already set in the pre-check section above.
+    if _analysis_type and AGENT_ENABLED_STR != "false":
+        logger.info("Analysis request detected: type=%s message=%s", _analysis_type, _original_message[:80])
+        analysis_answer = _run_analysis_with_data(
+            _original_message, sources, dart_context, _analysis_type, intent_info
+        )
+        if analysis_answer:
+            conversation_store.add_turn(session_id, "user", req.message)
+            conversation_store.add_turn(session_id, "assistant", analysis_answer)
+            ctx_full = conversation_store.is_context_full(session_id)
+            turn_count = conversation_store.get_turn_count(session_id)
+            
+            elapsed = (time.time() - t0) * 1000
+            # Compute pagination metadata
+            total_pages = max(1, (total_count + page_size - 1) // page_size)
+            has_next = page < total_pages
+            
+            logger.info("Analysis complete in %dms (type=%s)", elapsed, _analysis_type)
+            return ChatResponse(
+                answer=analysis_answer,
+                sources=sources[:SEARCH_TOP_K] if sources else [],
+                elapsed_ms=round(elapsed, 1),
+                intent=intent_info,
+                dart_results=dart_results,
+                total=total_count,
+                page=page,
+                page_size=page_size,
+                has_next=has_next,
+                context_full=ctx_full,
+                turn_count=turn_count,
+            )
+        else:
+            logger.warning("Analysis pipeline returned None, falling back to Bedrock")
+
     # Stage 3: Build context and answer
     # Determine if this was a browse query (all reports in date range)
     is_browse = (
@@ -773,6 +1007,31 @@ async def chat(req: ChatRequest):
     )
 
     if intent.is_general:
+        # v3: Greeting detection — for simple greetings, respond warmly
+        _greeting_kw = ["안녕", "하이", "헬로", "반가", "고마워", "감사", "ㅎㅇ"]
+        _original_for_greeting = getattr(req, 'message', '')
+        _is_simple_greeting = any(kw in _original_for_greeting for kw in _greeting_kw) and len(_original_for_greeting) < 20
+
+        if _is_simple_greeting:
+            greeting_msg = (
+                "안녕하세요! OPIK 금융 정보 챗봇입니다.\n\n"
+                "증권사 애널리스트 리포트와 DART 공시 데이터를 검색·요약해 드립니다.\n\n"
+                "예를 들어 이런 질문을 해보세요:\n"
+                "• \"삼성전자 목표주가 알려줘\"\n"
+                "• \"최근 반도체 리포트 있어?\"\n"
+                "• \"삼성전자랑 SK하이닉스 비교해줘\"\n"
+                "• \"오늘 올라온 리포트 요약해줘\"\n\n"
+                "무엇을 도와드릴까요?"
+            )
+            return ChatResponse(
+                answer=greeting_msg,
+                sources=[],
+                elapsed_ms=round((time.time() - t0) * 1000, 1),
+                intent=intent_info,
+                context_full=conversation_store.is_context_full(session_id),
+                turn_count=conversation_store.get_turn_count(session_id),
+            )
+
         # v2: Zone D guard — general intent with no data MUST NOT fabricate answers
         # Only respond with help message, never answer from empty context
         help_msg = (
@@ -1035,43 +1294,4 @@ def build_index_from_s3():
             for _, row in df.iterrows():
                 emb = row["embedding"]
                 if emb is None or len(emb) == 0:
-                    continue
-                all_embeddings.append(np.array(emb, dtype=np.float32))
-                rid = row["report_id"]
-                all_ids.append(rid)
-                report_texts[rid] = {
-                    "종목코드": row.get("종목코드"),
-                    "reason": row.get("reason"),
-                    "keywords": row.get("keywords"),
-                    "risks": row.get("risks"),
-                    "year": year,
-                    "month": month,
-                }
-        except Exception as e:
-            logger.warning("Error reading %s: %s", key, e)
-
-    n = len(all_embeddings)
-    if n == 0:
-        raise RuntimeError("No embeddings found in S3")
-
-    vectors = np.array(all_embeddings, dtype=np.float32).copy()
-    dim = vectors.shape[1]
-    faiss.normalize_L2(vectors)
-
-    index = faiss.IndexIDMap(faiss.IndexFlatIP(dim))
-    index.add_with_ids(vectors, np.arange(n, dtype=np.int64))
-
-    with index_lock:
-        faiss_index = index
-        report_ids = all_ids
-
-    faiss.write_index(faiss_index, FAISS_INDEX_PATH)
-    with open(FAISS_IDMAP_PATH, "w") as f:
-        json.dump(all_ids, f, ensure_ascii=False)
-
-    info_path = "/data/opik/report_info.json"
-    with open(info_path, "w") as f:
-        json.dump(report_texts, f, ensure_ascii=False)
-
-    logger.info("FAISS index rebuilt: %d vectors, dim=%d", n, dim)
-    return n
+               
