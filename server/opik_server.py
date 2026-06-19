@@ -163,7 +163,7 @@ def _run_analysis_with_data(analysis_type: str, sources: list,
     """Run V2 agent pipeline analysis on retrieved data.
     Falls back to None if analysis fails — caller should then use V1 path."""
     try:
-        from agent_integration import _report, _dart, _analysis, _composer
+        import agent_integration
         converted = _convert_sources(sources)
 
         # Extract ticker info from intent or message
@@ -173,7 +173,7 @@ def _run_analysis_with_data(analysis_type: str, sources: list,
         # If no sources from Stage 2, try direct FAISS search with ticker
         if not converted and ticker_name:
             logger.info("Analysis: Stage 2 had 0 sources, trying direct FAISS with ticker=%s", ticker_name)
-            converted = _report.search(ticker_name, top_k=20)
+            converted = agent_integration._report.search(ticker_name, top_k=20)
         if not converted:
             logger.warning("Analysis: no converted sources for %s", analysis_type)
             return None
@@ -181,22 +181,22 @@ def _run_analysis_with_data(analysis_type: str, sources: list,
         if analysis_type == "compare":
             # compare_reports expects List[dict] — pass converted directly
             # (Stage 2 already fetched data for all companies in the query)
-            result = _analysis.compare_reports(converted, ticker_name)
+            result = agent_integration._analysis.compare_reports(converted, ticker_name)
             if result:
-                return _composer.compose_chat_response(
+                return agent_integration._composer.compose_chat_response(
                 intent=analysis_type,
                 analysis=result,
                 sources=converted[:10] if converted else [],
             )
         elif analysis_type == "cause_tracking":
-            result = _analysis.trace_cause(
+            result = agent_integration._analysis.trace_cause(
                 ticker_name=ticker_name,
                 date_range=None,
                 report_events=converted,
                 dart_events=dart_results or [],
             )
             if result:
-                return _composer.compose_chat_response(
+                return agent_integration._composer.compose_chat_response(
                 intent=analysis_type,
                 analysis=result,
                 sources=converted[:10] if converted else [],
@@ -210,9 +210,9 @@ def _run_analysis_with_data(analysis_type: str, sources: list,
                 first = converted[0]
                 raw_text = first.get("text", first.get("reason", "")) if isinstance(first, dict) else str(first)
             if raw_text:
-                result = _dart.interpret_disclosure(raw_text, ticker_name or "종목")
+                result = agent_integration._dart.interpret_disclosure(raw_text, ticker_name or "종목")
                 if result:
-                    return _composer.compose_chat_response(
+                    return agent_integration._composer.compose_chat_response(
                 intent=analysis_type,
                 analysis=result,
                 sources=converted[:10] if converted else [],
