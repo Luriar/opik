@@ -36,7 +36,7 @@ def notify_telegram_failure(context):
 default_args = {
     "owner": "opik",
     "depends_on_past": False,
-    "start_date": datetime(2026, 6, 19),
+    "start_date": datetime(2026, 6, 18),
     "retries": 1,
     "retry_delay": timedelta(minutes=5),
     "execution_timeout": timedelta(hours=2),
@@ -46,32 +46,24 @@ default_args = {
 with DAG(
     dag_id="model_daily_prediction",
     default_args=default_args,
-    schedule="0 6 * * *",          # 06:00 KST daily -- after US market close
+    schedule="0 6 * * *",
     catchup=False,
     max_active_runs=1,
     tags=["opik", "model", "phase2"],
     description="Daily LightGBM model training + prediction + S3 Gold upload (06:00 KST)",
 ) as dag:
 
-    # -------------------------------------------------------------------------
-    # Task 1: Model training + prediction + S3 upload
-    # Single task -- the script handles all three steps sequentially.
-    # -------------------------------------------------------------------------
-
     run_model_pipeline = BashOperator(
         task_id="run_model_pipeline",
         bash_command=(
-            f"cd {OPIK_ROOT} && "
-            "python scripts/model/run_prediction.py --date {{ ds_nodash }} --project-root /opt/airflow/opik"
-        ),
+            "cd {OPIK_ROOT} && "
+            "python scripts/model/run_prediction.py "
+            "--date {{ (execution_date - macros.timedelta(days=1)).strftime('%Y%m%d') }} "
+            "--project-root {OPIK_ROOT}"
+        ).format(OPIK_ROOT=OPIK_ROOT),
         retries=1,
         retry_delay=timedelta(minutes=5),
         execution_timeout=timedelta(hours=2),
     )
-
-    # -------------------------------------------------------------------------
-    # DAG graph: single task (extensible to multi-task in Phase 2b)
-    #   run_model_pipeline
-    # -------------------------------------------------------------------------
 
     run_model_pipeline

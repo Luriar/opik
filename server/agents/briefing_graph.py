@@ -34,6 +34,9 @@ import boto3
 import pandas as pd
 import pyarrow.parquet as pq
 
+# Unified Gold data reader — Delta from S3 first, Parquet fallback
+from agents.data_helper import read_gold_data
+
 logger = logging.getLogger("opik.briefing")
 
 AWS_REGION = os.environ.get("AWS_REGION", "ap-northeast-2")
@@ -85,28 +88,26 @@ def _list_parquet_keys(prefix: str) -> List[str]:
 # ── Step Implementations ──
 
 def load_gold_structured(state: BriefingState) -> BriefingState:
-    """Step 1: Load today's Gold Structured data from S3."""
+    """Step 1: Load today's Gold Structured data via Delta Lake from S3."""
     date = state.date  # YYYYMMDD
     year = date[:4]
     month = date[4:6]
-    key = f"gold/structured/year={year}/month={month}/data.parquet"
 
     try:
-        df = _read_parquet_s3(key)
-        # Filter to today's report date
-        # 발행일 is the report publication date (stored as YYYYMMDD or YYYY-MM-DD)
-        today_str = f"{year}-{month}-{date[6:8]}"
-        today_compact = date
-
-        if "발행일" in df.columns:
-            df["발행일_str"] = df["발행일"].astype(str).str.replace("-", "")
-            df = df[df["발행일_str"] == today_compact]
-        elif "report_date" in df.columns:
-            df["report_date_str"] = df["report_date"].astype(str).str.replace("-", "")
-            df = df[df["report_date_str"] == today_compact]
-
-        state.structured = df.to_dict("records")
-        logger.info("Step 1: Gold Structured loaded — %d rows for %s", len(state.structured), date)
+        df = read_gold_data("structured")
+        if df is not None and len(df) > 0:
+            # Filter to today's report date
+            today_compact = date
+            if "발행일" in df.columns:
+                df["발행일_str"] = df["발행일"].astype(str).str.replace("-", "")
+                df = df[df["발행일_str"] == today_compact]
+            elif "report_date" in df.columns:
+                df["report_date_str"] = df["report_date"].astype(str).str.replace("-", "")
+                df = df[df["report_date_str"] == today_compact]
+            state.structured = df.to_dict("records")
+            logger.info("Step 1: Gold Structured loaded via Delta — %d rows for %s", len(state.structured), date)
+        else:
+            state.structured = []
     except Exception as e:
         logger.warning("Step 1: Gold Structured load failed: %s", e)
         state.structured = []
@@ -115,16 +116,14 @@ def load_gold_structured(state: BriefingState) -> BriefingState:
 
 
 def load_gold_llm(state: BriefingState) -> BriefingState:
-    """Step 2: Load today's Gold LLM (reason/risks/keywords) from S3."""
-    date = state.date
-    year = date[:4]
-    month = date[4:6]
-    key = f"gold/embeddings/year={year}/month={month}/data.parquet"
-
+    """Step 2: Load today's Gold LLM (reason/risks/keywords) via Delta Lake from S3."""
     try:
-        df = _read_parquet_s3(key)
-        state.llm_data = df.to_dict("records")
-        logger.info("Step 2: Gold LLM loaded — %d rows", len(state.llm_data))
+        df = read_gold_data("embeddings")
+        if df is not None:
+            state.llm_data = df.to_dict("records")
+            logger.info("Step 2: Gold LLM loaded via Delta — %d rows", len(state.llm_data))
+        else:
+            state.llm_data = []
     except Exception as e:
         logger.warning("Step 2: Gold LLM load failed: %s", e)
         state.llm_data = []
@@ -133,46 +132,30 @@ def load_gold_llm(state: BriefingState) -> BriefingState:
 
 
 def load_dart_events(state: BriefingState) -> BriefingState:
-    """Step 3: Load 1 month of DART disclosure events from S3 Gold.
+    """Step 3: Load 92-day window of DART disclosure events via Delta Lake from S3.
 
     Uses OPIK Gold disclosure_events as Phase 2 primary source.
+    Replaces the old monthly-parquet-partition loop with a single Delta read.
     """
     target_dt = datetime.strptime(state.date, "%Y%m%d")
     start_dt = target_dt - timedelta(days=92)  # ~1 quarter for ★ consensus window
 
-    # Collect all monthly partitions in range
-    months = set()
-    d = start_dt
-    while d <= target_dt:
-        months.add(d.strftime("%Y-%m"))
-        d = datetime(d.year, d.month, 1) + timedelta(days=32)
-        d = datetime(d.year, d.month, 1)
-
-    dfs = []
-    s3 = _get_s3()
-    for ym in sorted(months):
-        key = f"gold/dart/disclosure_events/dt={ym}/data.parquet"
-        try:
-            df = _read_parquet_s3(key)
-            dfs.append(df)
-            logger.info("Step 3: Loaded disclosure_events dt=%s: %d rows", ym, len(df))
-        except Exception:
-            logger.debug("Step 3: No disclosure_events for dt=%s", ym)
-
-    if dfs:
-        combined = pd.concat(dfs, ignore_index=True)
-
-        # Filter to date range
-        if "rcept_dt" in combined.columns:
-            combined = combined[
-                (combined["rcept_dt"] >= start_dt.strftime("%Y%m%d")) &
-                (combined["rcept_dt"] <= state.date)
-            ]
-
-        state.dart_events_df = combined
-        logger.info("Step 3: DART events loaded — %d rows", len(combined))
-    else:
-        logger.warning("Step 3: No DART events found for the period")
+    try:
+        df = read_gold_data("dart/disclosure_events")
+        if df is not None and len(df) > 0:
+            # Filter to date range
+            if "rcept_dt" in df.columns:
+                df = df[
+                    (df["rcept_dt"] >= start_dt.strftime("%Y%m%d")) &
+                    (df["rcept_dt"] <= state.date)
+                ]
+            state.dart_events_df = df
+            logger.info("Step 3: DART events loaded via Delta — %d rows", len(df))
+        else:
+            logger.warning("Step 3: No DART events found in Delta")
+            state.dart_events_df = pd.DataFrame()
+    except Exception as e:
+        logger.warning("Step 3: DART events Delta read failed: %s", e)
         state.dart_events_df = pd.DataFrame()
 
     return state
