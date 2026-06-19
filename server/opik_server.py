@@ -183,7 +183,11 @@ def _run_analysis_with_data(analysis_type: str, sources: list,
             # (Stage 2 already fetched data for all companies in the query)
             result = _analysis.compare_reports(converted, ticker_name)
             if result:
-                return _composer.compose(result, req_message)
+                return _composer.compose_chat_response(
+                intent=analysis_type,
+                analysis=result,
+                sources=converted[:10] if converted else [],
+            )
         elif analysis_type == "cause_tracking":
             result = _analysis.trace_cause(
                 ticker_name=ticker_name,
@@ -192,7 +196,11 @@ def _run_analysis_with_data(analysis_type: str, sources: list,
                 dart_events=dart_results or [],
             )
             if result:
-                return _composer.compose(result, req_message)
+                return _composer.compose_chat_response(
+                intent=analysis_type,
+                analysis=result,
+                sources=converted[:10] if converted else [],
+            )
         elif analysis_type == "interpret":
             raw_text = ""
             if dart_results and len(dart_results) > 0:
@@ -204,7 +212,11 @@ def _run_analysis_with_data(analysis_type: str, sources: list,
             if raw_text:
                 result = _dart.interpret_disclosure(raw_text, ticker_name or "종목")
                 if result:
-                    return _composer.compose(result, req_message)
+                    return _composer.compose_chat_response(
+                intent=analysis_type,
+                analysis=result,
+                sources=converted[:10] if converted else [],
+            )
         return None
     except Exception as e:
         logger.warning("Analysis pipeline failed (%s): %s", analysis_type, e)
