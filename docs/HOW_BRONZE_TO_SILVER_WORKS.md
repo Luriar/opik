@@ -59,14 +59,14 @@ S3의 `bronze/` 아래 모든 `_manifest.json` 파일을 찾는다. 매니페스
 날짜 하나 끝날 때마다 `.silver_checkpoint.json`에 마지막 완료 날짜를 기록한다.
 `--resume` 옵션으로 중단된 지점부터 이어서 돌릴 수 있다.
 
-## 현재 상태 (2026-06-12)
+## 현재 상태 (2026-06-19)
 
 | 항목 | 수치 |
 |------|------|
 | Bronze 총 PDF | ~67,000건 (네이버 37,000 + 한국투자증권 30,000) |
-| Silver 변환 완료 | ~48,000건 |
+| Silver 변환 완료 | 51,294건 (2020~2026 전량 완료) |
 | OCR 필요 판정 | 3건 (99.99% 이상 텍스트 추출 성공) |
-| 실패 주요 원인 | 이미지/스캔 PDF (OCR 필요), 빈 페이지 PDF |
+| 실행 방식 | EC2 Airflow DAG `opik_silver_extract` (00:00 KST, 자동) |
 
 ## 의존성
 
@@ -87,5 +87,4 @@ python extract_silver.py --start 2026-01-01 --end 2026-06-30 --workers 20
 python extract_silver.py --resume --workers 30
 
 # 건수만 확인 (dry-run)
-python extract_silver.py --dry-run
-```
+python extract_s

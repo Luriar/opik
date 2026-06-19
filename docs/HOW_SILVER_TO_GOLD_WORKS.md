@@ -220,7 +220,7 @@ TP false positive (500원 미만으로 잘못 추출): **17건 (0.044%)**
 
 모든 추출 함수는 실패 시 **null을 그대로 저장**한다. LLM 추론이나 기본값 대체(default imputation)는 하지 않는다. 근거는 두 가지다:
 
-**1. false positive가 false negative보다 위험하다.** 잘못된 TP 하나가 상승여력 계산과 스코어링을 오염시킨다. 회의론적 접근(skeptical extraction) — 애매하면 null.
+**1. false positive가 false negative보다 위험하다.** 잘못된 TP 하나가 상승여력 계산과 consensus 판정을 오염시킨다. 회의론적 접근(skeptical extraction) — 애매하면 null.
 
 **2. null 자체가 신호다.** TP=null + Opinion=BUY면 "매수 의견은 있는데 목표주가를 명시하지 않은 리포트"로 해석할 수 있다. 기본값을 채워넣으면 이런 구분이 사라진다.
 
@@ -237,19 +237,18 @@ TP false positive (500원 미만으로 잘못 추출): **17건 (0.044%)**
 
 **미래에 LLM Gold가 도입돼도 이 원칙은 유지한다.** LLM은 완전히 새로운 필드(reason, risks, keywords)를 추가할 뿐, 정규식이 실패한 케이스를 소급해서 채워넣지 않는다. 정규식 파이프라인은 "확실한 것만 담는" 층으로 고정하고, LLM은 "텍스트 이해가 필요한" 층을 담당하는 **역할 분리** 구조다.
 
-## LLM Gold — 다음 단계
+## LLM Gold — 완료
 
-현재 `extract_gold_structured.py`는 정규식만으로 작동하는 비용 제로 파이프라인이다. 75%의 TP 추출률을 넘어서려면 LLM이 필요하다.
+기존 `extract_gold_structured.py`는 정규식만으로 작동하는 비용 제로 파이프라인이다. 2026-06 현재 LLM Gold(`extract_gold_llm.py`)는 **완료되었으며**, 다음 필드를 Haiku로 추출하여 S3 `gold/embeddings/`에 84개월 적재 완료:
 
-계획된 LLM 추출 필드 (Claude Haiku, 건당 약 ₩1.5):
-- **reason:** 종목별 핵심 논리 1~2문장
-- **risks:** 리스크 요인 목록
-- **keywords:** 핵심 키워드 5~10개
-- **implied TP:** 밸류에이션 산식에서 역산 (정규식으로 못 잡은 케이스 보완)
-- **multi-stock 분해:** 섹터 리포트에서 종목별 opinion/TP 분리
+- reason: 종목별 핵심 논리 1~2문장
+- risks: 리스크 요인 목록
+- keywords: 핵심 키워드 5~10개
+- embedding: multilingual-e5-small 384-dim (FAISS 검색용)
+
+LLM Gold와 Structured Gold는 역할 분리 구조를 유지한다. 정규식 파이프라인은 "확실한 것만 담는" 층, LLM은 "텍스트 이해가 필요한" 층.
 
 ## 의존성
 
 - Python: `boto3`, `pyarrow` (Parquet), `asyncio`
-- S3: `s3-opik-bucket`, region `ap-northeast-2`
-- AWS 자격증명: shared credentials file
+- S3: `s3-

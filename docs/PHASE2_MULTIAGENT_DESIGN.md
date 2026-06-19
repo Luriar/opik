@@ -736,15 +736,17 @@ User: "삼성전자 왜 올랐어?"
 
 ### 7.1 LLM 할당
 
-| 에이전트 | 모델 | 근거 |
-|----------|------|-------|
-| Safety Agent | Haiku | 단순 분류, 저지연 필수 |
-| Intent Parser | Haiku | 분류 + 파라미터 추출, 1초 이내 |
-| Report Agent | Haiku | 검색 결과 나열, 템플릿 기반 |
-| DART Agent | Haiku | 쿼리 결과 나열, 요약 |
-| DART Sentiment Agent | Haiku (batch) | 25건씩 배치 분류, 저비용 |
-| Analysis Agent | Sonnet | 추론, 비교, 맥락 이해 필요 |
-| Response Composer | Sonnet/template | 복잡한 응답은 Sonnet, 단순 응답은 템플릿 |
+| 에이전트 | 설계 모델 | 실제 운영 모델 (2026-06-19) | 근거 |
+|----------|----------|----------|-------|
+| Safety Agent | Haiku | Haiku 3 (apac) | 단순 분류, 저지연 필수 |
+| Intent Parser | Haiku | Haiku 3 (apac) | 분류 + 파라미터 추출, 1초 이내 |
+| Report Agent | Haiku | Haiku 3 (apac) | 검색 결과 나열, 템플릿 기반 |
+| DART Agent | Haiku | **Haiku 4.5 (global)** + Sonnet 4.6 | interpret 상향, summarize 추가 |
+| DART Sentiment Agent | Haiku (batch) | Haiku 3 (apac) | 25건씩 배치 분류, 저비용 |
+| Analysis Agent | Sonnet | **Opus 4.8 (global)** | 추론 품질 최우선 |
+| Response Composer | Sonnet/template | Sonnet 4.6 (global) | 복잡한 응답은 Sonnet, 단순 응답은 템플릿 |
+
+> **2026-06-19 운영 반영**: Analysis는 Opus 4.8로 상향, DART interpret는 Haiku 4.5로 상향, DART summarize는 Sonnet 4.6 신설. 챗봇 Supervisor는 LangGraph 없이 `run()` plain function path로도 동작.
 
 ### 7.2 모델 비용 추정 (일간)
 
@@ -1121,9 +1123,3 @@ run_briefing = PythonOperator(
 
 2026-06-19 기준 모든 설계 결정 완료. 미결 사항 없음.
 
-**Phase 2a 구현 목록**:
-1. `server/agents/` — 7개 LangGraph Agent + Supervisor + Briefing Graph
-2. `dags/briefing/daily_briefing.py` — Airflow DAG (schedule: 0 7 * * *)
-3. DartCollector EC2 공동 배포 (PostgreSQL dart_service DB, Redis)
-4. DART Sentiment Agent — Haiku batch (25건/배치, asyncio 20 병렬, OPIK disclosure_events)
-5. Delta Lake MERGE — `spark_silver_to_delta.py` (07:00 cron, 하루 1회)

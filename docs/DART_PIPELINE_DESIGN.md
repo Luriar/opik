@@ -1,5 +1,10 @@
 # OPIK — DART 공시 Bronze→Silver→Gold 파이프라인 재설계
 
+> **⚠️ 설계 기록 문서입니다. 실제 운영과 다릅니다.**
+> 이 문서는 2026년 초 DART 파이프라인 재설계 당시의 설계 의도를 기록한 것입니다.
+> 현재 실제 DART Gold 운영 현황은 [OPIK_PHASE2_OPERATIONS_STATUS.md](OPIK_PHASE2_OPERATIONS_STATUS.md) §7을 참조하십시오.
+> 주요 차이: composite score(a+b+c) 폐지, `spark_compute_scores.py` 삭제, Partner 데이터 연동 미구현, disclosure_events 10개월만 존재.
+
 ## 문제 정의
 
 상용님 파이프라인의 근본 문제는 하나로 수렴된다:
@@ -444,14 +449,4 @@ Phase 1: Bronze 재설계 (상용님 현재 작업)
   └─ detail_collector: VERIFIED까지 자동 승격
 
 Phase 2: Silver → Gold (우리가 도와줄 부분)
-  ├─ Bronze VERIFIED → Silver 변환 자동화
-  ├─ Tier 1 규칙기반 b_score 구현
-  ├─ Tier 2 LLM b_score 구현 (Haiku)
-  ├─ gold/dart/disclosure_scores Parquet 출력
-  └─ OPIK Phase 2 wait_for_partners 연동 테스트
-
-Phase 3: 정기공시(A) 심화 (추후 — 재무제표 분석)
-  ├─ Silver financials 기반 실적 서프라이즈 감지
-  ├─ 영업이익/매출 컨센서스 대비 변동률 → b_score 반영
-  └─ LLM: 실적 코멘트 요약
-```
+  ├─ Bronze VE
