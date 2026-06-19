@@ -27,4 +27,8 @@ daily_update:
   market_open_time: "09:00"
   pipeline_start_time: "06:00"
   production_mode: true
-  strict_featu
+  strict_feature_source_check: true
+  enable_us10y_check: false
+  enable_gold_check: false
+  enable_dxy_check: false
+  model_n_estimators_cap: 200

@@ -18,6 +18,11 @@ transformers==4.41.2
 huggingface-hub==0.23.4
 tokenizers==0.19.1
 
+# Phase 2a: LangGraph multi-agent framework (optional — agents work without it)
+langgraph>=0.2.0,<1.0
+langchain>=0.3.0,<1.0
+langchain-aws>=0.2.0,<1.0
+
 # Airflow 2.10.0 constraints. Do not upgrade independently.
 click==8.1.7
 rich==13.7.1

@@ -1,14 +1,16 @@
+
 """
 DART Sentiment Agent — batch sentiment classification of DART disclosures.
 
-Used in the daily briefing pipeline (Step 4). Takes 1 month of DART disclosure
+Used in the daily briefing pipeline (Step 4). Takes up to 1 quarter of DART disclosure
 events and classifies each as positive / negative / neutral using Haiku batch mode
-(25 items per call, asyncio 20 concurrent → 1-2 seconds total).
+(25 items per call, 2 retries on JSON parse failure).
 
 Key design decisions:
   - Keywords alone cannot distinguish context ("유상증자" can be positive or negative)
   - LLM reads disclosure title + body text to judge context
-  - Batch mode: 25 items/call, parallel asyncio → 12 calls for 300 items
+  - Batch mode: 25 items/call, sequential processing
+  - Retry: up to 2 retries on empty/invalid JSON response with temperature jitter
 
 Output: [{ticker, stock_code, sentiment, reason}]
 """
@@ -18,6 +20,8 @@ import io
 import json
 import logging
 import os
+import re
+import time
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 
@@ -37,6 +41,10 @@ SENTIMENT_MODEL = os.environ.get(
 BATCH_SIZE = int(os.environ.get("DART_SENTIMENT_BATCH_SIZE", "25"))
 # Max concurrent LLM calls
 MAX_CONCURRENT = int(os.environ.get("DART_SENTIMENT_CONCURRENT", "20"))
+# Max retries for JSON parse failures
+MAX_RETRIES = int(os.environ.get("DART_SENTIMENT_MAX_RETRIES", "2"))
+# Delay between retries (seconds)
+RETRY_DELAY = float(os.environ.get("DART_SENTIMENT_RETRY_DELAY", "1.5"))
 
 SENTIMENT_SYSTEM_PROMPT = """당신은 한국 DART 공시의 시장 영향을 평가하는 금융 AI입니다.
 주어진 공시 목록을 분석하여 각각의 sentiment를 판단하세요.
@@ -55,7 +63,71 @@ SENTIMENT_SYSTEM_PROMPT = """당신은 한국 DART 공시의 시장 영향을 �
 - 공시유형명만 보지 말고 제목과 요약의 구체적 내용을 읽고 판단할 것
 - 같은 유상증자라도 목적(시설투자 vs 채무상환)에 따라 sentiment가 달라짐
 - 판단이 모호하면 망설이지 말고 neutral로 분류할 것
-- 각 판단의 근거를 reason에 한글로 15단어 이내로 작성할 것"""
+- 각 판단의 근거를 reason에 한글로 15단어 이내로 작성할 것
+- 반드시 유효한 JSON 배열만 출력하고 다른 텍스트는 포함하지 말 것"""
+
+
+def _extract_json_text(raw_text: str) -> str:
+    """Extract JSON array/object from LLM response, stripping markdown fences."""
+    text = raw_text.strip()
+    
+    # Normalize escaped newlines sometimes returned in JSON strings
+    text = text.replace('\\n', '\n').replace('\\r', '\r')
+    
+    # Remove markdown code fences
+    if text.startswith("```"):
+        lines = text.split("\n")
+        # Find first non-fence line
+        start_idx = 1
+        if len(lines) > 1 and lines[1].strip().startswith("json"):
+            start_idx = 2
+        # Find closing fence
+        end_lines = [i for i in range(len(lines)-1, start_idx-1, -1) if lines[i].strip() == "```"]
+        if end_lines:
+            text = "\n".join(lines[start_idx:end_lines[-1]]).strip()
+        else:
+            text = "\n".join(lines[start_idx:]).strip()
+    
+    # Try to find JSON array/object with regex if still not clean
+    if not text or (not text.startswith("[") and not text.startswith("{")):
+        m = re.search(r'(\[.*\]|\{.*\})', text, re.DOTALL)
+        if m:
+            text = m.group(1).strip()
+    
+    return text
+
+
+def _parse_sentiment_response(text: str, batch_items: List[dict]) -> List[dict]:
+    """Parse LLM response into sentiment results. Returns neutral fallback on failure."""
+    text = _extract_json_text(text)
+    
+    if not text:
+        raise ValueError("Empty response text after extraction")
+    
+    results = json.loads(text)
+    
+    if isinstance(results, dict):
+        results = [results]
+    
+    if not isinstance(results, list):
+        raise ValueError(f"Expected JSON array, got {type(results).__name__}")
+    
+    # Validate each result has required fields
+    for r in results:
+        if not isinstance(r, dict):
+            raise ValueError(f"Expected dict in array, got {type(r).__name__}")
+    
+    return results
+
+
+def _neutral_fallback(batch_items: List[dict]) -> List[dict]:
+    """Return neutral sentiment for all items in a batch."""
+    return [
+        {"ticker": item.get("stock_code", "unknown"),
+         "sentiment": "neutral",
+         "reason": "분류 실패"}
+        for item in batch_items
+    ]
 
 
 class DartSentimentAgent:
@@ -77,7 +149,12 @@ class DartSentimentAgent:
         return boto3.client("bedrock-runtime", region_name=self.region)
 
     def _call_bedrock_sync(self, batch_items: List[dict]) -> List[dict]:
-        """Synchronous single-batch call. Returns [{ticker, sentiment, reason}]."""
+        """Synchronous single-batch call with retry on JSON parse failure.
+        
+        Retries up to MAX_RETRIES times with increasing temperature jitter
+        if the response is empty or not valid JSON.
+        Returns [{ticker, sentiment, reason}].
+        """
         # Build input: each item = {ticker, report_nm, text_snippet}
         items_json = []
         for item in batch_items:
@@ -88,51 +165,77 @@ class DartSentimentAgent:
                 "text": text_snippet,
             })
 
-        body = json.dumps({
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 2000,
-            "system": SENTIMENT_SYSTEM_PROMPT,
-            "messages": [{
-                "role": "user",
-                "content": json.dumps(items_json, ensure_ascii=False),
-            }],
-            "temperature": 0.0,
-        })
+        last_error = None
+        
+        for attempt in range(MAX_RETRIES + 1):  # 0 = first try, 1+ = retries
+            temperature = 0.0 if attempt == 0 else min(0.1 * attempt, 0.4)
+            
+            body = json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 2000,
+                "system": SENTIMENT_SYSTEM_PROMPT,
+                "messages": [{
+                    "role": "user",
+                    "content": json.dumps(items_json, ensure_ascii=False),
+                }],
+                "temperature": temperature,
+            })
 
-        client = self._make_client()
-        try:
-            resp = client.invoke_model(
-                modelId=self.model_id,
-                contentType="application/json",
-                accept="application/json",
-                body=body,
-            )
-            resp_body = json.loads(resp["body"].read())
-            text = ""
-            for block in resp_body.get("content", []):
-                if block.get("type") == "text":
-                    text += block["text"]
+            client = self._make_client()
+            try:
+                resp = client.invoke_model(
+                    modelId=self.model_id,
+                    contentType="application/json",
+                    accept="application/json",
+                    body=body,
+                )
+                resp_body = json.loads(resp["body"].read())
+                text = ""
+                for block in resp_body.get("content", []):
+                    if block.get("type") == "text":
+                        text += block["text"]
 
-            text = text.strip()
-            if text.startswith("```"):
-                text = text.split("\n", 1)[-1].rsplit("\n```", 1)[0]
-                if text.startswith("json"):
-                    text = text[4:].strip()
+                if not text.strip():
+                    raise ValueError("Empty response from model")
 
-            results = json.loads(text)
-            if isinstance(results, dict):
-                results = [results]
-            return results
+                results = _parse_sentiment_response(text, batch_items)
+                
+                if attempt > 0:
+                    logger.info("Sentiment batch succeeded on retry %d", attempt)
+                
+                return results
 
-        except Exception as e:
-            logger.error("Sentiment batch call failed: %s", e)
-            # Return neutral fallback
-            return [
-                {"ticker": item.get("stock_code", "unknown"),
-                 "sentiment": "neutral",
-                 "reason": "분류 실패"}
-                for item in batch_items
-            ]
+            except (json.JSONDecodeError, ValueError) as e:
+                last_error = e
+                if attempt < MAX_RETRIES:
+                    logger.warning(
+                        "Sentiment batch parse failed (attempt %d/%d): %s — retrying...",
+                        attempt + 1, MAX_RETRIES + 1, str(e)[:100],
+                    )
+                    time.sleep(RETRY_DELAY * (attempt + 1))  # exponential backoff
+                else:
+                    logger.error(
+                        "Sentiment batch failed after %d retries: %s",
+                        MAX_RETRIES + 1, str(e)[:100],
+                    )
+            except Exception as e:
+                last_error = e
+                if attempt < MAX_RETRIES:
+                    logger.warning(
+                        "Sentiment batch API error (attempt %d/%d): %s — retrying...",
+                        attempt + 1, MAX_RETRIES + 1, str(e)[:100],
+                    )
+                    time.sleep(RETRY_DELAY * (attempt + 1))
+                else:
+                    logger.error(
+                        "Sentiment batch API error after %d retries: %s",
+                        MAX_RETRIES + 1, str(e)[:100],
+                    )
+        
+        # All retries exhausted
+        logger.error("Sentiment batch call failed: all %d attempts exhausted, last error: %s",
+                     MAX_RETRIES + 1, str(last_error)[:100] if last_error else "unknown")
+        return _neutral_fallback(batch_items)
 
     async def _call_bedrock_async(self, batch_items: List[dict]) -> List[dict]:
         """Async wrapper for batch call."""
@@ -210,14 +313,19 @@ class DartSentimentAgent:
         if df.empty:
             return df
 
-        # Extract relevant fields
+        # Deduplicate by stock_code to avoid redundant LLM calls
+        # For same ticker appearing multiple times, classify once and map back
         items = []
+        seen_codes = set()
         for _, row in df.iterrows():
-            items.append({
-                "stock_code": str(row.get("stock_code", "")).zfill(6),
-                "report_nm": str(row.get("report_nm", "")),
-                "text": str(row.get("text", "")),
-            })
+            code = str(row.get("stock_code", "")).zfill(6)
+            if code not in seen_codes:
+                seen_codes.add(code)
+                items.append({
+                    "stock_code": code,
+                    "report_nm": str(row.get("report_nm", "")),
+                    "text": str(row.get("text", "")),
+                })
 
         # Split into batches
         batches = [
@@ -226,16 +334,23 @@ class DartSentimentAgent:
         ]
 
         logger.info(
-            "DART sentiment: %d items in %d batches (batch_size=%d)",
+            "DART sentiment: %d unique tickers in %d batches (batch_size=%d)",
             len(items), len(batches), self.batch_size,
         )
 
         # Process sequentially (Airflow context — asyncio not needed)
         all_results = []
+        failures = 0
         for i, batch in enumerate(batches):
             results = self._call_bedrock_sync(batch)
+            # Check if this batch returned all neutral fallbacks
+            if all(r.get("sentiment") == "neutral" and r.get("reason") == "분류 실패" for r in results):
+                failures += 1
             all_results.extend(results)
             logger.info("Batch %d/%d: %d results", i + 1, len(batches), len(results))
+
+        if failures > 0:
+            logger.warning("Sentiment: %d/%d batches returned neutral fallback", failures, len(batches))
 
         # Merge results back into DataFrame
         result_map = {}
@@ -262,8 +377,8 @@ class DartSentimentAgent:
         negative = (df["sentiment"] == "negative").sum()
         neutral = (df["sentiment"] == "neutral").sum()
         logger.info(
-            "Sentiment complete: %d positive, %d negative, %d neutral",
-            positive, negative, neutral,
+            "Sentiment complete: %d positive, %d negative, %d neutral (%d batch failures)",
+            positive, negative, neutral, failures,
         )
         return df
 
@@ -272,13 +387,18 @@ class DartSentimentAgent:
         if df.empty:
             return df
 
+        # Deduplicate
         items = []
+        seen_codes = set()
         for _, row in df.iterrows():
-            items.append({
-                "stock_code": str(row.get("stock_code", "")).zfill(6),
-                "report_nm": str(row.get("report_nm", "")),
-                "text": str(row.get("text", "")),
-            })
+            code = str(row.get("stock_code", "")).zfill(6)
+            if code not in seen_codes:
+                seen_codes.add(code)
+                items.append({
+                    "stock_code": code,
+                    "report_nm": str(row.get("report_nm", "")),
+                    "text": str(row.get("text", "")),
+                })
 
         batches = [
             items[i:i + self.batch_size]

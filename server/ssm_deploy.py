@@ -145,4 +145,20 @@ print(f"  Agent files: {ok2}/{len(AGENT_FILES)}")
 print("[4/5] Verifying...")
 run_command([
     f"ls -la {BASE_DIR}/opik_server.py {BASE_DIR}/agent_integration.py {BASE_DIR}/conversation_store.py {BASE_DIR}/prompts/",
-    f"ls {BA
+    f"ls {BASE_DIR}/agents/*.py | wc -l",
+    f"grep -c 'def v2_chat' {BASE_DIR}/opik_server.py",
+    f"grep -c 'init_agents' {BASE_DIR}/agent_integration.py",
+], "verify")
+
+# Step 5: Restart service
+print("[5/5] Restarting opik-server...")
+run_command(["sudo systemctl restart opik-server"], "restart")
+time.sleep(3)
+run_command(["sudo systemctl status opik-server --no-pager | head -7"], "status")
+
+# Health check
+print("\n--- Health Check ---")
+run_command(["curl -s http://localhost:8000/health"], "health")
+
+print("\n=== Deploy Complete ===")
+print(f"Test: curl http://54.180.246.253:8000/health")

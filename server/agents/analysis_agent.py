@@ -1,11 +1,10 @@
 """
 Analysis Agent — cross-source synthesis, comparison, cause-tracing.
 
-The only agent that uses Sonnet (reasoning-heavy tasks):
+The main reasoning agent (Opus 4.8):
   - compare_reports: cross-brokerage report comparison
   - industry_analysis: sector-wide report synthesis
   - trace_cause: price movement cause tracing (timeline mapping)
-  - check_triple_consensus: ★ triple signal consensus for briefing
 
 Output is always caveated: analysis ≠ fact, probabilistic language only.
 """
@@ -22,7 +21,7 @@ logger = logging.getLogger("opik.analysis")
 AWS_REGION = os.environ.get("AWS_REGION", "ap-northeast-2")
 ANALYSIS_MODEL = os.environ.get(
     "ANALYSIS_MODEL",
-    "apac.anthropic.claude-3-5-sonnet-20240620-v1:0",
+    "global.anthropic.claude-opus-4-8",
 )
 
 COMPARE_PROMPT = """당신은 OPIK 금융 분석가입니다. 동일 종목에 대한 여러 증권사 리포트를 비교 분석하세요.
@@ -106,7 +105,7 @@ INDUSTRY_PROMPT = """당신은 OPIK 금융 분석가입니다. 특정 섹터의 
 
 
 class AnalysisAgent:
-    """Cross-source synthesis with Sonnet for complex reasoning tasks."""
+    """Cross-source synthesis with Opus 4.8 for complex reasoning tasks."""
 
     def __init__(
         self,
@@ -123,32 +122,26 @@ class AnalysisAgent:
             self._client = boto3.client("bedrock-runtime", region_name=self.region)
         return self._client
 
-    def _call_sonnet(self, system_prompt: str, user_content: str, max_tokens: int = 2000) -> str:
-        """Call Sonnet with the given system prompt and user content."""
-        body = json.dumps({
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": max_tokens,
-            "system": system_prompt,
-            "messages": [{"role": "user", "content": user_content}],
-            "temperature": 0.3,
-        })
-
+    def _call_opus(self, system_prompt: str, user_content: str, max_tokens: int = 2000) -> str:
+        """Call Opus via Bedrock converse API."""
         try:
-            resp = self.client.invoke_model(
+            resp = self.client.converse(
                 modelId=self.model_id,
-                contentType="application/json",
-                accept="application/json",
-                body=body,
+                messages=[{"role": "user", "content": [{"text": user_content}]}],
+                system=[{"text": system_prompt}],
+                inferenceConfig={"maxTokens": max_tokens, "temperature": 0.3},
             )
-            resp_body = json.loads(resp["body"].read())
             answer = ""
-            for block in resp_body.get("content", []):
-                if block.get("type") == "text":
+            for block in resp.get("output", {}).get("message", {}).get("content", []):
+                if block.get("text"):
                     answer += block["text"]
+            in_tok = resp.get("usage", {}).get("inputTokens", 0)
+            out_tok = resp.get("usage", {}).get("outputTokens", 0)
+            logger.info("Opus call: in=%d out=%d chars=%d", in_tok, out_tok, len(answer))
             return answer or "(분석 결과를 생성하지 못했습니다)"
 
         except Exception as e:
-            logger.error("Analysis call failed: %s", e)
+            logger.error("Opus call failed: %s", e)
             return f"분석 중 오류가 발생했습니다: {e}"
 
     def compare_reports(
@@ -171,7 +164,7 @@ class AnalysisAgent:
                 f"리스크: {r.get('risks', 'N/A')}\n\n"
             )
 
-        return self._call_sonnet(COMPARE_PROMPT, context)
+        return self._call_opus(COMPARE_PROMPT, context)
 
     def trace_cause(
         self,
@@ -191,7 +184,7 @@ class AnalysisAgent:
         for d in dart_events:
             context += f"- [{d.get('date', 'N/A')}] {d.get('event', '')} : {d.get('summary', '')}\n"
 
-        return self._call_sonnet(CAUSE_TRACE_PROMPT, context, max_tokens=1500)
+        return self._call_opus(CAUSE_TRACE_PROMPT, context, max_tokens=1500)
 
     def industry_analysis(
         self,
@@ -209,7 +202,7 @@ class AnalysisAgent:
                 f"키워드: {r.get('keywords', 'N/A')}\n"
             )
 
-        return self._call_sonnet(INDUSTRY_PROMPT, context, max_tokens=2500)
+        return self._call_opus(INDUSTRY_PROMPT, context, max_tokens=2500)
 
 
 # Singleton

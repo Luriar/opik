@@ -62,4 +62,5 @@ tmp/
 batch_output/
 *.out
 
-# Large dependencies (installed sepa
+# Large dependencies (installed separately)
+pylib/

@@ -52,4 +52,22 @@ ENDSSH
 fi
 
 echo "[5/6] Checking service status..."
-ssh -i "$SSH_KEY" "$REMOTE_USER@$EC2_IP" "sudo systemctl status opik-server --no-pager"
+ssh -i "$SSH_KEY" "$REMOTE_USER@$EC2_IP" "sudo systemctl status opik-server --no-pager" || true
+
+echo "[6/6] Verifying deployed files on EC2..."
+ssh -i "$SSH_KEY" "$REMOTE_USER@$EC2_IP" << 'ENDVERIFY'
+echo '--- Agents ---'
+ls -la ~/opik-server/agents/
+echo '--- Agent count ---'
+ls ~/opik-server/agents/*.py | wc -l
+echo '--- Prompts ---'
+wc -l ~/opik-server/prompts/*.md
+echo '--- Key files ---'
+ls -la ~/opik-server/opik_server.py ~/opik-server/agent_integration.py ~/opik-server/conversation_store.py
+ENDVERIFY
+
+echo ""
+echo "=== Deploy Complete ==="
+echo "Health check:     curl http://$EC2_IP:8000/health"
+echo "v1 Chat (stable): curl -X POST http://$EC2_IP:8000/chat -H 'Content-Type: application/json' -d '{\"message\":\"삼성전자 리포트\"}'"
+echo "v2 Chat (agents): curl -X POST http://$EC2_IP:8000/v2/chat -H 'Content-Type: application/json' -d '{\"message\":\"삼성전자 리포트\"}'"

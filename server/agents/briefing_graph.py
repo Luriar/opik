@@ -138,7 +138,7 @@ def load_dart_events(state: BriefingState) -> BriefingState:
     Uses OPIK Gold disclosure_events as Phase 2 primary source.
     """
     target_dt = datetime.strptime(state.date, "%Y%m%d")
-    start_dt = target_dt - timedelta(days=30)
+    start_dt = target_dt - timedelta(days=92)  # ~1 quarter for ★ consensus window
 
     # Collect all monthly partitions in range
     months = set()
@@ -179,29 +179,93 @@ def load_dart_events(state: BriefingState) -> BriefingState:
 
 
 def run_dart_sentiment(state: BriefingState) -> BriefingState:
-    """Step 4: Assign default neutral sentiment to all DART events.
+    """Step 4: Run Haiku sentiment on today's DART events + quarter 정기보고서.
 
-    Full LLM sentiment classification (Haiku batch) is too slow for daily
-    briefing — 12K+ events would take 60+ minutes. Sentiment is pre-computed
-    offline or deferred to a separate batch job.
-
-    For the daily briefing pipeline, all events default to "neutral" so that
-    DART data is still loaded and queryable without blocking the pipeline.
+    Classifies:
+      - All today's events (~600-700)
+      - 정기보고서 (사업/반기/분기) filings in last ~92 days (~1000-2000)
+    Total ~1600-2600 events, ~60-100 Haiku batches, ~1-2 min. Acceptable.
+    정기보고서 sentiment is needed for ★ quarter-level DART filter.
+    Non-정기보고서 events from previous days stay neutral (not classified).
     """
     if state.dart_events_df is None or state.dart_events_df.empty:
         logger.info("Step 4: No DART events to classify — skipping")
         return state
 
-    # Assign neutral sentiment without LLM calls
-    state.dart_events_df["sentiment"] = "neutral"
-    total = len(state.dart_events_df)
-    logger.info("Step 4: DART sentiment defaulted to neutral for %d events", total)
+    df = state.dart_events_df
 
+    # Default all events to neutral (safe fallback)
+    if "sentiment" not in df.columns:
+        df["sentiment"] = "neutral"
+
+    # Build classification mask: today's events + quarter 정기보고서
+    from datetime import datetime as _dt, timedelta as _td
+    _target_dt = _dt.strptime(state.date, "%Y%m%d")
+    _quarter_ago_str = (_target_dt - _td(days=92)).strftime("%Y%m%d")
+    _정기보고서_pat = "사업보고서|반기보고서|분기보고서|감사보고서제출|사업연도|기업가치제고계획"
+    n_today = 0
+    n_q_reports = 0
+
+    if "rcept_dt" in df.columns:
+        today_mask = df["rcept_dt"] == state.date
+        n_today = int(today_mask.sum())
+        # 정기보고서 in last quarter
+        q_report_mask = (
+            df["report_nm"].str.contains(_정기보고서_pat, na=False) &
+            (df["rcept_dt"] >= _quarter_ago_str) &
+            (df["rcept_dt"] <= state.date)
+        )
+        n_q_reports = int(q_report_mask.sum())
+        classify_mask = today_mask | q_report_mask
+    else:
+        classify_mask = pd.Series(True, index=df.index)
+        n_today = len(classify_mask)
+
+    classify_df = df[classify_mask].copy()
+
+    if classify_df.empty:
+        logger.info("Step 4: No events to classify — skipping sentiment")
+        return state
+
+    logger.info(
+        "Step 4: Classifying sentiment for %d events (today=%d, q-reports=%d)",
+        len(classify_df), n_today, n_q_reports,
+    )
+
+    try:
+        # Ensure agents dir is importable
+        import sys as _sys
+        _agents_dir = os.path.dirname(os.path.abspath(__file__))
+        if _agents_dir not in _sys.path:
+            _sys.path.insert(0, _agents_dir)
+        from dart_sentiment_agent import DartSentimentAgent  # noqa: E402
+        agent = DartSentimentAgent()
+        classify_df = agent.classify_sync(classify_df)
+
+        # Merge results back
+        for idx in classify_df.index:
+            sent = classify_df.at[idx, "sentiment"] if "sentiment" in classify_df.columns else "neutral"
+            df.at[idx, "sentiment"] = sent
+            reason = classify_df.at[idx, "sentiment_reason"] if "sentiment_reason" in classify_df.columns else ""
+            if reason:
+                df.at[idx, "sentiment_reason"] = reason
+
+        n_pos = (classify_df.get("sentiment") == "positive").sum() if "sentiment" in classify_df.columns else 0
+        n_neg = (classify_df.get("sentiment") == "negative").sum() if "sentiment" in classify_df.columns else 0
+        n_neu = len(classify_df) - n_pos - n_neg
+        logger.info("Step 4: Sentiment complete — %d pos, %d neg, %d neutral", n_pos, n_neg, n_neu)
+
+    except Exception as e:
+        logger.warning("Step 4: Sentiment classification failed, using neutral: %s", e)
+
+    state.dart_events_df = df
     return state
 
 def load_model_predictions(state: BriefingState) -> BriefingState:
     """Step 5: Load Chanho model predictions from S3 Gold."""
-    key = f"gold/model/predictions/dt={state.date}/predictions.parquet"
+        # state.date is YYYYMMDD; S3 key uses YYYY-MM-DD (see s3_upload.py line 64)
+    dt_formatted = f"{state.date[:4]}-{state.date[4:6]}-{state.date[6:8]}"
+    key = f"gold/model/predictions/dt={dt_formatted}/predictions.parquet"
 
     try:
         df = _read_parquet_s3(key)
@@ -219,12 +283,11 @@ def check_triple_consensus(state: BriefingState) -> BriefingState:
 
     Algorithm:
       1. INNER JOIN: report tickers ∩ model tickers
-      2. If DART sentiment available: filter to positive, remove negatives
-      3. Within intersection, verify: BUY opinion + upside > 0%
-
-    When DART sentiment is not available (all neutral), DART acts as a
-    data source for reference rather than a filter — the consensus uses
-    reports ∩ model only.
+      2. DART filter (1-quarter window): positive event OR 정기보고서 proxy
+         (감사보고서제출/사업연도 등) within last ~92 days → narrows intersection
+      3. If filtered intersection empty → fallback to report∩model (no DART signal today)
+      4. Within remaining: verify BUY opinion + upside > 0%
+      정기보고서 filing in last quarter counts as positive signal.
     """
     if not state.structured:
         logger.info("Step 6: No structured data — skipping consensus")
@@ -244,36 +307,101 @@ def check_triple_consensus(state: BriefingState) -> BriefingState:
         if code and m.get("ranking_score", 0) > 0:
             model_tickers.add(code)
 
-    # Extract DART sentiment tickers
-    dart_positive_tickers = set()
-    dart_negative_tickers = set()
+    # Calculate 1-quarter boundary (last ~92 days)
+    from datetime import datetime as _dt, timedelta as _td
+    _target_dt = _dt.strptime(state.date, "%Y%m%d")
+    _quarter_ago_str = (_target_dt - _td(days=92)).strftime("%Y%m%d")
+
+    # Build DART qualified set: tickers with positive event OR positive quarterly report
+    # in the last 1 quarter. 정기보고서 filing itself is a positive signal.
+    _정기보고서_pat = "사업보고서|반기보고서|분기보고서|감사보고서제출|사업연도|기업가치제고계획"
+    dart_q_positive = set()   # tickers with positive-sentiment events in last quarter
+    dart_q_report = set()     # tickers with 정기보고서 filings in last quarter
+    dart_negative_q = set()   # tickers with negative events in last quarter (for removal)
+
     if state.dart_events_df is not None and not state.dart_events_df.empty:
-        for _, row in state.dart_events_df.iterrows():
+        df = state.dart_events_df
+        if "rcept_dt" in df.columns:
+            q_df = df[df["rcept_dt"] >= _quarter_ago_str]
+        else:
+            q_df = df
+
+        for _, row in q_df.iterrows():
             code = str(row.get("stock_code", "")).zfill(6)
             if not code or code == "000000":
                 continue
-            sentiment = row.get("sentiment", "neutral")
+            sentiment = str(row.get("sentiment", "neutral"))
+            rn = str(row.get("report_nm", ""))
+
             if sentiment == "positive":
-                dart_positive_tickers.add(code)
+                dart_q_positive.add(code)
             elif sentiment == "negative":
-                dart_negative_tickers.add(code)
+                dart_negative_q.add(code)
 
-    # INNER JOIN: reports ∩ model (always); add DART filter if sentiment available
+            # 정기보고서 filing in last quarter counts as positive signal
+            # (사업보고서/반기보고서/분기보고서 contain substantial financial data)
+            import re as _re
+            if _re.search(_정기보고서_pat, rn):
+                dart_q_report.add(code)
+
+    # INNER JOIN: reports ∩ model
     intersection = report_tickers & model_tickers
-    has_dart_sentiment = bool(dart_positive_tickers or dart_negative_tickers)
 
-    if has_dart_sentiment:
-        # Narrow to tickers with positive DART sentiment
-        intersection &= dart_positive_tickers
-        # Remove tickers with negative DART events
-        intersection -= dart_negative_tickers
+    # Apply DART 1-quarter filter: must have (positive event OR quarterly report) in last quarter
+    _dart_qualified = dart_q_positive | dart_q_report
+    _original_intersection = report_tickers & model_tickers
+    if _dart_qualified:
+        _filtered = _original_intersection & _dart_qualified
+        # Remove tickers with ONLY negative events and no positive/quarterly offsets
+        _filtered -= (dart_negative_q - dart_q_positive - dart_q_report)
+        if _filtered:
+            intersection = _filtered
+            logger.info(
+                "Step 6: DART quarter filter PASS — %d pos, %d report, %d neg; intersection=%d",
+                len(dart_q_positive), len(dart_q_report), len(dart_negative_q), len(intersection),
+            )
+        else:
+            # Fallback: DART filter is too strict, use report∩model with note
+            logger.warning(
+                "Step 6: DART quarter filter EMPTY (pos=%d report=%d neg=%d) — fallback to report∩model=%d",
+                len(dart_q_positive), len(dart_q_report), len(dart_negative_q), len(_original_intersection),
+            )
+            intersection = _original_intersection
+    else:
+        logger.info("Step 6: No DART quarter data — skipping DART filter")
 
-    logger.info(
-        "Step 6: reports=%d model+=%d dart_pos=%d dart_neg=%d sentiment_available=%s → intersection=%d",
-        len(report_tickers), len(model_tickers),
-        len(dart_positive_tickers), len(dart_negative_tickers),
-        has_dart_sentiment, len(intersection),
-    )
+
+    # Build LLM lookup: report_id → {reason, risks, keywords}
+    llm_lookup = {}
+    for row in state.llm_data:
+        rid = row.get("report_id", "")
+        # Safe scalar extraction: Parquet list columns may return numpy arrays
+        def _safe_str(val):
+            if val is None:
+                return ""
+            try:
+                s = str(val)
+                return "" if s in ("None", "[]", "nan") else s
+            except Exception:
+                return ""
+
+        def _safe_float(val, default=0.0):
+            """Safely convert a value to float, handling numpy arrays."""
+            if val is None:
+                return default
+            try:
+                return float(val)
+            except (ValueError, TypeError):
+                return default
+
+        reason_s = _safe_str(row.get("reason"))
+        risks_s = _safe_str(row.get("risks"))
+        if rid and (reason_s or risks_s):
+            llm_lookup[rid] = {
+                "reason": reason_s,
+                "risks": risks_s,
+                "keywords": _safe_str(row.get("keywords")),
+            }
 
     # Within intersection: verify BUY opinion + upside > 0
     stars = []
@@ -282,10 +410,17 @@ def check_triple_consensus(state: BriefingState) -> BriefingState:
             r for r in state.structured
             if str(r.get("종목코드", "")).zfill(6) == ticker
             and str(r.get("투자의견", "")).upper() == "BUY"
-            and (r.get("상승여력_pct", 0) or 0) > 0
+            and _safe_float(r.get("상승여력_pct", 0)) > 0
         ]
         if not reports:
             continue
+        # Attach LLM reason/risks/keywords via report_id
+        for r in reports:
+            rid = r.get("report_id", "")
+            if rid in llm_lookup:
+                r["reason"] = llm_lookup[rid]["reason"]
+                r["risks"] = llm_lookup[rid]["risks"]
+                r["keywords"] = llm_lookup[rid]["keywords"]
 
         # Find matching model prediction
         model_pred = next(
@@ -396,9 +531,10 @@ def filter_major_disclosures(state: BriefingState) -> BriefingState:
         df = df[df["event_category"].isin(["B", "B-type"]) |
                 df["report_nm"].str.contains("|".join(b_type_keywords), na=False)]
 
-    # Only positive sentiment (skip if all neutral — no LLM sentiment available)
-    if "sentiment" in df.columns and (df["sentiment"] == "positive").any():
-        df = df[df["sentiment"] == "positive"]
+    # Include positive AND negative sentiment (exclude neutral only)
+    # neutral은 필요 없고 positive/negative 둘 다 보여줌
+    if "sentiment" in df.columns:
+        df = df[df["sentiment"] != "neutral"]
 
     # Exclude tickers already in ★
     star_tickers = {s["ticker"] for s in state.star_candidates}
@@ -412,12 +548,25 @@ def filter_major_disclosures(state: BriefingState) -> BriefingState:
     items = df.to_dict("records")
 
     # Deduplicate by ticker (keep first — most recent)
+    # Also filter out low-value disclosures
+    _low_value_patterns = [
+        "권리락",               # technical price adjustment, not news
+        "합병등종료보고서",     # post-hoc filing, event already done
+    ]
     seen = set()
     deduped = []
     for item in items:
         code = str(item.get("stock_code", "")).zfill(6)
         if code in seen or code == "000000":
             continue
+        rn = str(item.get("report_nm", ""))
+        # Skip low-value disclosures
+        if any(p in rn for p in _low_value_patterns):
+            logger.info("Step 7: Skipping low-value item: %s — %s", code, rn[:60])
+            continue
+        # Strip [기재정정] from report_nm for cleaner display
+        if "[기재정정]" in rn:
+            item["report_nm"] = rn.replace("[기재정정]", "").strip()
         seen.add(code)
         deduped.append(item)
 
@@ -479,14 +628,14 @@ def send_telegram(state: BriefingState) -> BriefingState:
         # Split long messages (Telegram limit: 4096 chars)
         max_len = 4000
         text = state.final_briefing
+        all_ok = True
 
         for i in range(0, len(text), max_len):
             chunk = text[i:i + max_len]
             url = f"https://api.telegram.org/bot{telegram_token}/sendMessage"
             payload = {
-                "chat_id": telegram_chat_id,
+                "chat_id": int(telegram_chat_id),
                 "text": chunk,
-                "parse_mode": "HTML",
                 "disable_web_page_preview": True,
             }
             resp = requests.post(url, json=payload, timeout=10)
@@ -495,10 +644,14 @@ def send_telegram(state: BriefingState) -> BriefingState:
                     "Telegram send failed (chunk %d): %s",
                     i // max_len, resp.text,
                 )
+                all_ok = False
             else:
                 logger.info("Telegram chunk %d sent", i // max_len)
 
-        logger.info("Step 9: Briefing sent to Telegram")
+        if all_ok:
+            logger.info("Step 9: Briefing sent to Telegram")
+        else:
+            state.error = "Telegram send partially failed"
     except Exception as e:
         logger.error("Step 9: Telegram send error: %s", e)
         state.error = f"Telegram send failed: {e}"

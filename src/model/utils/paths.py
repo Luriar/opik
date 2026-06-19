@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,7 +35,17 @@ class ProjectPaths:
 
 
 def get_project_root(start: str | Path | None = None) -> Path:
-    """Return the project root by walking upward to pyproject.toml."""
+    """Return the project root by walking upward to pyproject.toml.
+
+    In container environments, prefer OPIK_PROJECT_ROOT env var.
+    """
+    # Check environment variable first (container-friendly)
+    env_root = os.environ.get("OPIK_PROJECT_ROOT")
+    if env_root:
+        candidate = Path(env_root).resolve()
+        if (candidate / "pyproject.toml").exists():
+            return candidate
+
     current = Path(start or Path.cwd()).resolve()
     if current.is_file():
         current = current.parent
