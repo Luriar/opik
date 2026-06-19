@@ -5,6 +5,9 @@ Runs at 06:00 KST after US market close, before the Korean market opens at 09:00
 
 Output: s3://s3-opik-bucket/gold/model/predictions/dt={YYYY-MM-DD}/predictions.parquet
 Consumed by: OPIK Briefing DAG (07:00 KST) for triple consensus checking.
+
+IMPORTANT — Date offset: OHLCV/feature data arrives with ~2 day lag (T-2).
+The DAG uses `execution_date - 2 days` so training data is always available.
 """
 
 from datetime import datetime, timedelta
@@ -56,11 +59,11 @@ with DAG(
     run_model_pipeline = BashOperator(
         task_id="run_model_pipeline",
         bash_command=(
-            "cd {OPIK_ROOT} && "
+            "cd " + OPIK_ROOT + " && "
             "python scripts/model/run_prediction.py "
-            "--date {{ (execution_date - macros.timedelta(days=1)).strftime('%Y%m%d') }} "
-            "--project-root {OPIK_ROOT}"
-        ).format(OPIK_ROOT=OPIK_ROOT),
+            "--date {{ (execution_date - macros.timedelta(days=2)).strftime('%Y%m%d') }} "
+            "--project-root " + OPIK_ROOT
+        ),
         retries=1,
         retry_delay=timedelta(minutes=5),
         execution_timeout=timedelta(hours=2),
