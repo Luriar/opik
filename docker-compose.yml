@@ -1,6 +1,8 @@
+# EC2 배포용 docker-compose.yml — Docker Compose v2.29.7 (plugin)
+# dart-service-db는 별도 컨테이너로 bridge + compose network 양쪽에 연결 (SERVICE_DB_URL=dart-service-db:5433)
 x-airflow-common: &airflow-common
-  build: .
-  image: llm-financial-airflow:local
+  # build: .  # EC2에서는 기존 이미지 사용
+  image: opik-airflow:2.10.0
   environment: &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: ${AIRFLOW_EXECUTOR:-CeleryExecutor}
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db:5432/airflow
@@ -8,18 +10,18 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
     AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-dart-collector-secret-key-change-in-prod}
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:-}
     TZ: ${AIRFLOW_TIMEZONE:-Asia/Seoul}
     AIRFLOW__CORE__DEFAULT_TIMEZONE: ${AIRFLOW_TIMEZONE:-Asia/Seoul}
     AIRFLOW__WEBSERVER__DEFAULT_UI_TIMEZONE: ${AIRFLOW_TIMEZONE:-Asia/Seoul}
-    # zombie detection: 오래 걸리는 silver task가 heartbeat 지연으로 zombie 판정받지 않도록 임계값 상향
     AIRFLOW__SCHEDULER__ZOMBIE_DETECTION_INTERVAL: "60"
     AIRFLOW__CORE__KILLED_TASK_CLEANUP_TIME: "600"
     AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
     AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
     AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@airflow-db:5432/airflow
-    PYTHONPATH: /opt/airflow/src
+    PYTHONPATH: /opt/airflow/src:/opt/airflow/opik
     AIRFLOW_DB_URL: ${AIRFLOW_DB_URL:-postgresql+psycopg2://airflow:airflow@airflow-db:5432/airflow}
-    SERVICE_DB_URL: ${SERVICE_DB_URL:-postgresql+psycopg2://dart:dart@service-db:5432/dart_service}
+    SERVICE_DB_URL: ${SERVICE_DB_URL:-postgresql+psycopg2://dart:dart@dart-service-db:5432/dart_service}
     DART_API_KEYS: ${DART_API_KEYS:-}
     DART_BACKFILL_MONTHS: ${DART_BACKFILL_MONTHS:-12}
     DART_BACKFILL_START_DATE: ${DART_BACKFILL_START_DATE:-}
@@ -43,7 +45,6 @@ x-airflow-common: &airflow-common
     AWS_REGION: ${AWS_REGION:-ap-northeast-2}
     AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
     AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
-    # Gold 임베딩 — e5(intfloat/multilingual-e5-small, 384d). provider/model/version도 worker에 전달.
     EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-e5}
     EMBEDDING_MODEL: ${EMBEDDING_MODEL:-intfloat/multilingual-e5-small}
     EMBEDDING_VERSION: ${EMBEDDING_VERSION:-v1}
@@ -53,20 +54,18 @@ x-airflow-common: &airflow-common
     - ./logs:/opt/airflow/logs
     - ./plugins:/opt/airflow/plugins
     - ./src:/opt/airflow/src
+    - ./opik:/opt/airflow/opik
     - ./data:/opt/airflow/data
-    # .env를 읽기전용으로 mount: 런타임에 DART_API_KEYS를 직접 읽어 컨테이너 재생성 없이 키 추가/회전.
     - ./.env:/opt/airflow/.env:ro
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
     airflow-db:
       condition: service_healthy
-    service-db:
-      condition: service_healthy
     redis:
       condition: service_healthy
-    db-migrations:
-      condition: service_completed_successfully
 
+# dart-service-db는 별도 관리 (docker run --name dart-service-db postgres:16-alpine)
+# docker network connect airflow_default dart-service-db 로 연결
 services:
   # PostgreSQL 16 for Airflow metadata only.
   airflow-db:
@@ -85,42 +84,6 @@ services:
       start_period: 5s
     volumes:
       - airflow-db-volume:/var/lib/postgresql/data
-
-  # PostgreSQL 16 for DART ingestion/service data.
-  service-db:
-    image: postgres:16
-    container_name: llm-financial-service-db
-    environment:
-      POSTGRES_USER: dart
-      POSTGRES_PASSWORD: dart
-      POSTGRES_DB: dart_service
-    ports:
-      - "5433:5432"
-    healthcheck:
-      test: ["CMD", "pg_isready", "-U", "dart", "-d", "dart_service"]
-      interval: 10s
-      retries: 5
-      start_period: 5s
-    volumes:
-      - service-db-volume:/var/lib/postgresql/data
-      - ./sql/init_service_db.sql:/docker-entrypoint-initdb.d/001_init_service_db.sql:ro
-
-  db-migrations:
-    image: postgres:16
-    container_name: llm-financial-db-migrations
-    depends_on:
-      service-db:
-        condition: service_healthy
-    environment:
-      MIGRATION_DIR: /migrations
-      SERVICE_DB_HOST: service-db
-      SERVICE_DB_USER: dart
-      SERVICE_DB_PASSWORD: dart
-      SERVICE_DB_NAME: dart_service
-    volumes:
-      - ./sql/migrations:/migrations:ro
-      - ./scripts/apply-sql-migrations.sh:/scripts/apply-sql-migrations.sh:ro
-    command: ["sh", "/scripts/apply-sql-migrations.sh"]
 
   airflow-init:
     <<: *airflow-common
@@ -183,10 +146,7 @@ services:
         condition: service_healthy
       airflow-db:
         condition: service_healthy
-      service-db:
-        condition: service_healthy
     restart: unless-stopped
 
 volumes:
   airflow-db-volume:
-  service-db-volume:
