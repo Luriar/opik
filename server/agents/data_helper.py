@@ -1,5 +1,6 @@
 """
 Agent Data Helper — unified read path: Delta from S3 first, Parquet fallback.
+Gold v3 DART integration (상용, 2026-06-19): report_registry + facts material_event.
 
 All agents use this module to read OPIK data. The read preference is:
   1. Delta Lake on S3 (fast, ACID, time-travel capable)
@@ -21,13 +22,15 @@ AWS_REGION = os.environ.get("AWS_REGION", "ap-northeast-2")
 S3_BUCKET = os.environ.get("S3_BUCKET", "s3-opik-bucket")
 DELTA_S3_BASE = f"s3://{S3_BUCKET}/delta/gold_db"
 
+# Gold v3 DART prefix (상용 Exisign/DartCollector, 2026-06-19)
+DART_GOLD_PREFIX = "gold/dart"
+
 
 def _read_delta_s3(table_path: str) -> Optional[pd.DataFrame]:
     """Read a Delta Lake table directly from S3 via deltalake library."""
     try:
         from deltalake import DeltaTable
         import os
-        # deltalake defaults to us-east-1; force correct region
         os.environ.setdefault("AWS_REGION", AWS_REGION)
         dt = DeltaTable(table_path)
         df = dt.to_pandas()
@@ -84,7 +87,6 @@ def read_gold_data(
     # -- 2. Fallback: S3 Parquet (supports partitioned paths) --
     s3 = boto3.client("s3", region_name=AWS_REGION)
 
-    # Try exact key first, then partition listing
     if dt:
         key = f"gold/{dataset}/dt={dt}/data.parquet"
     else:
@@ -92,7 +94,6 @@ def read_gold_data(
 
     df = _read_parquet_s3(key)
     if df is None and not dt:
-        # No exact key — try to discover partition folders
         try:
             prefix = f"gold/{dataset}/"
             paginator = s3.get_paginator("list_objects_v2")
@@ -103,7 +104,7 @@ def read_gold_data(
                     if k.endswith(".parquet"):
                         keys.append(k)
             if keys:
-                keys = keys[:20]  # limit to avoid OOM
+                keys = keys[:20]
                 logger.info("Parquet fallback: found %d partition files for %s", len(keys), dataset)
                 dfs = []
                 for k in keys:
@@ -126,7 +127,141 @@ def read_gold_data(
     return None
 
 
-# Compatibility aliases for existing agent code
+# ── Gold v3 DART (상용 Exisign/DartCollector) ──────────────────────────────
+
+def _scan_parquet_partitions(s3_prefix: str, max_keys: int = 50) -> list[str]:
+    """Scan S3 prefix for .parquet files and return up to max_keys paths."""
+    s3 = boto3.client("s3", region_name=AWS_REGION)
+    keys = []
+    try:
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=s3_prefix):
+            for obj in page.get("Contents", []):
+                k = obj["Key"]
+                if k.endswith(".parquet"):
+                    keys.append(k)
+                    if len(keys) >= max_keys:
+                        return keys
+    except Exception as e:
+        logger.debug("S3 scan failed for %s: %s", s3_prefix, e)
+    return keys
+
+
+def read_dart_report_registry(
+    rcept_year: Optional[str] = None,
+    rcept_month: Optional[str] = None,
+    report_type: Optional[str] = None,
+    max_keys: int = 50,
+) -> Optional[pd.DataFrame]:
+    """Read DART report_registry from Gold v3 Parquet partitions.
+
+    Args:
+        rcept_year: 접수연도 필터 (e.g. "2026"). None = all.
+        rcept_month: 접수월 필터 (e.g. "06"). None = all.
+        report_type: 보고서 유형 필터 (e.g. "REGULAR", "MATERIAL_EVENT"). None = all.
+        max_keys: max partition files to scan.
+
+    Returns:
+        DataFrame with all report_registry columns or None.
+    """
+    # Build prefix path
+    parts = [f"{DART_GOLD_PREFIX}/report_registry"]
+    if rcept_year:
+        parts.append(f"rcept_year={rcept_year}")
+    if rcept_month:
+        parts.append(f"rcept_month={rcept_month}")
+    if report_type:
+        parts.append(f"report_type={report_type}")
+    prefix = "/".join(parts) + "/"
+
+    keys = _scan_parquet_partitions(prefix, max_keys)
+    if not keys:
+        logger.warning("No report_registry parquet files at %s", prefix)
+        return None
+
+    dfs = []
+    for k in keys:
+        part = _read_parquet_s3(k)
+        if part is not None:
+            dfs.append(part)
+    if not dfs:
+        return None
+
+    df = pd.concat(dfs, ignore_index=True)
+    # Deduplicate by rcept_no (keep latest by is_latest or rcept_dt)
+    if "is_latest" in df.columns:
+        df = df.sort_values("is_latest", ascending=False)
+    if "rcept_no" in df.columns:
+        df = df.drop_duplicates(subset=["rcept_no"], keep="first")
+    # Normalize rcept_dt to YYYYMMDD for backward compat
+    if "rcept_dt" in df.columns:
+        df["rcept_dt"] = df["rcept_dt"].astype(str).str.replace("-", "")
+    logger.info("DART report_registry: %d rows from %d partitions", len(df), len(keys))
+    return df
+
+
+def read_dart_material_events(
+    rcept_year: Optional[str] = None,
+    rcept_month: Optional[str] = None,
+    event_type: Optional[str] = None,
+    max_keys: int = 30,
+) -> Optional[pd.DataFrame]:
+    """Read DART material_event facts from Gold v3 Parquet partitions.
+
+    Args:
+        rcept_year: 접수연도 필터 (e.g. "2026"). None = all recent.
+        rcept_month: 접수월 필터 (e.g. "06"). None = all.
+        event_type: 이벤트 유형 필터 (e.g. "bdwtnIssuDcrs").
+        max_keys: max partition files to scan.
+
+    Returns:
+        DataFrame with material_event columns or None.
+    """
+    parts = [f"{DART_GOLD_PREFIX}/facts/material_event"]
+    if event_type:
+        parts.append(f"event_type={event_type}")
+    if rcept_year:
+        parts.append(f"rcept_year={rcept_year}")
+    if rcept_month:
+        parts.append(f"rcept_month={rcept_month}")
+    prefix = "/".join(parts) + "/"
+
+    keys = _scan_parquet_partitions(prefix, max_keys)
+    if not keys:
+        logger.warning("No material_event parquet files at %s", prefix)
+        return None
+
+    dfs = []
+    for k in keys:
+        part = _read_parquet_s3(k)
+        if part is not None:
+            dfs.append(part)
+    if not dfs:
+        return None
+
+    df = pd.concat(dfs, ignore_index=True)
+    if "rcept_no" in df.columns:
+        df = df.drop_duplicates(subset=["rcept_no"], keep="first")
+    if "rcept_dt" in df.columns:
+        df["rcept_dt"] = df["rcept_dt"].astype(str).str.replace("-", "")
+    logger.info("DART material_events: %d rows from %d partitions", len(df), len(keys))
+    return df
+
+
+def read_dart_latest_context(snapshot_date: Optional[str] = None) -> Optional[pd.DataFrame]:
+    """Read DART latest_company_context serving cache."""
+    prefix = f"{DART_GOLD_PREFIX}/serving/latest_company_context/"
+    if snapshot_date:
+        prefix = f"{prefix}snapshot_date={snapshot_date}/"
+    keys = _scan_parquet_partitions(prefix, max_keys=5)
+    if not keys:
+        return None
+    dfs = [df for k in keys if (df := _read_parquet_s3(k)) is not None]
+    return pd.concat(dfs, ignore_index=True) if dfs else None
+
+
+# ── Compatibility aliases ──────────────────────────────────────────────────
+
 read_gold_structured = lambda dt=None: read_gold_data("structured", dt=dt)
 read_gold_embeddings = lambda dt=None: read_gold_data("embeddings", dt=dt)
 read_dart_disclosures = lambda dt=None: read_gold_data("dart/disclosure_events", dt=dt)
