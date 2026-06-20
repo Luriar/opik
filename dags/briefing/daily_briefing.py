@@ -76,14 +76,7 @@ with DAG(
         )
 
         if result["error"]:
-            raise RuntimeError(f"Briefing failed: {result['error']}")
-
-        return result
-
-    run_briefing = PythonOperator(
-        task_id="run_briefing",
-        python_callable=_run_briefing,
-        provide_context=True,
-    )
-
-    run_briefing
+            # Telegram-only failures are non-fatal; briefing content was already composed.
+            if "Telegram" in result["error"]:
+                logger.warning("Briefing content ready but Telegram delivery failed: %s", result["error"])
+          
