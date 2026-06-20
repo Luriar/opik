@@ -104,7 +104,6 @@ def read_gold_data(
                     if k.endswith(".parquet"):
                         keys.append(k)
             if keys:
-                keys = keys[:20]
                 logger.info("Parquet fallback: found %d partition files for %s", len(keys), dataset)
                 dfs = []
                 for k in keys:
@@ -113,10 +112,18 @@ def read_gold_data(
                         dfs.append(part)
                 if dfs:
                     df = pd.concat(dfs, ignore_index=True)
+                    # Normalize date formats (dots -> dashes) for robustness
+                    for date_col in ["발행일", "report_date", "date", "dt"]:
+                        if date_col in df.columns:
+                            df[date_col] = df[date_col].astype(str).str.replace(".", "-", regex=False)
         except Exception:
             pass
 
     if df is not None:
+        # Normalize date formats in Delta path too
+        for date_col in ["발행일", "report_date", "date", "dt"]:
+            if date_col in df.columns:
+                df[date_col] = df[date_col].astype(str).str.replace(".", "-", regex=False)
         logger.info("Read %d rows from S3 Parquet: %s", len(df), dataset)
         if columns:
             existing = [c for c in columns if c in df.columns]
@@ -257,11 +264,3 @@ def read_dart_latest_context(snapshot_date: Optional[str] = None) -> Optional[pd
     if not keys:
         return None
     dfs = [df for k in keys if (df := _read_parquet_s3(k)) is not None]
-    return pd.concat(dfs, ignore_index=True) if dfs else None
-
-
-# ── Compatibility aliases ──────────────────────────────────────────────────
-
-read_gold_structured = lambda dt=None: read_gold_data("structured", dt=dt)
-read_gold_embeddings = lambda dt=None: read_gold_data("embeddings", dt=dt)
-read_dart_disclosures = lambda dt=None: read_gold_data("dart/disclosure_events", dt=dt)

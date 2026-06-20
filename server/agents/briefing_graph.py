@@ -36,7 +36,7 @@ import pyarrow.parquet as pq
 
 # Unified Gold data reader — Delta from S3 first, Parquet fallback
 # Gold v3: DART data now read from gold/dart/report_registry (상용 Exisign/DartCollector)
-from agents.data_helper import read_gold_data, read_dart_report_registry, read_dart_material_events
+from .data_helper import read_gold_data, read_dart_report_registry, read_dart_material_events
 
 logger = logging.getLogger("opik.briefing")
 
@@ -841,5 +841,6 @@ def run_briefing_pipeline(date: str) -> dict:
         "report_count": len(state.structured),
         "dart_count": len(state.dart_events_df) if state.dart_events_df is not None else 0,
         "briefing_length": len(state.final_briefing),
+        "final_briefing": state.final_briefing,
         "error": state.error,
     }
