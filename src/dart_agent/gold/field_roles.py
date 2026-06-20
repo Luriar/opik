@@ -17,7 +17,7 @@ from dart_agent.gold import ksic
 from dart_agent.opendart.report_apis import REPORT_APIS
 
 # role 맵 변경 시 반드시 버전을 올린다. 같은 원문이라도 chunk_text가 달라져 기존 embedding 재사용 불가.
-FIELD_MAPPING_VERSION = "field_roles.v3"
+FIELD_MAPPING_VERSION = "field_roles.v4"  # v4(2026-06-21): 지분공시 per-record 청크 제외
 
 
 def canonical_report_type(report_type: str | None) -> str:
@@ -93,7 +93,10 @@ EMBED_FIELDS: dict[str, dict[str, str]] = {
 
 # per-record 청크를 만들 '서술 풍부' API(allowlist). 피벗 metric 표(alotMatter/irdsSttus/
 # piTickCrtfcList/emplyMttrs 등)는 제외 — record당 무의미 청크 양산 방지(요약은 summary_card가 담당).
-_PER_RECORD = {"exctvSttus", "hyslrChgHist", "hyslrSttus", "tesstkAcqsDspsSttus", "majorstock", "elestock"}
+# 지분공시(majorstock/elestock)는 per-record 청크에서 제외(2026-06-21). DS004는 기업 단위 이력 스냅샷이라
+# 같은 보고가 공시마다 중복 임베딩(~9×)되고 임베딩 내용이 보고자+보고사유뿐이라 저신호다.
+# 지분 검색은 summary_card(회사 단위 요약) + facts/ownership(SQL)로 충분. 근거: docs/data-model/report-types.md
+_PER_RECORD = {"exctvSttus", "hyslrChgHist", "hyslrSttus", "tesstkAcqsDspsSttus"}
 
 
 def is_per_record_api(api: str) -> bool:

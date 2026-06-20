@@ -14,7 +14,7 @@ from dart_agent.gold.context import run_gold_latest_context
 with DAG(
     dag_id="dag_dart_gold_backfill",
     start_date=pendulum.datetime(2026, 1, 1, tz="Asia/Seoul"),
-    schedule="0 7 * * *",
+    schedule="0 7 * * 1-5",  # 07:00 KST 평일
     catchup=False,
     max_active_runs=1,
     tags=["dart", "gold", "backfill"],
