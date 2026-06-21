@@ -153,14 +153,38 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
 
     # Step 2: Intent parsing with conversation context
     _context = ""
+    _followup_override = False  # set True if follow-up detected → skip Haiku intent
     if session_id != "default":
         from conversation_store import store as _conv_store
         _context = _conv_store.get_context_for_prompt(session_id)
         if _context:
             logger.info("Agent pipeline: injecting %d chars of conversation context", len(_context))
-    intent_result = _intent.parse(user_message, conversation_context=_context)
-    intent = intent_result["intent"]
-    params = intent_result.get("intent_params", {})
+        # Follow-up detection: short message with reference words + recent report context
+        # Haiku often misclassifies follow-ups like "이거 자세히 알려줘" as general.
+        _followup_words = ["이거", "저거", "그거", "이것", "저것", "그것",
+                           "이 리포트", "저 리포트", "그 리포트",
+                           "자세히", "더 자세히", "더 알려줘", "내용 알려줘",
+                           "이 종목", "저 종목", "이 공시", "저 공시"]
+        _msg_clean = user_message.strip()
+        _is_short = len(_msg_clean) <= 40
+        _has_ref = any(w in _msg_clean for w in _followup_words)
+        if _is_short and _has_ref and _context:
+            logger.info("Agent pipeline: follow-up pattern detected → overriding intent to report_search")
+            _followup_override = True
+    
+    if _followup_override:
+        # Bypass Haiku intent parser — force report_search with the user message as keyword
+        intent = "report_search"
+        params = {
+            "tickers": [], "ticker_names": [], "brokerages": [], "sectors": [],
+            "time_range": None, "keywords": [_msg_clean],
+            "compare": False, "cause_tracking": False, "interpret": False,
+            "is_greeting": False, "response_style": "detailed",
+        }
+    else:
+        intent_result = _intent.parse(user_message, conversation_context=_context)
+        intent = intent_result["intent"]
+        params = intent_result.get("intent_params", {})
 
     # Direct date extraction: "M월 D일" without year → (current_year)-MM-DD
     # Haiku intent parser is unreliable for year inference on month-day patterns.
