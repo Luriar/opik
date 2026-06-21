@@ -275,7 +275,7 @@ class DartSentimentAgent:
                         (df_delta["rcept_dt"] <= target_date)
                     ]
                 combined = df_delta
-                logger.info("DART loaded via Delta \u2014 %d rows", len(combined))
+                logger.info("DART loaded via Delta — %d rows", len(combined))
         except Exception as e:
             logger.debug("Delta read skipped: %s", e)
 
@@ -335,7 +335,7 @@ class DartSentimentAgent:
                             (combined["rcept_dt"].astype(str) >= start_dt.strftime("%Y%m%d")) &
                             (combined["rcept_dt"].astype(str) <= target_date)
                         ]
-                    logger.info("DART loaded via material_event facts \u2014 %d rows", len(combined))
+                    logger.info("DART loaded via material_event facts — %d rows", len(combined))
             except Exception as e:
                 logger.debug("material_event read skipped: %s", e)
 
