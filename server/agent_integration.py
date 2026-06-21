@@ -162,13 +162,17 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
     # by Haiku even with full context.
     # Skip safety for follow-up scenarios:
     # - has conversation context (user already passed safety on turn 1)
-    # - short message with reference words (Haiku misclassifies as out_of_domain)
+    # - short message with clear BACK-REFERENCE words pointing to prior turns
+    #   (Haiku misclassifies these as out_of_domain)
+    # DO NOT skip safety for normal first queries like "6월 18일 리포트 알려줘"
+    # — "알려줘" alone is too common and not a back-reference.
     _is_followup_like = (
         len(user_message.strip()) <= 60
         and any(w in user_message for w in [
             "이거", "저거", "그거", "이것", "저것", "그것",
-            "자세히", "더 알려줘", "더 보여줘", "내용 알려줘",
-            "이 리포트", "저 리포트", "이 종목", "이 공시"
+            "자세히", "더 알려줘", "더 보여줘",
+            "이 리포트", "저 리포트", "그 리포트",
+            "이 종목", "저 종목", "이 공시"
         ])
     )
     if _context or _is_followup_like:
@@ -212,8 +216,9 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
         }
     elif not _context and len(user_message.strip()) <= 60:
         _followup_hints = ["이거", "저거", "그거", "이것", "저것", "그것",
-                           "자세히", "더 알려줘", "알려줘", "내용",
-                           "이 리포트", "저 리포트", "이 종목", "이 공시"]
+                           "자세히", "더 알려줘",
+                           "이 리포트", "저 리포트", "그 리포트",
+                           "이 종목", "저 종목", "이 공시"]
         _kw_text = user_message.strip()
         for _w in _followup_hints:
             _kw_text = _kw_text.replace(_w, " ")
