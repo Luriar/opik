@@ -1,12 +1,7 @@
-"""Gold Parquet 컴팩션 — 증분이 만든 작은 part-*.parquet를 파티션별 1파일로 병합.
+"""Gold Parquet compaction - merge small part-*.parquet into 1 per partition.
 
-근실시간(분 주기)은 파티션마다 part-{run_id}.parquet를 계속 쌓는다. 그대로 두면 소파일이
-누적돼 조회(planning)·S3 LIST/메타 비용이 커진다. 이 배치가 파티션 디렉터리 단위로:
-  여러 part/compacted .parquet → 자연키 dedup(최신 유지) → compacted-{run_id}.parquet 1개로 병합
-하고 원본을 삭제한다.
-
-동시성: 병합 시작 시점에 list한 파일만 삭제한다. 그 후 증분이 쓴 새 part는 list에 없어 보존되며
-다음 컴팩션이 흡수한다(멱등·무손실). manifest/_done/_quarantine/dim 디렉터리는 건드리지 않는다.
+Concurrency: only deletes files listed before merge started. New parts written
+during merge are safe (will be collected by next run).
 """
 from __future__ import annotations
 
@@ -17,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from dart_agent.config import get_settings
@@ -24,8 +20,7 @@ from dart_agent.storage import GoldPaths, build_storage
 
 log = logging.getLogger(__name__)
 
-# 파티션 디렉터리(경로 일부) → dedup 자연키 컬럼. 가장 먼저 매칭되는 것을 쓴다.
-_DEDUP_KEYS: list[tuple[str, list[str]]] = [
+_DEDUP_KEYS = [
     ("/report_registry/", ["doc_id"]),
     ("/company_snapshot/", ["corp_code"]),
     ("/dim/company_dictionary/", ["corp_code"]),
@@ -40,62 +35,134 @@ _DEDUP_KEYS: list[tuple[str, list[str]]] = [
     ("/rag/entity_relation/", ["relation_id"]),
     ("/rag/embedding/", ["chunk_id"]),
 ]
-# 컴팩션 제외 디렉터리(마커/매니페스트).
+
 _SKIP_DIRS = ("/manifest/", "/_done/", "/_quarantine/")
 
 
-def _dedup_keys(directory: str) -> list[str] | None:
+def _dedup_keys(directory):
     for marker, keys in _DEDUP_KEYS:
         if marker in directory + "/":
             return keys
     return None
 
 
-def _concat(tables: list[pa.Table]) -> pa.Table:
-    # part 파일마다 컬럼 집합이 조금 다를 수 있어 schema promote로 통합.
+def _cast_to_string(arr):
+    """Cast an array to string, handling complex types like list<>."""
+    if pa.types.is_string(arr.type) or pa.types.is_large_string(arr.type):
+        return arr
+    try:
+        return arr.cast(pa.string())
+    except (pa.ArrowNotImplementedError, pa.ArrowInvalid):
+        # For list, struct, or other complex types, convert via pandas
+        s = arr.to_pandas()
+        return pa.array(s.astype(str), type=pa.string())
+
+
+def _unify_schemas(tables):
+    col_types = {}
+    for t in tables:
+        for col in t.column_names:
+            col_types.setdefault(col, set()).add(t.schema.field(col).type)
+
+    conflict_cols = set()
+    for col, types in col_types.items():
+        if len(types) > 1:
+            conflict_cols.add(col)
+
+    if not conflict_cols:
+        return tables
+
+    result = []
+    for t in tables:
+        has_conflict = False
+        for c in conflict_cols:
+            if c in t.column_names:
+                has_conflict = True
+                break
+        if has_conflict:
+            cols = {}
+            for cn in t.column_names:
+                if cn in conflict_cols:
+                    cols[cn] = _cast_to_string(t.column(cn))
+                else:
+                    cols[cn] = t.column(cn)
+            t = pa.table(cols)
+        result.append(t)
+    return result
+
+
+def _concat(tables):
     try:
         return pa.concat_tables(tables, promote_options="default")
-    except TypeError:  # 구버전 pyarrow 호환.
-        return pa.concat_tables(tables, promote=True)
+    except (TypeError, pa.ArrowTypeError):
+        unified = _unify_schemas(tables)
+        return pa.concat_tables(unified, promote_options="default")
 
 
-def run_gold_compaction(min_parts_to_merge: int = 2, storage=None) -> dict[str, Any]:
-    """파티션 디렉터리별로 part 파일을 1개로 병합(dedup)하고 원본을 삭제한다.
-
-    storage: 테스트 주입용. None이면 설정에서 만든다.
-    """
+def run_gold_compaction(min_parts_to_merge=2, storage=None):
     if storage is None:
         storage = build_storage(get_settings())
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
-    keys = [k for k in storage.list_keys(GoldPaths.root())
-            if k.endswith(".parquet") and not any(s in k for s in _SKIP_DIRS)]
-    by_dir: dict[str, list[str]] = defaultdict(list)
+    keys = []
+    for k in storage.list_keys(GoldPaths.root()):
+        if k.endswith(".parquet"):
+            skip = False
+            for s in _SKIP_DIRS:
+                if s in k:
+                    skip = True
+                    break
+            if not skip:
+                keys.append(k)
+
+    by_dir = defaultdict(list)
     for k in keys:
         by_dir[k.rsplit("/", 1)[0]].append(k)
 
-    merged_dirs = compacted_rows = deleted_files = skipped_dirs = 0
+    merged_dirs = 0
+    compacted_rows = 0
+    deleted_files = 0
+    skipped_dirs = 0
+
     for directory, files in by_dir.items():
         if len(files) < min_parts_to_merge:
             skipped_dirs += 1
             continue
-        files = sorted(files)  # run_id 타임스탬프 정렬 → 뒤가 최신(keep='last').
-        tables = [pq.read_table(io.BytesIO(storage.read_bytes(f))) for f in files]
+        files = sorted(files)
+        tables = []
+        for f in files:
+            buf = io.BytesIO(storage.read_bytes(f))
+            tab = pq.read_table(buf)
+            tables.append(tab)
         merged = _concat(tables)
         dedup = _dedup_keys(directory)
-        if dedup and all(c in merged.column_names for c in dedup):
-            df = merged.to_pandas().drop_duplicates(subset=dedup, keep="last")
-            merged = pa.Table.from_pandas(df, preserve_index=False)
+        if dedup:
+            all_ok = True
+            for c in dedup:
+                if c not in merged.column_names:
+                    all_ok = False
+            if all_ok:
+                df = merged.to_pandas()
+                df = df.drop_duplicates(subset=dedup, keep="last")
+                merged = pa.Table.from_pandas(df, preserve_index=False)
         buf = io.BytesIO()
         pq.write_table(merged, buf, compression="snappy")
-        storage.write_bytes(f"{directory}/compacted-{run_id}.parquet", buf.getvalue(),
+        dst_key = "%s/compacted-%s.parquet" % (directory, run_id)
+        storage.write_bytes(dst_key, buf.getvalue(),
                             content_type="application/octet-stream")
-        for f in files:  # 시작 시점 list한 원본만 삭제(이후 새 part는 보존).
+        for f in files:
             storage.delete(f)
             deleted_files += 1
         merged_dirs += 1
         compacted_rows += merged.num_rows
 
-    log.info("gold compaction: merged_dirs=%s deleted=%s rows=%s", merged_dirs, deleted_files, compacted_rows)
-    return {"merged_dirs": merged_dirs, "deleted_files": deleted_files,
-            "compacted_rows": compacted_rows, "skipped_dirs": skipped_dirs}
+    log.info(
+        "gold compaction: merged_dirs=%s deleted=%s rows=%s",
+        merged_dirs, deleted_files, compacted_rows
+    )
+    return {
+        "merged_dirs": merged_dirs,
+        "deleted_files": deleted_files,
+        "compacted_rows": compacted_rows,
+        "skipped_dirs": skipped_dirs,
+    }
