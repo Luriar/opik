@@ -112,7 +112,11 @@ def _format_date_browse(date_str: str, results: list) -> str:
     return "\n".join(lines)
 
 
-def _run_agent_pipeline(user_message: str) -> dict:
+def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
+    """Run the full agent pipeline for one user message.
+    
+    session_id is used to fetch conversation context for follow-up resolution.
+    """
     """Run the full agent pipeline for one user message.
 
     Returns dict with keys: answer, sources, intent, confidence, violation_type
@@ -147,8 +151,14 @@ def _run_agent_pipeline(user_message: str) -> dict:
             "elapsed_ms": elapsed,
         }
 
-    # Step 2: Intent parsing
-    intent_result = _intent.parse(user_message)
+    # Step 2: Intent parsing with conversation context
+    _context = ""
+    if session_id != "default":
+        from conversation_store import store as _conv_store
+        _context = _conv_store.get_context_for_prompt(session_id)
+        if _context:
+            logger.info("Agent pipeline: injecting %d chars of conversation context", len(_context))
+    intent_result = _intent.parse(user_message, conversation_context=_context)
     intent = intent_result["intent"]
     params = intent_result.get("intent_params", {})
 
@@ -351,7 +361,7 @@ async def v2_chat_handler(req) -> dict:
         }
 
     # Run agent pipeline
-    result = _run_agent_pipeline(msg)
+    result = _run_agent_pipeline(msg, session_id=session_id)
 
     # Save conversation turn
     conversation_store.add_turn(session_id, "user", msg)
