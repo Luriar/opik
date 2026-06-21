@@ -214,7 +214,7 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
             "compare": False, "cause_tracking": False, "interpret": False,
             "is_greeting": False, "response_style": "detailed",
         }
-    elif not _context and len(user_message.strip()) <= 60:
+    elif not _context and _is_followup_like:
         _followup_hints = ["이거", "저거", "그거", "이것", "저것", "그것",
                            "자세히", "더 알려줘",
                            "이 리포트", "저 리포트", "그 리포트",
