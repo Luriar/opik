@@ -347,22 +347,33 @@ def query_insider_transactions(companies, codes, date_from=None, date_to=None,
 def query_disclosure_events(companies, codes, date_from=None, date_to=None,
                              is_recent=False, limit_rows=500,
                              page=1, page_size=20):
-    """Query disclosure events (paginated)."""
+    """Query disclosure events (paginated) — Delta from S3 first, Parquet fallback."""
     table_prefix = "gold/dart/disclosure_events"
     if is_recent and not date_from:
         date_from = (datetime.now() - timedelta(days=60)).strftime("%Y-%m")
-    dt_parts = _get_date_partitions(
-        table_prefix, date_from or "2025-01", date_to or "2099-12"
-    )
-    if not dt_parts:
-        return "해당 기간의 공시 데이터가 없습니다."
 
-    df = _read_parquet_partitions(table_prefix, dt_parts, limit_rows)
-    if len(df) == 0:
-        return "해당 기간의 공시 데이터가 없습니다."
+    # Try Delta first (single read, no partition loop)
+    # Lazy import to avoid agents/__init__.py chain during module load
+    try:
+        from agents.data_helper import read_gold_data
+        df = read_gold_data("dart/disclosure_events")
+        if df is not None and len(df) > 0:
+            logger.info("disclosure_events loaded via Delta: %d rows", len(df))
+            df = _filter_by_date_col(df, "rcept_dt", date_from, date_to)
+            if len(df) > limit_rows:
+                df = df.head(limit_rows)
+        else:
+            raise ValueError("Delta returned empty")
+    except Exception as e:
+        logger.debug("Delta read skipped, falling back to Parquet: %s", e)
+        dt_parts = _get_date_partitions(
+            table_prefix, date_from or "2025-01", date_to or "2099-12"
+        )
+        if not dt_parts:
+            return "해당 기간의 공시 데이터가 없습니다."
+        df = _read_parquet_partitions(table_prefix, dt_parts, limit_rows)
+        df = _filter_by_date_col(df, "rcept_dt", date_from, date_to)
 
-    # Day-level filter on rcept_dt
-    df = _filter_by_date_col(df, "rcept_dt", date_from, date_to)
     if len(df) == 0:
         return "해당 기간의 공시 데이터가 없습니다."
 

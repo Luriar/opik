@@ -72,6 +72,9 @@ class ConversationStore:
         if len(session.turns) > self.max_turns:
             self._compress_old_turns(session)
 
+        # Persist to SQLite (fire-and-forget, best-effort)
+        self._persist_session(session_id, session)
+
     def get_context_for_prompt(self, session_id: str) -> str:
         """프롬프트에 주입할 대화 맥락 생성"""
         session = self.get_or_create(session_id)
@@ -279,6 +282,62 @@ class ConversationStore:
             "topics": list(topics)[:5],
             "recent_dates": list(recent_dates)[:5],
         }
+
+    def _persist_session(self, session_id: str, session: ConversationSession):
+        """Best-effort persist to SQLite."""
+        try:
+            from db import save_conversation
+            chat_id = 0
+            if session_id.startswith("telegram_"):
+                try:
+                    chat_id = int(session_id.split("_", 1)[1])
+                except ValueError:
+                    chat_id = 0
+            turns_json = [
+                {"role": t.role, "content": t.content,
+                 "summary": t.summary, "timestamp": t.timestamp.isoformat()}
+                for t in session.turns
+            ]
+            save_conversation(session_id, chat_id, turns_json, session.context_summary)
+        except Exception:
+            pass
+
+    def restore_all(self):
+        """Restore active conversations from SQLite on startup."""
+        try:
+            from db import list_approved_subscribers, load_conversation_by_chat
+            subscribers = list_approved_subscribers()
+            for sub in subscribers:
+                chat_id = sub["chat_id"]
+                sessions = load_conversation_by_chat(chat_id, limit=1)
+                for s in sessions:
+                    sid = s["session_id"]
+                    cs = ConversationSession(
+                        session_id=sid,
+                        context_summary=s.get("context_summary", ""),
+                    )
+                    cs.last_active = datetime.fromisoformat(
+                        s.get("last_active", datetime.now().isoformat())
+                    ) if s.get("last_active") else datetime.now()
+                    for t in s.get("turns", []):
+                        ts = t.get("timestamp", "")
+                        try:
+                            ts_dt = datetime.fromisoformat(ts) if ts else datetime.now()
+                        except (ValueError, TypeError):
+                            ts_dt = datetime.now()
+                        cs.turns.append(ConversationTurn(
+                            role=t.get("role", "user"),
+                            content=t.get("content", ""),
+                            summary=t.get("summary", ""),
+                            timestamp=ts_dt,
+                        ))
+                    with self._lock:
+                        if sid not in self._sessions:
+                            self._sessions[sid] = cs
+            import logging
+            logging.getLogger(__name__).info("Restored %d sessions", len(self._sessions))
+        except Exception:
+            pass
 
     def _evict_expired(self):
         """TTL 만료 세션 제거"""

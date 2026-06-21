@@ -841,7 +841,7 @@ def run_daily_embedding(
             cache_folder=str(cache_dir),
         )
         vectors = embedder.encode(
-            [row["_embedding_input"] for row in embedding_rows],
+            ["passage: " + row["_embedding_input"] for row in embedding_rows],
             batch_size=16,
             normalize_embeddings=True,
             show_progress_bar=False,

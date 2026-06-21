@@ -8,30 +8,14 @@ Depends on:
   - DART Gold (전일 08:00 compaction 기준, 1영업일 lag)
 
 Runs the full 9-step briefing pipeline via briefing_graph.py.
-Single PythonOperator — LangGraph handles internal orchestration.
-
-Deployment: copy this file to /opt/airflow/dags/ on EC2.
-Also needs server/agents/ accessible in PYTHONPATH.
+Uses BashOperator to avoid Celery serialization / module import issues.
 """
 
-import logging
-import os
-import sys
 from datetime import datetime, timedelta
 
 import pendulum
 from airflow import DAG
-from airflow.operators.python import PythonOperator
-
-# Ensure server/agents is importable
-# On EC2: /opt/airflow/opik/server/agents/
-_PROJECT_ROOT = os.environ.get("OPIK_PROJECT_ROOT", "/opt/airflow/opik")
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
-
-logger = logging.getLogger("opik.briefing_dag")
-
-# ── DAG definition ──
+from airflow.operators.bash import BashOperator
 
 default_args = {
     "owner": "opik",
@@ -44,7 +28,7 @@ default_args = {
 with DAG(
     dag_id="opik_briefing",
     default_args=default_args,
-    description="OPIK ★/! Triple Consensus Daily Briefing → Telegram",
+    description="OPIK Star/! Triple Consensus Daily Briefing -> Telegram",
     schedule="0 7 * * *",
     start_date=pendulum.datetime(2026, 6, 1, tz="Asia/Seoul"),
     catchup=False,
@@ -52,38 +36,19 @@ with DAG(
     tags=["opik", "briefing", "telegram"],
 ) as dag:
 
-    def _run_briefing(**context) -> dict:
-        """Execute the briefing pipeline.
-
-        Uses Airflow ds_nodash as the target date (KST data_interval_end - 1일).
-        For a schedule of 0 7 * * *, the ds_nodash is the previous day's date
-        (which is correct: 07:00 briefing on June 19 processes June 18 data).
-        """
-        from server.agents.briefing_graph import run_briefing_pipeline
-
-        ds_nodash = context["ds_nodash"]
-        logger.info("Starting OPIK briefing for date=%s", ds_nodash)
-
-        result = run_briefing_pipeline(ds_nodash)
-
-        logger.info(
-            "Briefing complete: ★=%d !=%d reports=%d dart=%d error=%s",
-            result["star_count"],
-            result["exclamation_count"],
-            result["report_count"],
-            result["dart_count"],
-            result["error"],
-        )
-
-        if result["error"]:
-            raise RuntimeError(f"Briefing failed: {result['error']}")
-
-        return result
-
-    run_briefing = PythonOperator(
+    run_briefing = BashOperator(
         task_id="run_briefing",
-        python_callable=_run_briefing,
-        provide_context=True,
+        bash_command=(
+            "cd /opt/airflow/opik && "
+            "PYTHONPATH=/opt/airflow/opik:$PYTHONPATH "
+            "python -c \""
+            "import sys; sys.path.insert(0, '/opt/airflow/opik'); "
+            "from server.agents.briefing_graph import run_briefing_pipeline; "
+            "print(f'Starting briefing for {{ ds_nodash }}'); "
+            "result = run_briefing_pipeline('{{ ds_nodash }}'); "
+            "print(f'Complete: star={result[\\\"star_count\\\"]} excl={result[\\\"exclamation_count\\\"]} reports={result[\\\"report_count\\\"]} dart={result[\\\"dart_count\\\"]} error={result[\\\"error\\\"]}'); "
+            "if result.get('error') and 'Telegram' not in str(result.get('error', '')): "
+            "    raise SystemExit(f'Briefing failed: {result[\\\"error\\\"]}')"
+            "\""
+        ),
     )
-
-    run_briefing

@@ -89,7 +89,34 @@ def get_agent_status() -> dict:
     }
 
 
-def _run_agent_pipeline(user_message: str) -> dict:
+def _format_date_browse(date_str: str, results: list) -> str:
+    """Format date-based browse results directly — no LLM summarise needed."""
+    if not results:
+        return f"해당 날짜({date_str})의 증권사 리포트 데이터가 없습니다."
+
+    lines = [f"*{date_str} 증권사 리포트* ({len(results)}건)", ""]
+    for r in results[:20]:
+        reason = r.get("reason", "") or ""
+        kw = r.get("keywords", "") or ""
+        risk = r.get("risks", "") or ""
+        lines.append(f"• {reason}")
+        if kw:
+            lines.append(f"  키워드: {kw}")
+        if risk:
+            lines.append(f"  리스크: {risk}")
+        lines.append("")
+
+    if len(results) > 20:
+        lines.append(f"... 외 {len(results) - 20}건")
+    lines.append("※ 본 정보는 증권사 리포트의 사실적 요약이며 투자 권유가 아닙니다.")
+    return "\n".join(lines)
+
+
+def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
+    """Run the full agent pipeline for one user message.
+    
+    session_id is used to fetch conversation context for follow-up resolution.
+    """
     """Run the full agent pipeline for one user message.
 
     Returns dict with keys: answer, sources, intent, confidence, violation_type
@@ -105,8 +132,46 @@ def _run_agent_pipeline(user_message: str) -> dict:
 
     t0 = time.time()
 
-    # Step 1: Safety check
-    safety_result = _safety.check(user_message)
+    # Step 0: Fetch conversation context and detect follow-ups (before safety check)
+    _context = ""
+    _followup_override = False
+    _augmented_message = user_message
+    if session_id != "default":
+        from conversation_store import store as _conv_store
+        _context = _conv_store.get_context_for_prompt(session_id)
+        if _context:
+            logger.info("Agent pipeline: injecting %d chars of conversation context", len(_context))
+        # Follow-up detection: short message with reference words
+        # Must run BEFORE safety check because safety agent sees phrases like "챕터 2의
+        # 서막" as out-of-domain without knowing it refers to a report from the
+        # previous turn. We don't require _context to be non-empty because the
+        # conversation_store is in-memory and gets wiped on server restart.
+        _followup_words = ["이거", "저거", "그거", "이것", "저것", "그것",
+                           "이 리포트", "저 리포트", "그 리포트",
+                           "자세히", "더 자세히", "더 알려줘", "내용 알려줘",
+                           "이 종목", "저 종목", "이 공시", "저 공시"]
+        _msg_clean = user_message.strip()
+        _is_short = len(_msg_clean) <= 40
+        _has_ref = any(w in _msg_clean for w in _followup_words)
+        if _is_short and _has_ref:
+            logger.info("Agent pipeline: follow-up pattern detected → overriding intent, skipping safety")
+            # Build augmented message with context if available
+            if _context:
+                _augmented_message = (
+                    "[이전 대화에서 논의된 증권사 리포트에 대한 후속 질문]\n"
+                    f"{_context}\n\n"
+                    f"[질문]\n{user_message}"
+                )
+            else:
+                _augmented_message = user_message
+            _followup_override = True
+
+    # Step 1: Safety check (skip for follow-ups — already passed in previous turn)
+    if _followup_override:
+        safety_result = {"is_safe": True, "violation_type": None, "redirect_suggestion": ""}
+        logger.info("Agent pipeline: follow-up → skipping safety check")
+    else:
+        safety_result = _safety.check(user_message)
     if not safety_result.get("is_safe", True):
         answer = _safety.build_refusal_message(
             safety_result.get("violation_type"),
@@ -125,9 +190,33 @@ def _run_agent_pipeline(user_message: str) -> dict:
         }
 
     # Step 2: Intent parsing
-    intent_result = _intent.parse(user_message)
-    intent = intent_result["intent"]
-    params = intent_result.get("intent_params", {})
+    if _followup_override:
+        # Bypass Haiku intent parser — force report_search
+        intent = "report_search"
+        params = {
+            "tickers": [], "ticker_names": [], "brokerages": [], "sectors": [],
+            "time_range": None, "keywords": [user_message.strip()],
+            "compare": False, "cause_tracking": False, "interpret": False,
+            "is_greeting": False, "response_style": "detailed",
+        }
+    else:
+        intent_result = _intent.parse(user_message, conversation_context=_context)
+        intent = intent_result["intent"]
+        params = intent_result.get("intent_params", {})
+
+    # Direct date extraction: "M월 D일" without year → (current_year)-MM-DD
+    # Haiku intent parser is unreliable for year inference on month-day patterns.
+    _md = __import__("re").search(r"(?<!\d)(\d{1,2})월\s*(\d{1,2})일", user_message)
+    if _md and not __import__("re").search(r"\d{4}년", user_message):
+        _cy = str(__import__("datetime").datetime.now().year)
+        _dm = _md.group(1).zfill(2)
+        _dd = _md.group(2).zfill(2)
+        _ed = f"{_cy}-{_dm}-{_dd}"
+        logger.info("Agent date extract: %s월 %s일 → %s", _md.group(1), _md.group(2), _ed)
+        params["date_from"] = _ed
+        params["date_to"] = _ed
+        if not params.get("ticker_names"):
+            params["ticker_names"] = []
 
     # Step 3: Route and execute
     route = _supervisor.route(True, intent, params)
@@ -160,20 +249,37 @@ def _run_agent_pipeline(user_message: str) -> dict:
         confidence = "high"
 
     elif route == "report_agent":
-        search_results = _report.search(user_message, top_k=10)
-        if search_results:
-            answer = _report.summarise(user_message, search_results)
-            sources = [r.get("report_id", "") for r in search_results]
-            confidence = "high"
+        if params.get("date_from") and not params.get("ticker_names"):
+            search_results = _report.search_by_date(params["date_from"], params["date_to"], limit=50)
+            logger.info("Using date-based browse for %s (%d results)", params["date_from"], len(search_results))
+            if search_results:
+                answer = _format_date_browse(params["date_from"], search_results)
+                sources = [r.get("report_id", "") for r in search_results]
+                confidence = "high"
+            else:
+                answer = f"해당 날짜({params['date_from']})의 증권사 리포트 데이터가 없습니다."
+                sources = []
+                confidence = "low"
         else:
-            ticker_names = params.get("ticker_names", [])
-            names_str = ", ".join(ticker_names) if ticker_names else "해당 조건"
-            answer = f"{names_str}으로 검색된 애널리스트 리포트가 없습니다."
-            confidence = "low"
+            search_results = _report.search(user_message, top_k=10)
+            if search_results:
+                answer = _report.summarise(user_message, search_results)
+                sources = [r.get("report_id", "") for r in search_results]
+                confidence = "high"
+            else:
+                ticker_names = params.get("ticker_names", [])
+                names_str = ", ".join(ticker_names) if ticker_names else "해당 조건"
+                answer = f"{names_str}으로 검색된 애널리스트 리포트가 없습니다."
+                confidence = "low"
 
     elif route == "report_with_analysis":
-        search_results = _report.search(user_message, top_k=10)
-        report_summary = _report.summarise(user_message, search_results) if search_results else ""
+        if params.get("date_from") and not params.get("ticker_names"):
+            search_results = _report.search_by_date(params["date_from"], params["date_to"], limit=50)
+            logger.info("Using date-based browse for %s (%d results)", params["date_from"], len(search_results))
+            report_summary = _format_date_browse(params["date_from"], search_results) if search_results else ""
+        else:
+            search_results = _report.search(user_message, top_k=10)
+            report_summary = _report.summarise(user_message, search_results) if search_results else ""
         ticker_name = params.get("ticker_names", [""])[0] if params.get("ticker_names") else ""
 
         analysis = ""
@@ -214,9 +320,13 @@ def _run_agent_pipeline(user_message: str) -> dict:
     elif route == "hybrid_parallel":
         report_summary = ""
         dart_summary = ""
-        search_results = _report.search(user_message, top_k=10)
-        if search_results:
-            report_summary = _report.summarise(user_message, search_results)
+        if params.get("date_from") and not params.get("ticker_names"):
+            search_results = _report.search_by_date(params["date_from"], params["date_to"], limit=50)
+            logger.info("Using date-based browse for %s (%d results)", params["date_from"], len(search_results))
+            report_summary = _format_date_browse(params["date_from"], search_results) if search_results else ""
+        else:
+            search_results = _report.search(user_message, top_k=10)
+            report_summary = _report.summarise(user_message, search_results) if search_results else ""
             sources = [r.get("report_id", "") for r in search_results]
 
         ticker_names = params.get("ticker_names", [])
@@ -293,7 +403,7 @@ async def v2_chat_handler(req) -> dict:
         }
 
     # Run agent pipeline
-    result = _run_agent_pipeline(msg)
+    result = _run_agent_pipeline(msg, session_id=session_id)
 
     # Save conversation turn
     conversation_store.add_turn(session_id, "user", msg)

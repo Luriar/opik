@@ -28,7 +28,8 @@ import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 import re
-from fastapi import FastAPI, HTTPException
+import requests
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
@@ -56,6 +57,12 @@ AWS_REGION = os.environ.get("AWS_REGION", "ap-northeast-2")
 BEDROCK_MODEL = os.environ.get("BEDROCK_MODEL", "apac.anthropic.claude-3-haiku-20240307-v1:0")
 SEARCH_TOP_K = int(os.environ.get("SEARCH_TOP_K", "10"))
 AGENT_ENABLED_STR = os.environ.get("OPIK_AGENT_ENABLED", "true")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+
+from db import (upsert_subscriber, is_approved, approve_subscriber,
+                add_briefing_recipient, remove_briefing_recipient,
+                list_approved_subscribers, init_db, seed_initial_users,
+                get_subscriber)
 
 os.makedirs("/data/opik", exist_ok=True)
 
@@ -255,7 +262,7 @@ def _run_analysis_with_data(analysis_type: str, sources: list,
         # produces poor matches. Search each company separately.
         if analysis_type == "compare" and len(companies) >= 2:
             logger.info("Compare: multi-ticker search for %d companies: %s", len(companies), companies)
-            multi_results = _search_faiss_for_companies(companies, "증권사 리포트", top_k=20)
+            multi_results = _search_faiss_for_companies(companies, "", top_k=20)
             if multi_results:
                 converted = _convert_sources(multi_results)
                 logger.info("Compare: multi-ticker search returned %d results", len(converted))
@@ -432,7 +439,23 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning("Agent init failed (non-fatal): %s", e)
 
+    init_db()
+    seed_initial_users()
+    conversation_store.restore_all()
+
+    _telegram_polling_stop = threading.Event()
+    _telegram_polling_thread = threading.Thread(
+        target=_telegram_polling_loop,
+        args=(_telegram_polling_stop,),
+        daemon=True,
+        name="telegram_polling"
+    )
+    _telegram_polling_thread.start()
+
     yield
+
+    _telegram_polling_stop.set()
+    _telegram_polling_thread.join(timeout=5)
     logger.info("Shutting down.")
 
 
@@ -859,6 +882,23 @@ async def chat(req: ChatRequest):
     date_from = req.date_from or intent.date_from
     date_to = req.date_to or intent.date_to
 
+    # Direct date extraction: "M월 D일" without year → (current_year)-MM-DD
+    # Haiku intent parser is unreliable for year inference on month-day patterns.
+    # Extract dates directly from user text to guarantee correct year.
+    _month_day_pat = re.search(r'(?<!\d)(\d{1,2})월\s*(\d{1,2})일', req.message)
+    if _month_day_pat and not re.search(r'\d{4}년', req.message):
+        from datetime import datetime as _dt
+        _cur_year = str(_dt.now().year)
+        _m = _month_day_pat.group(1).zfill(2)
+        _d = _month_day_pat.group(2).zfill(2)
+        _extracted = f"{_cur_year}-{_m}-{_d}"
+        logger.info("Direct date: '%s월 %s일' → %s (overriding Haiku intent)",
+                     _month_day_pat.group(1), _month_day_pat.group(2), _extracted)
+        date_from = _extracted
+        date_to = _extracted
+        intent_info["date_from"] = _extracted
+        intent_info["date_to"] = _extracted
+
     # Check if the user message contains explicit date text
     _has_explicit_date = bool(
         re.search(r'\d{4}년|\d{1,2}월\s*\d{1,2}일|\d{4}-\d{2}-\d{2}|어제|오늘|그제', req.message)
@@ -1103,7 +1143,11 @@ async def chat(req: ChatRequest):
                              or conversation_store.get_recent_full_date(session_id)
                              or "지정된")
             return ChatResponse(
-                answer=f"해당 날짜({_display_date})의 DART 공시 데이터가 없습니다.",
+                answer=(
+                f"해당 날짜({_display_date})의 DART 공시 데이터가 없습니다.\n\n"
+                "DART 공시 데이터는 2026년 3월까지 적재되어 있습니다.\n"
+                "최신 공시는 3월 이전 날짜로 조회해 주세요."
+            ),
                 sources=[],
                 elapsed_ms=round((time.time() - t0) * 1000, 1),
                 intent=intent_info,
@@ -1266,6 +1310,152 @@ async def v2_chat(req: ChatRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+
+
+# -- Telegram ------------------------------------------------------------
+
+def _send_telegram(chat_id, text, parse_mode="HTML"):
+    if not TELEGRAM_BOT_TOKEN:
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        for i in range(0, len(text), 4000):
+            chunk = text[i:i + 4000]
+            r = requests.post(url, json={
+                "chat_id": chat_id, "text": chunk,
+                "parse_mode": parse_mode, "disable_web_page_preview": True
+            }, timeout=15)
+            if r.status_code != 200:
+                logger.error("TG send failed: %s", r.text)
+                return False
+        return True
+    except Exception as e:
+        logger.exception("TG send error: %s", e)
+        return False
+
+
+def _handle_telegram_command(chat_id, text, username, first_name):
+    cmd = text.strip().lower()
+    if cmd == "/start":
+        upsert_subscriber(chat_id, username=username, first_name=first_name)
+        if is_approved(chat_id):
+            return "OPIK에 다시 오신 것을 환영합니다!"
+        return "OPIK 봇에 오신 것을 환영합니다! 승인 대기 중입니다."
+    elif cmd == "/subscribe":
+        upsert_subscriber(chat_id, username=username, first_name=first_name)
+        if not is_approved(chat_id):
+            return "먼저 승인이 필요합니다."
+        if add_briefing_recipient(chat_id):
+            return "매일 아침 7시 브리핑을 구독했습니다."
+        return "이미 구독 중입니다."
+    elif cmd == "/unsubscribe":
+        if remove_briefing_recipient(chat_id):
+            return "구독이 해지되었습니다."
+        return "구독 중이 아닙니다."
+    elif cmd == "/status":
+        sub = get_subscriber(chat_id)
+        if not sub:
+            return "등록되지 않았습니다."
+        return "승인됨" if sub.get("approved") else "대기 중"
+    elif cmd.startswith("/approve") and is_approved(chat_id):
+        parts = text.strip().split()
+        if len(parts) == 2 and parts[1].isdigit():
+            target = int(parts[1])
+            if approve_subscriber(target):
+                add_briefing_recipient(target)
+                _send_telegram(target, "관리자가 승인했습니다.")
+                return f"승인: {target}"
+            return "승인 실패"
+        return "사용법: /approve <chat_id>"
+    elif cmd == "/help":
+        return "OPIK: /start /subscribe /unsubscribe /status /help"
+    return None
+
+
+def _process_telegram_message(chat_id, text, username, first_name):
+    upsert_subscriber(chat_id, username=username, first_name=first_name)
+    reply = _handle_telegram_command(chat_id, text, username, first_name)
+    if reply is not None:
+        _send_telegram(chat_id, reply)
+        return
+    if not is_approved(chat_id):
+        _send_telegram(chat_id, "승인 대기 중입니다.")
+        return
+
+    # Show typing indicator
+    if TELEGRAM_BOT_TOKEN:
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendChatAction",
+                json={"chat_id": chat_id, "action": "typing"}, timeout=5
+            )
+        except Exception:
+            pass
+
+    t0 = time.time()
+    try:
+        FakeReq = type("FakeReq", (), {
+            "message": text, "session_id": f"telegram_{chat_id}"
+        })
+        import asyncio
+        r = asyncio.run(v2_chat_handler(FakeReq()))
+        answer = r.get("answer", "응답 실패")
+    except Exception as e:
+        logger.exception("Agent failed %d: %s", chat_id, e)
+        answer = "내부 오류"
+    logger.info("TG done in %dms", round((time.time()-t0)*1000))
+    _send_telegram(chat_id, answer)
+
+
+def _telegram_polling_loop(stop_event):
+    offset = 0
+    logger.info("Telegram polling started")
+    while not stop_event.is_set():
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+            r = requests.get(url, params={
+                "offset": offset, "timeout": 30, "allowed_updates": ["message"]
+            }, timeout=35)
+            data = r.json()
+            if not data.get("ok"):
+                stop_event.wait(5)
+                continue
+            for upd in data.get("result", []):
+                offset = upd["update_id"] + 1
+                msg = upd.get("message")
+                if not msg:
+                    continue
+                ch = msg.get("chat", {})
+                cid = ch.get("id")
+                txt = (msg.get("text") or "").strip()
+                if not cid or not txt:
+                    continue
+                logger.info("TG msg from %d: %s", cid, txt[:100])
+                _process_telegram_message(cid, txt, ch.get("username",""), ch.get("first_name",""))
+        except Exception as e:
+            logger.warning("TG poll err: %s", e)
+            stop_event.wait(5)
+    logger.info("Telegram polling stopped")
+
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(req: Request):
+    if not TELEGRAM_BOT_TOKEN:
+        raise HTTPException(503)
+    body = await req.json()
+    msg = body.get("message", {})
+    if not msg:
+        return {"status": "ignored"}
+    ch = msg.get("chat", {})
+    cid = ch.get("id")
+    txt = (msg.get("text") or "").strip()
+    if not cid or not txt:
+        return {"status": "ignored"}
+    _process_telegram_message(cid, txt, ch.get("username",""), ch.get("first_name",""))
+    return {"status": "ok"}
+
+
+# index management
 # index management
 @app.post("/index/rebuild")
 async def rebuild_index():

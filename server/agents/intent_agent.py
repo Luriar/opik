@@ -102,9 +102,23 @@ class IntentAgent:
             self._client = boto3.client("bedrock-runtime", region_name=self.region)
         return self._client
 
-    def parse(self, user_message: str) -> dict:
+    def parse(self, user_message: str, conversation_context: str = "") -> dict:
+        """Parse user message into structured intent.
+        
+        If conversation_context is provided, it is prepended to help resolve
+        follow-up references like "이거", "저 리포트", etc.
+        """
         """Parse user message into structured intent."""
         now = datetime.now()
+
+        # Augment with conversation context for follow-up resolution
+        if conversation_context:
+            augmented = (
+                f"[이전 대화 내용]\n{conversation_context}\n\n"
+                f"[현재 질문]\n{user_message}"
+            )
+        else:
+            augmented = user_message
 
         system_prompt = INTENT_SYSTEM_PROMPT.replace(
             "{TODAY_DATE}", now.strftime("%Y-%m-%d")
@@ -114,7 +128,7 @@ class IntentAgent:
             "anthropic_version": "bedrock-2023-05-31",
             "max_tokens": 512,
             "system": system_prompt,
-            "messages": [{"role": "user", "content": user_message}],
+            "messages": [{"role": "user", "content": augmented}],
             "temperature": 0.0,
         })
 

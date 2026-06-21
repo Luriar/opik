@@ -22,4 +22,4 @@ for label, msg in tests:
             print(f"Answer: {answer[:500]}")
     except Exception as e:
         print(f"ERROR: {e}")
-    time.slee
+    time.sleep(2)

@@ -1,0 +1,152 @@
+# EC2 배포용 docker-compose.yml — Docker Compose v2.29.7 (plugin)
+# dart-service-db는 별도 컨테이너로 bridge + compose network 양쪽에 연결 (SERVICE_DB_URL=dart-service-db:5433)
+x-airflow-common: &airflow-common
+  # build: .  # EC2에서는 기존 이미지 사용
+  image: opik-airflow:2.10.0
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: ${AIRFLOW_EXECUTOR:-CeleryExecutor}
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db:5432/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-dart-collector-secret-key-change-in-prod}
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:-}
+    TZ: ${AIRFLOW_TIMEZONE:-Asia/Seoul}
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: ${AIRFLOW_TIMEZONE:-Asia/Seoul}
+    AIRFLOW__WEBSERVER__DEFAULT_UI_TIMEZONE: ${AIRFLOW_TIMEZONE:-Asia/Seoul}
+    AIRFLOW__SCHEDULER__ZOMBIE_DETECTION_INTERVAL: "60"
+    AIRFLOW__CORE__KILLED_TASK_CLEANUP_TIME: "600"
+    AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@airflow-db:5432/airflow
+    PYTHONPATH: /opt/airflow/src:/opt/airflow/opik
+    AIRFLOW_DB_URL: ${AIRFLOW_DB_URL:-postgresql+psycopg2://airflow:airflow@airflow-db:5432/airflow}
+    SERVICE_DB_URL: ${SERVICE_DB_URL:-postgresql+psycopg2://dart:dart@dart-service-db:5432/dart_service}
+    DART_API_KEYS: ${DART_API_KEYS:-}
+    DART_BACKFILL_MONTHS: ${DART_BACKFILL_MONTHS:-12}
+    DART_BACKFILL_START_DATE: ${DART_BACKFILL_START_DATE:-}
+    DART_BACKFILL_END_DATE: ${DART_BACKFILL_END_DATE:-}
+    DART_INCREMENTAL_DAYS: ${DART_INCREMENTAL_DAYS:-3}
+    DART_LISTED_COMPANY_SCHEDULE: ${DART_LISTED_COMPANY_SCHEDULE:-1 9 * * 1-5}
+    DART_DAILY_LIMIT: ${DART_DAILY_LIMIT:-20000}
+    DART_DAILY_SAFE_LIMIT: ${DART_DAILY_SAFE_LIMIT:-18000}
+    DART_DAILY_EMERGENCY_LIMIT: ${DART_DAILY_EMERGENCY_LIMIT:-19500}
+    DART_MINUTE_LIMIT: ${DART_MINUTE_LIMIT:-1000}
+    DART_MINUTE_SAFE_LIMIT: ${DART_MINUTE_SAFE_LIMIT:-600}
+    DART_QUOTA_REQUEST_LOG_ENABLED: ${DART_QUOTA_REQUEST_LOG_ENABLED:-true}
+    DART_COLLECT_MODE: ${DART_COLLECT_MODE:-structured}
+    STORAGE_BACKEND: ${STORAGE_BACKEND:-auto}
+    LOCAL_STORAGE_BASE_PATH: ${LOCAL_STORAGE_BASE_PATH:-/opt/airflow/data}
+    S3_BUCKET: ${S3_BUCKET:-}
+    S3_BASE_PREFIX: ${S3_BASE_PREFIX:-}
+    BRONZE_PREFIX: ${BRONZE_PREFIX:-bronze/dart}
+    SILVER_PREFIX: ${SILVER_PREFIX:-silver/dart}
+    GOLD_PREFIX: ${GOLD_PREFIX:-gold/dart}
+    AWS_REGION: ${AWS_REGION:-ap-northeast-2}
+    AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+    AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+    EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-e5}
+    EMBEDDING_MODEL: ${EMBEDDING_MODEL:-intfloat/multilingual-e5-small}
+    EMBEDDING_VERSION: ${EMBEDDING_VERSION:-v1}
+    EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-384}
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ./src:/opt/airflow/src
+    - ./opik:/opt/airflow/opik
+    - ./data:/opt/airflow/data
+    - ./.env:/opt/airflow/.env:ro
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    airflow-db:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+# dart-service-db는 별도 관리 (docker run --name dart-service-db postgres:16-alpine)
+# docker network connect airflow_default dart-service-db 로 연결
+services:
+  # PostgreSQL 16 for Airflow metadata only.
+  airflow-db:
+    image: postgres:16
+    container_name: llm-financial-airflow-db
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    ports:
+      - "5435:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    volumes:
+      - airflow-db-volume:/var/lib/postgresql/data
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: llm-financial-airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username airflow \
+          --firstname Airflow \
+          --lastname Admin \
+          --role Admin \
+          --email airflow@example.com \
+          --password airflow || true
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: llm-financial-airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: llm-financial-airflow-scheduler
+    command: scheduler
+    restart: unless-stopped
+
+  airflow-triggerer:
+    <<: *airflow-common
+    container_name: llm-financial-airflow-triggerer
+    command: triggerer
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-bookworm
+    container_name: llm-financial-airflow-redis
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 30s
+      retries: 50
+      start_period: 30s
+
+  airflow-worker:
+    <<: *airflow-common
+    container_name: llm-financial-airflow-worker
+    command: celery worker
+    depends_on:
+      redis:
+        condition: service_healthy
+      airflow-db:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  airflow-db-volume:
