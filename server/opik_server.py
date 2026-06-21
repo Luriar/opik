@@ -255,7 +255,7 @@ def _run_analysis_with_data(analysis_type: str, sources: list,
         # produces poor matches. Search each company separately.
         if analysis_type == "compare" and len(companies) >= 2:
             logger.info("Compare: multi-ticker search for %d companies: %s", len(companies), companies)
-            multi_results = _search_faiss_for_companies(companies, "증권사 리포트", top_k=20)
+            multi_results = _search_faiss_for_companies(companies, "", top_k=20)
             if multi_results:
                 converted = _convert_sources(multi_results)
                 logger.info("Compare: multi-ticker search returned %d results", len(converted))
@@ -269,9 +269,13 @@ def _run_analysis_with_data(analysis_type: str, sources: list,
             return None
 
         if analysis_type == "compare":
-            # compare_reports expects List[dict] — pass converted directly
-            # (Stage 2 already fetched data for all companies in the query)
-            result = agent_integration._analysis.compare_reports(converted, ticker_name)
+            # v6: Multi-company → cross-stock compare; single-company → broker compare
+            if len(companies) >= 2:
+                stock_codes = intent_info.get("stock_codes", [])
+                result = agent_integration._analysis.compare_stocks(converted, companies, stock_codes)
+                logger.info("Compare: routing to compare_stocks for %d companies (codes=%s)", len(companies), stock_codes)
+            else:
+                result = agent_integration._analysis.compare_reports(converted, ticker_name)
             if result:
                 return agent_integration._composer.compose_chat_response(
                 intent=analysis_type,

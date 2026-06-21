@@ -139,4 +139,10 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    files, rows = reembed_month(args.year, args.mon
+    files, rows = reembed_month(args.year, args.month, dry_run=args.dry_run)
+    action = "Would re-embed" if args.dry_run else "Re-embedded"
+    print(f"{action}: {files} files, {rows} rows")
+
+
+if __name__ == "__main__":
+    main()
