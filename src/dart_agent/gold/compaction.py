@@ -53,7 +53,6 @@ def _cast_to_string(arr):
     try:
         return arr.cast(pa.string())
     except (pa.ArrowNotImplementedError, pa.ArrowInvalid):
-        # For list, struct, or other complex types, convert via pandas
         s = arr.to_pandas()
         return pa.array(s.astype(str), type=pa.string())
 
@@ -104,6 +103,7 @@ def run_gold_compaction(min_parts_to_merge=2, storage=None):
         storage = build_storage(get_settings())
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
+    log.info("Compaction: listing parquet files...")
     keys = []
     for k in storage.list_keys(GoldPaths.root()):
         if k.endswith(".parquet"):
@@ -114,20 +114,29 @@ def run_gold_compaction(min_parts_to_merge=2, storage=None):
                     break
             if not skip:
                 keys.append(k)
+    log.info("Compaction: found %d parquet files", len(keys))
 
     by_dir = defaultdict(list)
     for k in keys:
         by_dir[k.rsplit("/", 1)[0]].append(k)
+
+    dirs_total = len(by_dir)
+    log.info("Compaction: %d unique directories to check", dirs_total)
 
     merged_dirs = 0
     compacted_rows = 0
     deleted_files = 0
     skipped_dirs = 0
 
-    for directory, files in by_dir.items():
+    for idx, (directory, files) in enumerate(by_dir.items()):
         if len(files) < min_parts_to_merge:
             skipped_dirs += 1
             continue
+        if idx % 25 == 0 or len(files) >= 10:
+            log.info(
+                "Compaction [%d/%d]: %s (%d files)",
+                idx + 1, dirs_total, directory, len(files)
+            )
         files = sorted(files)
         tables = []
         for f in files:
@@ -157,8 +166,8 @@ def run_gold_compaction(min_parts_to_merge=2, storage=None):
         compacted_rows += merged.num_rows
 
     log.info(
-        "gold compaction: merged_dirs=%s deleted=%s rows=%s",
-        merged_dirs, deleted_files, compacted_rows
+        "Compaction done: merged_dirs=%s deleted=%s rows=%s skipped=%s",
+        merged_dirs, deleted_files, compacted_rows, skipped_dirs
     )
     return {
         "merged_dirs": merged_dirs,
