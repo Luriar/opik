@@ -1,3 +1,4 @@
+
 """
 Agent Integration — wires server/agents/ into the existing FastAPI server.
 
@@ -112,6 +113,41 @@ def _format_date_browse(date_str: str, results: list) -> str:
     return "\n".join(lines)
 
 
+# Date-only question patterns for short-circuit detection.
+# These prevent Haiku intent parser from miscategorising "오늘 며칠이냐"
+# as report_search (which causes FAISS search → hallucinated {today_date}).
+_DATE_ONLY_PATTERNS = [
+    "오늘 며칠", "며칠이야", "며칠이냐", "오늘 날짜",
+    "오늘은 며칠", "오늘이 며칠", "오늘 뭐냐", "날짜 알려줘",
+    "오늘 몇일", "오늘이 몇일",
+]
+
+
+def _filter_recent(results: list, max_days: int = 180) -> list:
+    """Filter search results to recent reports (within max_days).
+
+    When no date/time_range is specified and the user hasn't asked for
+    a specific historical year, old FAISS matches (2022-2023) should be
+    dropped to avoid showing stale reports as "today's".
+    """
+    from datetime import datetime, timedelta
+    cutoff = datetime.now() - timedelta(days=max_days)
+    filtered = []
+    for r in results:
+        year = r.get("year")
+        month = r.get("month")
+        if year and month:
+            try:
+                rd = datetime(int(year), int(month), 15)
+                if rd >= cutoff:
+                    filtered.append(r)
+            except (ValueError, TypeError):
+                filtered.append(r)
+        else:
+            filtered.append(r)
+    return filtered
+
+
 def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
     """Run the full agent pipeline for one user message.
     
@@ -137,11 +173,6 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
                  session_id, len(user_message), user_message[:80])
 
     # Step 0: Inject conversation context into the message when available.
-    # This lets safety and intent agents resolve short references like
-    # "이거 자세히 알려줘" or "챕터 2의 서막 내용 알려줘" that refer to
-    # reports mentioned in previous turns. Context is prepended as a
-    # structured prefix so Haiku can distinguish prior context from the
-    # current question.
     _context = ""
     if session_id != "default":
         from conversation_store import store as _conv_store
@@ -156,16 +187,6 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
         )
 
     # Step 1: Safety check.
-    # When conversation context exists, skip the safety filter — the user
-    # already passed safety on their first turn, and short follow-up messages
-    # like "이거 자세히 알려줘" are consistently misclassified as out_of_domain
-    # by Haiku even with full context.
-    # Skip safety for follow-up scenarios:
-    # - has conversation context (user already passed safety on turn 1)
-    # - short message with clear BACK-REFERENCE words pointing to prior turns
-    #   (Haiku misclassifies these as out_of_domain)
-    # DO NOT skip safety for normal first queries like "6월 18일 리포트 알려줘"
-    # — "알려줘" alone is too common and not a back-reference.
     _is_followup_like = (
         len(user_message.strip()) <= 60
         and any(w in user_message for w in [
@@ -199,12 +220,6 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
         }
 
     # Step 2: Intent parsing.
-    #
-    # Three cases:
-    # 1) context + short msg -> force report_search (Haiku misclassifies follow-ups)
-    # 2) NO context + short msg -> try keyword search, fall through to natural re-ask
-    #    (handles TTL expiry gracefully - no "session expired" system message)
-    # 3) normal message -> full intent parsing via Haiku
     if _context and len(user_message.strip()) <= 60:
         logger.info("Agent pipeline: short msg + context -> forcing report_search intent")
         intent = "report_search"
@@ -259,7 +274,6 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
         params = intent_result.get("intent_params", {})
 
     # Direct date extraction: "M월 D일" without year → (current_year)-MM-DD
-    # Haiku intent parser is unreliable for year inference on month-day patterns.
     _md = __import__("re").search(r"(?<!\d)(\d{1,2})월\s*(\d{1,2})일", user_message)
     if _md and not __import__("re").search(r"\d{4}년", user_message):
         _cy = str(__import__("datetime").datetime.now().year)
@@ -271,6 +285,44 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
         params["date_to"] = _ed
         if not params.get("ticker_names"):
             params["ticker_names"] = []
+
+    # --- BUGFIX 1: Pure date-only question detection ---
+    # "오늘 며칠이야?", "며칠이냐?" etc. must NOT reach FAISS search.
+    # Haiku intent parser miscategorises these as report_search, causing
+    # FAISS to return random old reports and Haiku summarise to hallucinate
+    # the literal string "{today_date}".
+    _msg_stripped = user_message.replace(" ", "").replace("?", "").replace("!", "").replace(".", "").replace("~", "")
+    _is_date_only = False
+    for _dp in _DATE_ONLY_PATTERNS:
+        _dp_stripped = _dp.replace(" ", "")
+        if _dp_stripped in _msg_stripped:
+            _is_date_only = True
+            break
+    if _is_date_only:
+        _today = __import__("datetime").datetime.now()
+        _elapsed = (time.time() - t0) * 1000
+        logger.info("Agent pipeline: date-only question detected → short-circuit (%r)", user_message[:40])
+        return {
+            "answer": (
+                f"오늘은 {_today.year}년 {_today.month}월 {_today.day}일입니다.\n\n"
+                "원하시는 날짜의 증권사 리포트를 보시려면 '6월 18일 리포트'처럼 날짜를 말씀해 주세요."
+            ),
+            "sources": [],
+            "intent": "general",
+            "confidence": "high",
+            "violation_type": None,
+            "elapsed_ms": _elapsed,
+        }
+
+    # --- BUGFIX 2: "오늘" keyword → force date-based search ---
+    # When user says "오늘 리포트" without a specific date, use search_by_date
+    # instead of FAISS to avoid returning 2022-2023 reports as "today's".
+    if "오늘" in user_message and not params.get("date_from"):
+        _today = __import__("datetime").datetime.now()
+        _td = _today.strftime("%Y-%m-%d")
+        logger.info("Agent pipeline: '오늘' keyword → force date_from=%s", _td)
+        params["date_from"] = _td
+        params["date_to"] = _td
 
     # Step 3: Route and execute
     route = _supervisor.route(True, intent, params)
@@ -316,6 +368,17 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
                 confidence = "low"
         else:
             search_results = _report.search(user_message, top_k=10)
+            # --- BUGFIX 3: Recency filter on FAISS results ---
+            # Without a date_from, FAISS returns semantically similar reports
+            # from any year. Filter to 180 days unless user explicitly asked
+            # for a specific historical year.
+            _has_year_ref = bool(__import__("re").search(r"\b(20\d{2})년", user_message))
+            if not _has_year_ref and search_results:
+                _before = len(search_results)
+                search_results = _filter_recent(search_results)
+                if _before > len(search_results):
+                    logger.info("Recency filter: %d → %d results (dropped %d old reports)",
+                                _before, len(search_results), _before - len(search_results))
             if search_results:
                 answer = _report.summarise(user_message, search_results)
                 sources = [r.get("report_id", "") for r in search_results]
@@ -333,6 +396,12 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
             report_summary = _format_date_browse(params["date_from"], search_results) if search_results else ""
         else:
             search_results = _report.search(user_message, top_k=10)
+            _has_year_ref = bool(__import__("re").search(r"\b(20\d{2})년", user_message))
+            if not _has_year_ref and search_results:
+                _before = len(search_results)
+                search_results = _filter_recent(search_results)
+                if _before > len(search_results):
+                    logger.info("Recency filter (analysis): %d → %d results", _before, len(search_results))
             report_summary = _report.summarise(user_message, search_results) if search_results else ""
         ticker_name = params.get("ticker_names", [""])[0] if params.get("ticker_names") else ""
 
@@ -380,6 +449,12 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
             report_summary = _format_date_browse(params["date_from"], search_results) if search_results else ""
         else:
             search_results = _report.search(user_message, top_k=10)
+            _has_year_ref = bool(__import__("re").search(r"\b(20\d{2})년", user_message))
+            if not _has_year_ref and search_results:
+                _before = len(search_results)
+                search_results = _filter_recent(search_results)
+                if _before > len(search_results):
+                    logger.info("Recency filter (hybrid): %d → %d results", _before, len(search_results))
             report_summary = _report.summarise(user_message, search_results) if search_results else ""
             sources = [r.get("report_id", "") for r in search_results]
 
