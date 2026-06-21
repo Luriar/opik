@@ -248,9 +248,11 @@ class DartSentimentAgent:
         lookback_days: int = 30,
         event_types: Optional[List[str]] = None,
     ) -> pd.DataFrame:
-        """Load DART disclosure events from S3 Gold for sentiment analysis.
+        """Load DART disclosure events from S3 for sentiment analysis.
 
-        Uses OPIK Gold disclosure_events (Phase 2 1차 소스).
+        Primary: Delta dart/disclosure_events (fast single read)
+        Fallback: DartCollector Gold facts/material_event (new partitioned path)
+        Legacy fallback: gold/dart/disclosure_events/dt={ym}/ (may be deleted by compaction)
 
         Args:
             target_date: reference date in YYYYMMDD format
@@ -260,50 +262,125 @@ class DartSentimentAgent:
         target_dt = datetime.strptime(target_date, "%Y%m%d")
         start_dt = target_dt - timedelta(days=lookback_days)
 
-        # Scan relevant monthly partitions
-        s3 = boto3.client("s3", region_name=self.region)
-        months = set()
-        d = start_dt
-        while d <= target_dt:
-            months.add(d.strftime("%Y-%m"))
-            # Add a day and re-normalize
-            d = datetime(d.year, d.month, 1) + timedelta(days=32)
-            d = datetime(d.year, d.month, 1)
+        combined = None
 
-        dfs = []
-        for ym in sorted(months):
-            key = f"gold/dart/disclosure_events/dt={ym}/data.parquet"
+        # Path 1: Delta (primary, fast)
+        try:
+            from agents.data_helper import read_gold_data
+            df_delta = read_gold_data("dart/disclosure_events")
+            if df_delta is not None and len(df_delta) > 0:
+                if "rcept_dt" in df_delta.columns:
+                    df_delta = df_delta[
+                        (df_delta["rcept_dt"] >= start_dt.strftime("%Y%m%d")) &
+                        (df_delta["rcept_dt"] <= target_date)
+                    ]
+                combined = df_delta
+                logger.info("DART loaded via Delta \u2014 %d rows", len(combined))
+        except Exception as e:
+            logger.debug("Delta read skipped: %s", e)
+
+        # Path 2: DartCollector Gold material_event facts (new)
+        if combined is None or len(combined) == 0:
             try:
-                obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
-                buf = io.BytesIO(obj["Body"].read())
-                df = pq.read_table(buf).to_pandas()
-                dfs.append(df)
-                logger.info("Loaded disclosure_events dt=%s: %d rows", ym, len(df))
-            except s3.exceptions.NoSuchKey:
-                logger.debug("No disclosure_events for dt=%s", ym)
-            except Exception as e:
-                logger.warning("Error loading dt=%s: %s", ym, e)
+                s3 = boto3.client("s3", region_name=self.region)
+                import re as _re
 
-        if not dfs:
+                prefix = "gold/dart/facts/material_event/"
+                all_keys = []
+                paginator = s3.get_paginator("list_objects_v2")
+                for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
+                    for obj in page.get("Contents", []):
+                        if obj["Key"].endswith(".parquet"):
+                            all_keys.append(obj["Key"])
+
+                # Filter by date partitions
+                months = set()
+                d = start_dt
+                while d <= target_dt:
+                    months.add((str(d.year), f"{d.month:02d}"))
+                    if d.month == 12:
+                        d = datetime(d.year + 1, 1, 1)
+                    else:
+                        d = datetime(d.year, d.month + 1, 1)
+
+                relevant_keys = []
+                for key in all_keys:
+                    m = _re.search(r'rcept_year=(\d{4})/rcept_month=(\d{2})/', key)
+                    if m and (m.group(1), m.group(2)) in months:
+                        relevant_keys.append(key)
+                    elif not m:
+                        relevant_keys.append(key)
+
+                if not relevant_keys and all_keys:
+                    relevant_keys = all_keys
+
+                frames = []
+                total_rows = 0
+                for key in relevant_keys:
+                    if total_rows >= 50000:
+                        break
+                    try:
+                        obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
+                        buf = io.BytesIO(obj["Body"].read())
+                        df = pq.read_table(buf).to_pandas()
+                        frames.append(df)
+                        total_rows += len(df)
+                    except Exception as e2:
+                        logger.warning("Error reading %s: %s", key, e2)
+
+                if frames:
+                    combined = pd.concat(frames, ignore_index=True)
+                    if "rcept_dt" in combined.columns:
+                        combined = combined[
+                            (combined["rcept_dt"].astype(str) >= start_dt.strftime("%Y%m%d")) &
+                            (combined["rcept_dt"].astype(str) <= target_date)
+                        ]
+                    logger.info("DART loaded via material_event facts \u2014 %d rows", len(combined))
+            except Exception as e:
+                logger.debug("material_event read skipped: %s", e)
+
+        # Path 3: Legacy gold/dart/disclosure_events/dt= (may be deleted by compaction)
+        if combined is None or len(combined) == 0:
+            s3 = boto3.client("s3", region_name=self.region)
+            months = set()
+            d = start_dt
+            while d <= target_dt:
+                months.add(d.strftime("%Y-%m"))
+                d = datetime(d.year, d.month, 1) + timedelta(days=32)
+                d = datetime(d.year, d.month, 1)
+
+            dfs = []
+            for ym in sorted(months):
+                key = f"gold/dart/disclosure_events/dt={ym}/data.parquet"
+                try:
+                    obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
+                    buf = io.BytesIO(obj["Body"].read())
+                    df = pq.read_table(buf).to_pandas()
+                    dfs.append(df)
+                    logger.info("Loaded disclosure_events dt=%s: %d rows", ym, len(df))
+                except Exception:
+                    pass
+
+            if dfs:
+                combined = pd.concat(dfs, ignore_index=True)
+                if "rcept_dt" in combined.columns:
+                    combined = combined[
+                        (combined["rcept_dt"].astype(str) >= start_dt.strftime("%Y%m%d")) &
+                        (combined["rcept_dt"].astype(str) <= target_date)
+                    ]
+
+        if combined is not None and len(combined) > 0:
+            # Filter by event type if specified
+            if event_types and "event_category" in combined.columns:
+                combined = combined[combined["event_category"].isin(event_types)]
+
+            logger.info("Disclosure events loaded: %d rows after filtering", len(combined))
+            return combined
+        else:
             logger.warning("No disclosure events found for period %s to %s",
                            start_dt.strftime("%Y-%m-%d"), target_dt.strftime("%Y-%m-%d"))
             return pd.DataFrame()
 
-        combined = pd.concat(dfs, ignore_index=True)
-
-        # Filter by date range
-        if "rcept_dt" in combined.columns:
-            combined = combined[
-                (combined["rcept_dt"] >= start_dt.strftime("%Y%m%d")) &
-                (combined["rcept_dt"] <= target_dt)
-            ]
-
-        # Filter by event type if specified
-        if event_types and "event_category" in combined.columns:
-            combined = combined[combined["event_category"].isin(event_types)]
-
-        logger.info("Disclosure events loaded: %d rows after filtering", len(combined))
-        return combined
 
     def classify_sync(self, df: pd.DataFrame) -> pd.DataFrame:
         """Classify sentiment for all disclosures (synchronous, for Airflow).
