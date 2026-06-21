@@ -132,39 +132,36 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
 
     t0 = time.time()
 
-    # Step 0: Fetch conversation context and detect follow-ups (before safety check)
+    # Step 0: Fetch conversation context (session_id gate)
     _context = ""
-    _followup_override = False
-    _augmented_message = user_message
     if session_id != "default":
         from conversation_store import store as _conv_store
         _context = _conv_store.get_context_for_prompt(session_id)
         if _context:
             logger.info("Agent pipeline: injecting %d chars of conversation context", len(_context))
-        # Follow-up detection: short message with reference words
-        # Must run BEFORE safety check because safety agent sees phrases like "챕터 2의
-        # 서막" as out-of-domain without knowing it refers to a report from the
-        # previous turn. We don't require _context to be non-empty because the
-        # conversation_store is in-memory and gets wiped on server restart.
-        _followup_words = ["이거", "저거", "그거", "이것", "저것", "그것",
-                           "이 리포트", "저 리포트", "그 리포트",
-                           "자세히", "더 자세히", "더 알려줘", "내용 알려줘",
-                           "이 종목", "저 종목", "이 공시", "저 공시"]
-        _msg_clean = user_message.strip()
-        _is_short = len(_msg_clean) <= 40
-        _has_ref = any(w in _msg_clean for w in _followup_words)
-        if _is_short and _has_ref:
-            logger.info("Agent pipeline: follow-up pattern detected → overriding intent, skipping safety")
-            # Build augmented message with context if available
-            if _context:
-                _augmented_message = (
-                    "[이전 대화에서 논의된 증권사 리포트에 대한 후속 질문]\n"
-                    f"{_context}\n\n"
-                    f"[질문]\n{user_message}"
-                )
-            else:
-                _augmented_message = user_message
-            _followup_override = True
+
+    # Follow-up detection — runs BEFORE safety check, unconditionally.
+    # Safety agent sees phrases like "챕터 2의 서막" as out-of-domain without
+    # knowing it refers to a report from the previous turn. Follow-ups are:
+    # short message (<=40 chars) with a reference word + detail request.
+    _followup_override = False
+    _augmented_message = user_message
+    _followup_words = ["이거", "저거", "그거", "이것", "저것", "그것",
+                       "이 리포트", "저 리포트", "그 리포트",
+                       "자세히", "더 자세히", "더 알려줘", "내용 알려줘",
+                       "이 종목", "저 종목", "이 공시", "저 공시"]
+    _msg_clean = user_message.strip()
+    _is_short = len(_msg_clean) <= 40
+    _has_ref = any(w in _msg_clean for w in _followup_words)
+    if _is_short and _has_ref:
+        logger.info("Agent pipeline: follow-up pattern detected → overriding intent, skipping safety")
+        if _context:
+            _augmented_message = (
+                "[이전 대화에서 논의된 증권사 리포트에 대한 후속 질문]\n"
+                f"{_context}\n\n"
+                f"[질문]\n{user_message}"
+            )
+        _followup_override = True
 
     # Step 1: Safety check (skip for follow-ups — already passed in previous turn)
     if _followup_override:
