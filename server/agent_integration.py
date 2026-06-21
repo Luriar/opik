@@ -132,46 +132,55 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
 
     t0 = time.time()
 
-    # Step 0: Fetch conversation context and detect follow-ups (before safety check)
+    # DEBUG: log session_id and message length
+    logger.info("Agent pipeline: session_id=%s msg_len=%d msg_preview=%r",
+                 session_id, len(user_message), user_message[:80])
+
+    # Step 0: Inject conversation context into the message when available.
+    # This lets safety and intent agents resolve short references like
+    # "이거 자세히 알려줘" or "챕터 2의 서막 내용 알려줘" that refer to
+    # reports mentioned in previous turns. Context is prepended as a
+    # structured prefix so Haiku can distinguish prior context from the
+    # current question.
     _context = ""
-    _followup_override = False
-    _augmented_message = user_message
     if session_id != "default":
         from conversation_store import store as _conv_store
         _context = _conv_store.get_context_for_prompt(session_id)
-        if _context:
-            logger.info("Agent pipeline: injecting %d chars of conversation context", len(_context))
-        # Follow-up detection: short message with reference words
-        # Must run BEFORE safety check because safety agent sees phrases like "챕터 2의
-        # 서막" as out-of-domain without knowing it refers to a report from the
-        # previous turn. We don't require _context to be non-empty because the
-        # conversation_store is in-memory and gets wiped on server restart.
-        _followup_words = ["이거", "저거", "그거", "이것", "저것", "그것",
-                           "이 리포트", "저 리포트", "그 리포트",
-                           "자세히", "더 자세히", "더 알려줘", "내용 알려줘",
-                           "이 종목", "저 종목", "이 공시", "저 공시"]
-        _msg_clean = user_message.strip()
-        _is_short = len(_msg_clean) <= 40
-        _has_ref = any(w in _msg_clean for w in _followup_words)
-        if _is_short and _has_ref:
-            logger.info("Agent pipeline: follow-up pattern detected → overriding intent, skipping safety")
-            # Build augmented message with context if available
-            if _context:
-                _augmented_message = (
-                    "[이전 대화에서 논의된 증권사 리포트에 대한 후속 질문]\n"
-                    f"{_context}\n\n"
-                    f"[질문]\n{user_message}"
-                )
-            else:
-                _augmented_message = user_message
-            _followup_override = True
+    _msg_for_safety = user_message
+    if _context:
+        logger.info("Agent pipeline: injecting %d chars of conversation context", len(_context))
+        _msg_for_safety = (
+            "[이전 대화에서 논의된 증권사 리포트에 대한 후속 질문입니다.]\n"
+            f"<previous_conversation>\n{_context}\n</previous_conversation>\n\n"
+            f"<current_question>\n{user_message}\n</current_question>"
+        )
 
-    # Step 1: Safety check (skip for follow-ups — already passed in previous turn)
-    if _followup_override:
+    # Step 1: Safety check.
+    # When conversation context exists, skip the safety filter — the user
+    # already passed safety on their first turn, and short follow-up messages
+    # like "이거 자세히 알려줘" are consistently misclassified as out_of_domain
+    # by Haiku even with full context.
+    # Skip safety for follow-up scenarios:
+    # - has conversation context (user already passed safety on turn 1)
+    # - short message with clear BACK-REFERENCE words pointing to prior turns
+    #   (Haiku misclassifies these as out_of_domain)
+    # DO NOT skip safety for normal first queries like "6월 18일 리포트 알려줘"
+    # — "알려줘" alone is too common and not a back-reference.
+    _is_followup_like = (
+        len(user_message.strip()) <= 60
+        and any(w in user_message for w in [
+            "이거", "저거", "그거", "이것", "저것", "그것",
+            "자세히", "더 알려줘", "더 보여줘",
+            "이 리포트", "저 리포트", "그 리포트",
+            "이 종목", "저 종목", "이 공시"
+        ])
+    )
+    if _context or _is_followup_like:
         safety_result = {"is_safe": True, "violation_type": None, "redirect_suggestion": ""}
-        logger.info("Agent pipeline: follow-up → skipping safety check")
+        logger.info("Agent pipeline: skipping safety (context=%d followup=%s)",
+                     len(_context), _is_followup_like)
     else:
-        safety_result = _safety.check(user_message)
+        safety_result = _safety.check(_msg_for_safety)
     if not safety_result.get("is_safe", True):
         answer = _safety.build_refusal_message(
             safety_result.get("violation_type"),
@@ -189,15 +198,60 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
             "elapsed_ms": elapsed,
         }
 
-    # Step 2: Intent parsing
-    if _followup_override:
-        # Bypass Haiku intent parser — force report_search
+    # Step 2: Intent parsing.
+    #
+    # Three cases:
+    # 1) context + short msg -> force report_search (Haiku misclassifies follow-ups)
+    # 2) NO context + short msg -> try keyword search, fall through to natural re-ask
+    #    (handles TTL expiry gracefully - no "session expired" system message)
+    # 3) normal message -> full intent parsing via Haiku
+    if _context and len(user_message.strip()) <= 60:
+        logger.info("Agent pipeline: short msg + context -> forcing report_search intent")
         intent = "report_search"
         params = {
             "tickers": [], "ticker_names": [], "brokerages": [], "sectors": [],
             "time_range": None, "keywords": [user_message.strip()],
             "compare": False, "cause_tracking": False, "interpret": False,
             "is_greeting": False, "response_style": "detailed",
+        }
+    elif not _context and _is_followup_like:
+        _followup_hints = ["이거", "저거", "그거", "이것", "저것", "그것",
+                           "자세히", "더 알려줘",
+                           "이 리포트", "저 리포트", "그 리포트",
+                           "이 종목", "저 종목", "이 공시"]
+        _kw_text = user_message.strip()
+        for _w in _followup_hints:
+            _kw_text = _kw_text.replace(_w, " ")
+        _kw_text = " ".join(_kw_text.split())
+        if _kw_text:
+            logger.info("Agent pipeline: no-context short msg -> keyword search: %r", _kw_text)
+            _search_results = _report.search(_kw_text, top_k=5)
+            if _search_results:
+                _answer = _report.summarise(_kw_text, _search_results)
+                _elapsed = (time.time() - t0) * 1000
+                logger.info("Agent pipeline: no-context keyword search: %d results (%.0fms)",
+                            len(_search_results), _elapsed)
+                return {
+                    "answer": _answer,
+                    "sources": [r.get("report_id", "") for r in _search_results],
+                    "intent": "report_search",
+                    "confidence": "medium",
+                    "violation_type": None,
+                    "elapsed_ms": _elapsed,
+                }
+            logger.info("Agent pipeline: no-context keyword search found nothing for %r", _kw_text)
+        _elapsed = (time.time() - t0) * 1000
+        return {
+            "answer": (
+                "어떤 리포트나 종목을 찾으시는지 구체적으로 말씀해 주시면 검색해 드릴게요.\n\n"
+                "예를 들어 '삼성전자 리포트 보여줘', '6월 18일 리포트', "
+                "'최근 반도체 공시 알려줘'처럼 말씀해 주세요."
+            ),
+            "sources": [],
+            "intent": "general",
+            "confidence": "low",
+            "violation_type": None,
+            "elapsed_ms": _elapsed,
         }
     else:
         intent_result = _intent.parse(user_message, conversation_context=_context)

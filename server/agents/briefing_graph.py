@@ -133,42 +133,99 @@ def load_gold_llm(state: BriefingState) -> BriefingState:
 
 
 def load_dart_events(state: BriefingState) -> BriefingState:
-    """Step 3: Load 1 month of DART disclosure events from S3 Gold.
+    """Step 3: Load 1 quarter of DART disclosure events.
 
-    Uses OPIK Gold disclosure_events as Phase 2 primary source.
+    Primary: Delta dart/disclosure_events (fast single read)
+    Fallback: DartCollector Gold facts/material_event (new partitioned path)
+    Legacy fallback: gold/dart/disclosure_events/dt={ym}/ (may be deleted by compaction)
     """
     target_dt = datetime.strptime(state.date, "%Y%m%d")
     start_dt = target_dt - timedelta(days=92)  # ~1 quarter for ★ consensus window
 
-    # Collect all monthly partitions in range
-    months = set()
-    d = start_dt
-    while d <= target_dt:
-        months.add(d.strftime("%Y-%m"))
-        d = datetime(d.year, d.month, 1) + timedelta(days=32)
-        d = datetime(d.year, d.month, 1)
+    combined = None
 
-    dfs = []
-    s3 = _get_s3()
-    for ym in sorted(months):
-        key = f"gold/dart/disclosure_events/dt={ym}/data.parquet"
+    # Path 1: Delta (primary, fast)
+    try:
+        from agents.data_helper import read_gold_data
+        df_delta = read_gold_data("dart/disclosure_events")
+        if df_delta is not None and len(df_delta) > 0:
+            if "rcept_dt" in df_delta.columns:
+                df_delta = df_delta[
+                    (df_delta["rcept_dt"] >= start_dt.strftime("%Y%m%d")) &
+                    (df_delta["rcept_dt"] <= state.date)
+                ]
+            combined = df_delta
+            logger.info("Step 3: DART loaded via Delta — %d rows", len(combined))
+    except Exception as e:
+        logger.debug("Step 3: Delta read skipped: %s", e)
+
+    # Path 2: DartCollector Gold material_event facts (new)
+    if combined is None or len(combined) == 0:
         try:
-            df = _read_parquet_s3(key)
-            dfs.append(df)
-            logger.info("Step 3: Loaded disclosure_events dt=%s: %d rows", ym, len(df))
-        except Exception:
-            logger.debug("Step 3: No disclosure_events for dt=%s", ym)
+            prefix = "gold/dart/facts/material_event/"
+            all_keys = _list_parquet_keys(prefix)
 
-    if dfs:
-        combined = pd.concat(dfs, ignore_index=True)
+            # Filter by date partitions
+            months = set()
+            d = start_dt
+            while d <= target_dt:
+                months.add((str(d.year), f"{d.month:02d}"))
+                if d.month == 12:
+                    d = datetime(d.year + 1, 1, 1)
+                else:
+                    d = datetime(d.year, d.month + 1, 1)
 
-        # Filter to date range
-        if "rcept_dt" in combined.columns:
-            combined = combined[
-                (combined["rcept_dt"] >= start_dt.strftime("%Y%m%d")) &
-                (combined["rcept_dt"] <= state.date)
-            ]
+            relevant_keys = []
+            for key in all_keys:
+                m = re.search(r'rcept_year=(\d{4})/rcept_month=(\d{2})/', key)
+                if m and (m.group(1), m.group(2)) in months:
+                    relevant_keys.append(key)
+                elif not m:
+                    relevant_keys.append(key)
 
+            if not relevant_keys and all_keys:
+                relevant_keys = all_keys
+
+            df_facts = _read_parquet_keys(relevant_keys, limit_rows=50000)
+            if len(df_facts) > 0:
+                if "rcept_dt" in df_facts.columns:
+                    df_facts = df_facts[
+                        (df_facts["rcept_dt"].astype(str) >= start_dt.strftime("%Y%m%d")) &
+                        (df_facts["rcept_dt"].astype(str) <= state.date)
+                    ]
+                combined = df_facts
+                logger.info("Step 3: DART loaded via material_event facts — %d rows", len(combined))
+        except Exception as e:
+            logger.debug("Step 3: material_event read skipped: %s", e)
+
+    # Path 3: Legacy gold/dart/disclosure_events/dt= (may be deleted by compaction)
+    if combined is None or len(combined) == 0:
+        months_set = set()
+        d = start_dt
+        while d <= target_dt:
+            months_set.add(d.strftime("%Y-%m"))
+            d = datetime(d.year, d.month, 1) + timedelta(days=32)
+            d = datetime(d.year, d.month, 1)
+
+        dfs = []
+        for ym in sorted(months_set):
+            key = f"gold/dart/disclosure_events/dt={ym}/data.parquet"
+            try:
+                df = _read_parquet_s3(key)
+                dfs.append(df)
+                logger.info("Step 3 legacy: Loaded dt=%s: %d rows", ym, len(df))
+            except Exception:
+                pass
+
+        if dfs:
+            combined = pd.concat(dfs, ignore_index=True)
+            if "rcept_dt" in combined.columns:
+                combined = combined[
+                    (combined["rcept_dt"] >= start_dt.strftime("%Y%m%d")) &
+                    (combined["rcept_dt"] <= state.date)
+                ]
+
+    if combined is not None and len(combined) > 0:
         state.dart_events_df = combined
         logger.info("Step 3: DART events loaded — %d rows", len(combined))
     else:

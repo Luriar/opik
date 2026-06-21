@@ -1394,8 +1394,12 @@ def _process_telegram_message(chat_id, text, username, first_name):
 
     t0 = time.time()
     try:
+        # Context injection for follow-up messages is handled by
+        # _run_agent_pipeline() in agent_integration.py. Pass the
+        # original message so v10's short-message detection works correctly.
+        _augmented_text = text
         FakeReq = type("FakeReq", (), {
-            "message": text, "session_id": f"telegram_{chat_id}"
+            "message": _augmented_text, "session_id": f"telegram_{chat_id}"
         })
         import asyncio
         r = asyncio.run(v2_chat_handler(FakeReq()))
