@@ -132,6 +132,10 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
 
     t0 = time.time()
 
+    # DEBUG: log session_id and message length
+    logger.info("Agent pipeline: session_id=%s msg_len=%d msg_preview=%r",
+                 session_id, len(user_message), user_message[:80])
+
     # Step 0: Inject conversation context into the message when available.
     # This lets safety and intent agents resolve short references like
     # "이거 자세히 알려줘" or "챕터 2의 서막 내용 알려줘" that refer to

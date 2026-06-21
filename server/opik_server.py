@@ -1394,25 +1394,10 @@ def _process_telegram_message(chat_id, text, username, first_name):
 
     t0 = time.time()
     try:
-        # Inject conversation context for follow-up messages.
-        # Messages like "이거 자세히 알려줘" or "챕터 2의 서막 내용 알려줘"
-        # make no sense without the previous turn. Prepend context tags
-        # so safety/intent agents can resolve references.
+        # Context injection for follow-up messages is handled by
+        # _run_agent_pipeline() in agent_integration.py. Pass the
+        # original message so v10's short-message detection works correctly.
         _augmented_text = text
-        _ctx = conversation_store.get_context_for_prompt(f"telegram_{chat_id}")
-        if _ctx:
-            _followup_words = ["이거", "저거", "그거", "이것", "저것", "그것",
-                               "이 리포트", "저 리포트", "그 리포트",
-                               "자세히", "더 자세히", "더 알려줘",
-                               "이 종목", "저 종목", "이 공시", "저 공시"]
-            _cleaned = text.strip()
-            if len(_cleaned) <= 40 and any(w in _cleaned for w in _followup_words):
-                _augmented_text = (
-                    "[이전 대화에서 논의된 증권사 리포트에 대한 후속 질문입니다.\n"
-                    f"이전 대화 내용:\n{_ctx}\n\n"
-                    f"사용자의 후속 질문:\n{text}"
-                )
-                logger.info("TG follow-up: augmenting message with %d chars of context", len(_ctx))
         FakeReq = type("FakeReq", (), {
             "message": _augmented_text, "session_id": f"telegram_{chat_id}"
         })
