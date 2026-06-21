@@ -276,12 +276,9 @@ def _run_analysis_with_data(analysis_type: str, sources: list,
             return None
 
         if analysis_type == "compare":
-            if len(companies) >= 2:
-                stock_codes = intent_info.get("stock_codes", [])
-                result = agent_integration._analysis.compare_stocks(converted, companies, stock_codes)
-                logger.info("Compare: compare_stocks for %d companies", len(companies))
-            else:
-                result = agent_integration._analysis.compare_reports(converted, ticker_name)
+            # compare_reports expects List[dict] — pass converted directly
+            # (Stage 2 already fetched data for all companies in the query)
+            result = agent_integration._analysis.compare_reports(converted, ticker_name)
             if result:
                 return agent_integration._composer.compose_chat_response(
                 intent=analysis_type,
@@ -885,6 +882,23 @@ async def chat(req: ChatRequest):
     date_from = req.date_from or intent.date_from
     date_to = req.date_to or intent.date_to
 
+    # Direct date extraction: "M월 D일" without year → (current_year)-MM-DD
+    # Haiku intent parser is unreliable for year inference on month-day patterns.
+    # Extract dates directly from user text to guarantee correct year.
+    _month_day_pat = re.search(r'(?<!\d)(\d{1,2})월\s*(\d{1,2})일', req.message)
+    if _month_day_pat and not re.search(r'\d{4}년', req.message):
+        from datetime import datetime as _dt
+        _cur_year = str(_dt.now().year)
+        _m = _month_day_pat.group(1).zfill(2)
+        _d = _month_day_pat.group(2).zfill(2)
+        _extracted = f"{_cur_year}-{_m}-{_d}"
+        logger.info("Direct date: '%s월 %s일' → %s (overriding Haiku intent)",
+                     _month_day_pat.group(1), _month_day_pat.group(2), _extracted)
+        date_from = _extracted
+        date_to = _extracted
+        intent_info["date_from"] = _extracted
+        intent_info["date_to"] = _extracted
+
     # Check if the user message contains explicit date text
     _has_explicit_date = bool(
         re.search(r'\d{4}년|\d{1,2}월\s*\d{1,2}일|\d{4}-\d{2}-\d{2}|어제|오늘|그제', req.message)
@@ -1129,7 +1143,11 @@ async def chat(req: ChatRequest):
                              or conversation_store.get_recent_full_date(session_id)
                              or "지정된")
             return ChatResponse(
-                answer=f"해당 날짜({_display_date})의 DART 공시 데이터가 없습니다.",
+                answer=(
+                f"해당 날짜({_display_date})의 DART 공시 데이터가 없습니다.\n\n"
+                "DART 공시 데이터는 2026년 3월까지 적재되어 있습니다.\n"
+                "최신 공시는 3월 이전 날짜로 조회해 주세요."
+            ),
                 sources=[],
                 elapsed_ms=round((time.time() - t0) * 1000, 1),
                 intent=intent_info,
@@ -1363,6 +1381,17 @@ def _process_telegram_message(chat_id, text, username, first_name):
     if not is_approved(chat_id):
         _send_telegram(chat_id, "승인 대기 중입니다.")
         return
+
+    # Show typing indicator
+    if TELEGRAM_BOT_TOKEN:
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendChatAction",
+                json={"chat_id": chat_id, "action": "typing"}, timeout=5
+            )
+        except Exception:
+            pass
+
     t0 = time.time()
     try:
         FakeReq = type("FakeReq", (), {
@@ -1412,7 +1441,7 @@ def _telegram_polling_loop(stop_event):
 @app.post("/telegram/webhook")
 async def telegram_webhook(req: Request):
     if not TELEGRAM_BOT_TOKEN:
-        raise HTTPException(status_code=503)
+        raise HTTPException(503)
     body = await req.json()
     msg = body.get("message", {})
     if not msg:

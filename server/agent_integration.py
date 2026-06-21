@@ -89,6 +89,29 @@ def get_agent_status() -> dict:
     }
 
 
+def _format_date_browse(date_str: str, results: list) -> str:
+    """Format date-based browse results directly — no LLM summarise needed."""
+    if not results:
+        return f"해당 날짜({date_str})의 증권사 리포트 데이터가 없습니다."
+
+    lines = [f"*{date_str} 증권사 리포트* ({len(results)}건)", ""]
+    for r in results[:20]:
+        reason = r.get("reason", "") or ""
+        kw = r.get("keywords", "") or ""
+        risk = r.get("risks", "") or ""
+        lines.append(f"• {reason}")
+        if kw:
+            lines.append(f"  키워드: {kw}")
+        if risk:
+            lines.append(f"  리스크: {risk}")
+        lines.append("")
+
+    if len(results) > 20:
+        lines.append(f"... 외 {len(results) - 20}건")
+    lines.append("※ 본 정보는 증권사 리포트의 사실적 요약이며 투자 권유가 아닙니다.")
+    return "\n".join(lines)
+
+
 def _run_agent_pipeline(user_message: str) -> dict:
     """Run the full agent pipeline for one user message.
 
@@ -129,6 +152,20 @@ def _run_agent_pipeline(user_message: str) -> dict:
     intent = intent_result["intent"]
     params = intent_result.get("intent_params", {})
 
+    # Direct date extraction: "M월 D일" without year → (current_year)-MM-DD
+    # Haiku intent parser is unreliable for year inference on month-day patterns.
+    _md = __import__("re").search(r"(?<!\d)(\d{1,2})월\s*(\d{1,2})일", user_message)
+    if _md and not __import__("re").search(r"\d{4}년", user_message):
+        _cy = str(__import__("datetime").datetime.now().year)
+        _dm = _md.group(1).zfill(2)
+        _dd = _md.group(2).zfill(2)
+        _ed = f"{_cy}-{_dm}-{_dd}"
+        logger.info("Agent date extract: %s월 %s일 → %s", _md.group(1), _md.group(2), _ed)
+        params["date_from"] = _ed
+        params["date_to"] = _ed
+        if not params.get("ticker_names"):
+            params["ticker_names"] = []
+
     # Step 3: Route and execute
     route = _supervisor.route(True, intent, params)
 
@@ -160,20 +197,37 @@ def _run_agent_pipeline(user_message: str) -> dict:
         confidence = "high"
 
     elif route == "report_agent":
-        search_results = _report.search(user_message, top_k=10)
-        if search_results:
-            answer = _report.summarise(user_message, search_results)
-            sources = [r.get("report_id", "") for r in search_results]
-            confidence = "high"
+        if params.get("date_from") and not params.get("ticker_names"):
+            search_results = _report.search_by_date(params["date_from"], params["date_to"], limit=50)
+            logger.info("Using date-based browse for %s (%d results)", params["date_from"], len(search_results))
+            if search_results:
+                answer = _format_date_browse(params["date_from"], search_results)
+                sources = [r.get("report_id", "") for r in search_results]
+                confidence = "high"
+            else:
+                answer = f"해당 날짜({params['date_from']})의 증권사 리포트 데이터가 없습니다."
+                sources = []
+                confidence = "low"
         else:
-            ticker_names = params.get("ticker_names", [])
-            names_str = ", ".join(ticker_names) if ticker_names else "해당 조건"
-            answer = f"{names_str}으로 검색된 애널리스트 리포트가 없습니다."
-            confidence = "low"
+            search_results = _report.search(user_message, top_k=10)
+            if search_results:
+                answer = _report.summarise(user_message, search_results)
+                sources = [r.get("report_id", "") for r in search_results]
+                confidence = "high"
+            else:
+                ticker_names = params.get("ticker_names", [])
+                names_str = ", ".join(ticker_names) if ticker_names else "해당 조건"
+                answer = f"{names_str}으로 검색된 애널리스트 리포트가 없습니다."
+                confidence = "low"
 
     elif route == "report_with_analysis":
-        search_results = _report.search(user_message, top_k=10)
-        report_summary = _report.summarise(user_message, search_results) if search_results else ""
+        if params.get("date_from") and not params.get("ticker_names"):
+            search_results = _report.search_by_date(params["date_from"], params["date_to"], limit=50)
+            logger.info("Using date-based browse for %s (%d results)", params["date_from"], len(search_results))
+            report_summary = _format_date_browse(params["date_from"], search_results) if search_results else ""
+        else:
+            search_results = _report.search(user_message, top_k=10)
+            report_summary = _report.summarise(user_message, search_results) if search_results else ""
         ticker_name = params.get("ticker_names", [""])[0] if params.get("ticker_names") else ""
 
         analysis = ""
@@ -214,9 +268,13 @@ def _run_agent_pipeline(user_message: str) -> dict:
     elif route == "hybrid_parallel":
         report_summary = ""
         dart_summary = ""
-        search_results = _report.search(user_message, top_k=10)
-        if search_results:
-            report_summary = _report.summarise(user_message, search_results)
+        if params.get("date_from") and not params.get("ticker_names"):
+            search_results = _report.search_by_date(params["date_from"], params["date_to"], limit=50)
+            logger.info("Using date-based browse for %s (%d results)", params["date_from"], len(search_results))
+            report_summary = _format_date_browse(params["date_from"], search_results) if search_results else ""
+        else:
+            search_results = _report.search(user_message, top_k=10)
+            report_summary = _report.summarise(user_message, search_results) if search_results else ""
             sources = [r.get("report_id", "") for r in search_results]
 
         ticker_names = params.get("ticker_names", [])
