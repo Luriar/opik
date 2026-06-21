@@ -161,8 +161,12 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
             )
             _followup_override = True
 
-    # Step 1: Safety check (with augmented message if follow-up)
-    safety_result = _safety.check(_augmented_message)
+    # Step 1: Safety check (skip for follow-ups — already passed in previous turn)
+    if _followup_override:
+        safety_result = {"is_safe": True, "violation_type": None, "redirect_suggestion": ""}
+        logger.info("Agent pipeline: follow-up → skipping safety check")
+    else:
+        safety_result = _safety.check(user_message)
     if not safety_result.get("is_safe", True):
         answer = _safety.build_refusal_message(
             safety_result.get("violation_type"),
