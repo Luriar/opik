@@ -1,0 +1,93 @@
+aws_region  = "ap-northeast-2"
+project_name = "opik"
+environment = "dev"
+
+# Keep this true for dev cost control. Use false in production for AZ-local NAT.
+single_nat_gateway = true
+
+# Data bucket. Leave null to use opik-dev-<account-id>-ap-northeast-2-data.
+# To use an existing bucket with real data, set its name and manage_data_bucket=false
+# so Terraform only references it (never creates/owns/destroys it).
+data_bucket_name   = "s3-opik-bucket"
+manage_data_bucket = false
+
+# Airflow UI is published via the front proxy on :8080, restricted to these CIDRs.
+# Set to your own public IP /32. Empty list = UI not reachable from the internet
+# (use SSM port forwarding instead). Edit whenever your IP changes.
+admin_airflow_cidrs = ["203.0.113.10/32"]
+
+# Public API ALB ingress. Restrict this when the API is not intended for public use.
+alb_ingress_cidrs = ["0.0.0.0/0"] # Public ALB/front proxy ingress.
+
+# Set this to enable HTTPS listener and HTTP->HTTPS redirect.
+certificate_arn = null
+
+rds_instance_class           = "db.t4g.micro"
+rds_allocated_storage_gb     = 20
+rds_max_allocated_storage_gb = 100
+rds_multi_az                 = false
+rds_deletion_protection      = false
+rds_skip_final_snapshot      = true
+
+create_redis = false
+
+# Public front layer for accounts without ELBv2 permissions.
+create_front_proxy        = true
+front_proxy_instance_type = "t4g.nano"
+
+airflow_instance_type = "r6g.large"
+api_instance_type     = "r6g.large"
+
+# Optional. SSH ingress is intentionally not opened by Terraform.
+ec2_key_name = null
+
+# Used by EC2 user-data to deploy the FastAPI/RAG application.
+repo_url = "https://github.com/Luriar/opik.git"
+
+# ---------------------------------------------------------------------------
+# Application runtime configuration (NON-SECRET only).
+#
+# These mirror the non-secret keys from the repository .env. Override any value
+# here at deploy time; omit a block to use the defaults in variables.tf.
+#
+# NEVER put secrets in this file:
+#   - AWS access keys      -> not needed; the EC2 IAM role provides credentials
+#   - DART_API_KEYS        -> Secrets Manager runtime container (see DEPLOYMENT.md)
+#   - Bedrock / Airflow keys / DB passwords -> Secrets Manager (see DEPLOYMENT.md)
+# Airflow-internal settings (executor, UID, fernet/secret keys, DB URLs,
+# timezone) are NOT configured here; the EC2 bootstrap handles them.
+# ---------------------------------------------------------------------------
+
+# S3 data-lake layout. The bucket name itself is data_bucket_name above.
+storage_config = {
+  storage_backend         = "auto"            # auto | s3 | local
+  local_storage_base_path = "/opt/airflow/data"
+  s3_base_prefix          = ""                # optional global prefix; "" = bucket root
+  bronze_prefix           = "bronze/dart"
+  silver_prefix           = "silver/dart"
+  gold_prefix             = "gold/dart"
+}
+
+# DART ingestion tuning. DART_API_KEYS is a SECRET and is intentionally absent.
+dart_config = {
+  backfill_months           = 12
+  backfill_start_date       = "2025-06-13"
+  backfill_end_date         = "2026-06-13"
+  incremental_days          = 3
+  listed_company_schedule   = "1 9 * * 1-5"   # Asia/Seoul business days 09:01
+  collect_mode              = "both"          # structured | document | both
+  daily_limit               = 40000           # per DART account/day
+  daily_safe_limit          = 36000
+  daily_emergency_limit     = 39000
+  minute_limit              = 1000
+  minute_safe_limit         = 900
+  quota_request_log_enabled = true
+}
+
+# Gold-layer embedding model. Keep aligned between Airflow and the API/RAG side.
+embedding_config = {
+  provider  = "e5"
+  model     = "intfloat/multilingual-e5-small"
+  version   = "v1"
+  dimension = 384
+}
