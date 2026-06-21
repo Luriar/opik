@@ -182,18 +182,59 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
             "elapsed_ms": elapsed,
         }
 
-    # Step 2: Intent parsing
-    # When context exists, tell Haiku to use it and pass it in the prompt.
-    # Also, treat short messages with context as likely report_search to
-    # avoid the "general" misclassification of follow-ups.
+    # Step 2: Intent parsing.
+    #
+    # Three cases:
+    # 1) context + short msg -> force report_search (Haiku misclassifies follow-ups)
+    # 2) NO context + short msg -> try keyword search, fall through to natural re-ask
+    #    (handles TTL expiry gracefully - no "session expired" system message)
+    # 3) normal message -> full intent parsing via Haiku
     if _context and len(user_message.strip()) <= 60:
-        logger.info("Agent pipeline: short msg + context → forcing report_search intent")
+        logger.info("Agent pipeline: short msg + context -> forcing report_search intent")
         intent = "report_search"
         params = {
             "tickers": [], "ticker_names": [], "brokerages": [], "sectors": [],
             "time_range": None, "keywords": [user_message.strip()],
             "compare": False, "cause_tracking": False, "interpret": False,
             "is_greeting": False, "response_style": "detailed",
+        }
+    elif not _context and len(user_message.strip()) <= 60:
+        _followup_hints = ["이거", "저거", "그거", "이것", "저것", "그것",
+                           "자세히", "더 알려줘", "알려줘", "내용",
+                           "이 리포트", "저 리포트", "이 종목", "이 공시"]
+        _kw_text = user_message.strip()
+        for _w in _followup_hints:
+            _kw_text = _kw_text.replace(_w, " ")
+        _kw_text = " ".join(_kw_text.split())
+        if _kw_text:
+            logger.info("Agent pipeline: no-context short msg -> keyword search: %r", _kw_text)
+            _search_results = _report.search(_kw_text, top_k=5)
+            if _search_results:
+                _answer = _report.summarise(_kw_text, _search_results)
+                _elapsed = (time.time() - t0) * 1000
+                logger.info("Agent pipeline: no-context keyword search: %d results (%.0fms)",
+                            len(_search_results), _elapsed)
+                return {
+                    "answer": _answer,
+                    "sources": [r.get("report_id", "") for r in _search_results],
+                    "intent": "report_search",
+                    "confidence": "medium",
+                    "violation_type": None,
+                    "elapsed_ms": _elapsed,
+                }
+            logger.info("Agent pipeline: no-context keyword search found nothing for %r", _kw_text)
+        _elapsed = (time.time() - t0) * 1000
+        return {
+            "answer": (
+                "어떤 리포트나 종목을 찾으시는지 구체적으로 말씀해 주시면 검색해 드릴게요.\n\n"
+                "예를 들어 '삼성전자 리포트 보여줘', '6월 18일 리포트', "
+                "'최근 반도체 공시 알려줘'처럼 말씀해 주세요."
+            ),
+            "sources": [],
+            "intent": "general",
+            "confidence": "low",
+            "violation_type": None,
+            "elapsed_ms": _elapsed,
         }
     else:
         intent_result = _intent.parse(user_message, conversation_context=_context)
