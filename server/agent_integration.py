@@ -160,9 +160,21 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
     # already passed safety on their first turn, and short follow-up messages
     # like "이거 자세히 알려줘" are consistently misclassified as out_of_domain
     # by Haiku even with full context.
-    if _context:
+    # Skip safety for follow-up scenarios:
+    # - has conversation context (user already passed safety on turn 1)
+    # - short message with reference words (Haiku misclassifies as out_of_domain)
+    _is_followup_like = (
+        len(user_message.strip()) <= 60
+        and any(w in user_message for w in [
+            "이거", "저거", "그거", "이것", "저것", "그것",
+            "자세히", "더 알려줘", "더 보여줘", "내용 알려줘",
+            "이 리포트", "저 리포트", "이 종목", "이 공시"
+        ])
+    )
+    if _context or _is_followup_like:
         safety_result = {"is_safe": True, "violation_type": None, "redirect_suggestion": ""}
-        logger.info("Agent pipeline: skipping safety check (has %d chars of context)", len(_context))
+        logger.info("Agent pipeline: skipping safety (context=%d followup=%s)",
+                     len(_context), _is_followup_like)
     else:
         safety_result = _safety.check(_msg_for_safety)
     if not safety_result.get("is_safe", True):
