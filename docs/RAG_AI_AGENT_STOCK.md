@@ -437,18 +437,17 @@ Gold 로드(리포트 3일 lookback + DART + 모델)
 | Airflow | Docker Compose, CeleryExecutor |
 | 서버 | systemd `opik-server` (uvicorn, port 8000), `/root/opik-server/` |
 | FAISS | 인메모리, 299,596 vectors, 384d |
-| Delta Lake | Gold Parquet 일별 MERGE (`spark-delta-merge.timer`, 06:50 KST) |
+| Delta Lake | Gold Parquet 일별 MERGE (`spark-delta-merge.timer`, 23:00 KST) — 야간 최적화, 아침 파이프라인과 무관 |
 | LLM | AWS Bedrock — Haiku 3.0 (경량), Sonnet (중간), Opus (분석) |
 
 #### 오케스트레이션 타임라인 (KST, 평일)
 
 ```
-00:00  수집 브론즈·실버 파이프라인 시작
-05:00  DART raw_to_silver
+05:00  DART raw_to_silver (DartCollector)
 06:00  daily_ohlcv_collection DAG (FinanceDataReader)
 06:30  model_daily_prediction DAG (LightGBM 재학습·예측·Top10)
-06:50  spark-delta-merge.timer (Delta Lake MERGE)
 07:00  opik_briefing DAG (★/! 브리핑 → 텔레그램 발송)
+23:00  spark-delta-merge.timer (Delta MERGE + FAISS rebuild — 야간 최적화)
 ```
 
 > **2026-06-22 현재**: 3개 DAG 모두 unpaused, 정상 작동 중. OHLCV 06:00 / Model 06:30 / Briefing 07:00 KST.
@@ -462,7 +461,7 @@ Gold 로드(리포트 3일 lookback + DART + 모델)
 | OHLCV 수집 소스 | pykrx | FinanceDataReader (주력) + pykrx (fallback) |
 | OHLCV DAG | 없음 | `daily_ohlcv_collection` 06:00 KST Mon-Fri |
 | Model DAG 시간 | 06:00 KST | 06:30 KST (OHLCV 완료 후) |
-| 타임라인 | 00:00 수집 → 06:00 모델 → 07:00 브리핑 | 06:00 OHLCV → 06:30 모델 → 06:50 Delta → 07:00 브리핑 |
+| 타임라인 | 00:00 수집 → 06:00 모델 → 07:00 브리핑 | 06:00 OHLCV → 06:30 모델 → 07:00 브리핑 (Delta는 23:00 야간, 분리) |
 | FAISS 벡터 수 | 51,583 | 299,596 (리포트 + DART 통합) |
 | DART FAISS | "OPIK 과제" | 통합 완료 (297K DART vectors) |
 | DART Gold 경로 | "더미 경로 → 이행 예정" | DartCollector v2 정본 경로 통합 완료 |
@@ -471,4 +470,4 @@ Gold 로드(리포트 3일 lookback + DART + 모델)
 | 한국투자증권 | 미기재 | 수집기 개발 완료 (618건 dry-run) |
 | 검색 방식 | FAISS only | FAISS + `search_by_date()` (S3 Parquet 직접 스캔) 병행 |
 | 최신성 필터 | 없음 | 180일 리컨시 필터 (2026-06-22 추가) |
-| 날짜 질문 | 미대응 | 순수 날짜 질문 short-circuit 감지 (2026-06-22 추가) |
+| 날짜 질문 | 미대응 | 
