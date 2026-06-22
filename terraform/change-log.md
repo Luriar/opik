@@ -558,3 +558,244 @@ terraform plan -var=repo_url=https://github.com/Luriar/opik.git -detailed-exitco
 ### AWS verification result
 
 - 실제 AWS apply/verification은 수행하지 않음.
+
+## 2026-06-22 — Airflow UI 8080 접근 불가 원인 확인 및 admin CIDR 갱신
+
+### Date
+
+2026-06-22
+
+### Goal
+
+- 현재 PC에서 Terraform 배포 후 public page 접근이 안 되는 원인을 확인하고, 필요한 범위만 조치한다.
+
+### Current phase
+
+- 조치 및 실제 endpoint 검증 완료.
+
+### Findings
+
+- FastAPI/chat public entrypoint는 정상:
+  - `http://15.165.237.95/health` → HTTP 200
+  - `http://15.165.237.95/` → HTTP 200, `chat.html` 반환
+- 접근 불가 대상은 Airflow UI `http://15.165.237.95:8080`.
+- 원인: `terraform/envs/dev/terraform.tfvars`의 `admin_airflow_cidrs`가 예시값 `203.0.113.10/32`로 남아 있었고, 현재 PC public IP는 `222.108.125.33`.
+- AWS 상태:
+  - API EC2, Airflow EC2, front proxy EC2 모두 `running`.
+  - SSM ping 모두 `Online`.
+  - Airflow 내부 health는 SG 변경 후 public 경로에서 정상 응답.
+
+### Changes made
+
+- `terraform/envs/dev/terraform.tfvars`:
+  - `admin_airflow_cidrs = ["203.0.113.10/32"]`
+  - → `admin_airflow_cidrs = ["222.108.125.33/32"]`
+- AWS Security Group 즉시 조치:
+  - front proxy SG `sg-0e48922bb46f2bca0`
+    - revoke `203.0.113.10/32:8080`
+    - authorize `222.108.125.33/32:8080`
+  - Airflow SG `sg-0fef853375dd349d4`
+    - revoke `203.0.113.10/32:8080`
+    - authorize `222.108.125.33/32:8080`
+
+### Commands run
+
+- `aws sts get-caller-identity`
+- `aws ec2 describe-instances`
+- `aws ssm describe-instance-information`
+- `aws ec2 describe-security-groups`
+- `aws ec2 revoke-security-group-ingress`
+- `aws ec2 authorize-security-group-ingress`
+- `Invoke-WebRequest http://15.165.237.95/health`
+- `Invoke-WebRequest http://15.165.237.95/`
+- `Invoke-WebRequest http://15.165.237.95:8080/health`
+
+### Validation result
+
+- `http://15.165.237.95:8080/health` → HTTP 200.
+- Airflow health response:
+  - metadatabase: healthy
+  - scheduler: healthy
+  - triggerer: healthy
+- `http://15.165.237.95:8080/` → HTTP 302 to `/home`, Airflow UI route reachable.
+
+### AWS verification result
+
+- front proxy SG 8080 ingress now includes `222.108.125.33/32`.
+- Airflow SG 8080 direct admin ingress now includes `222.108.125.33/32`.
+- Airflow SG still allows 8080 from front proxy SG.
+
+### Notes / Remaining
+
+- Terraform CLI is not available on this shell's PATH, so `terraform plan/apply` was not run here.
+- `terraform.tfvars` is gitignored local configuration. If the public IP changes again, update `admin_airflow_cidrs` and re-apply, or repeat the SG update.
+- The immediate AWS CLI SG update may be reconciled by the next Terraform run. The local `terraform.tfvars` value has been updated to the same CIDR to keep intent aligned.
+
+## 2026-06-22 — Airflow 로그인 redirect 포트 누락 수정 및 FastAPI 채팅 검증
+
+### Date
+
+2026-06-22
+
+### Goal
+
+- Airflow UI 로그인 후 접속 실패 원인을 확인하고 조치한다.
+- FastAPI 채팅 페이지가 실제로 접근/호출 가능한지 확인한다.
+
+### Current phase
+
+- 조치 및 public endpoint 재검증 완료.
+
+### Findings
+
+- Airflow UI 자체는 `http://15.165.237.95:8080/login/`에서 HTTP 200으로 열렸다.
+- 로그인 전 `/home` 접근 redirect가 다음처럼 생성되어 있었다.
+  - 수정 전: `/login/?next=http%3A%2F%2F15.165.237.95%2Fhome`
+  - 문제: public Airflow 포트 `:8080`이 빠져 로그인 후 `http://15.165.237.95/home`으로 이동할 수 있음.
+- 원인: front proxy nginx가 `proxy_set_header Host $host;`로 upstream에 전달하고 있었다. nginx `$host`는 포트가 제거될 수 있어 Airflow가 외부 URL을 잘못 계산했다.
+- Apache Airflow 공식 reverse proxy 문서는 nginx 예시에서 `proxy_set_header Host $http_host;`, `X-Forwarded-For`, `X-Forwarded-Proto` 전달을 제시한다. 현재 수정은 이 방향에 맞춘 것이다.
+- FastAPI/chat public endpoint는 정상:
+  - `http://15.165.237.95/` → HTTP 200, `chat.html` 반환
+  - `http://15.165.237.95/health` → HTTP 200
+  - `POST http://15.165.237.95/chat` → HTTP 200, JSON 응답 반환
+- `POST http://15.165.237.95/api/chat`는 HTTP 404가 맞다. 현재 `server/chat.html`은 `/chat`을 호출한다.
+
+### Changes made
+
+- `terraform/modules/compute/user_data/front_proxy.sh.tftpl`
+  - API proxy와 Airflow proxy 모두 `Host $host`를 `Host $http_host`로 변경.
+  - `X-Forwarded-Host $http_host`, `X-Forwarded-Port $server_port` 추가.
+- 실행 중인 front proxy EC2 `i-0de3979e28efab599`에 SSM으로 동일 nginx 설정 hotfix 적용.
+  - `/etc/nginx/conf.d/opik-airflow.conf` 백업 생성.
+  - `/etc/nginx/conf.d/opik-api.conf`도 Terraform 템플릿과 맞게 동일 proxy header 설정으로 갱신.
+  - `nginx -t` 성공 후 `systemctl reload nginx`.
+
+### Commands run
+
+- `Invoke-WebRequest http://15.165.237.95/`
+- `Invoke-WebRequest http://15.165.237.95/health`
+- `Invoke-WebRequest -Method POST http://15.165.237.95/chat`
+- `curl.exe -i -L http://15.165.237.95:8080/`
+- `curl.exe -i http://15.165.237.95:8080/login/`
+- `aws ssm send-command` for front proxy nginx hotfix
+- `aws ssm get-command-invocation`
+- Airflow login POST 검증: Secrets Manager의 기존 관리자 계정을 프로세스 내부 변수로만 사용, 값 미출력
+
+### Validation result
+
+- SSM hotfix command status: `Success`.
+- `nginx -t`: successful.
+- Airflow redirect 재검증:
+  - 수정 후: `/login/?next=http%3A%2F%2F15.165.237.95%3A8080%2Fhome`
+  - `:8080` 유지 확인.
+- Airflow 로그인 POST:
+  - HTTP 302
+  - `Location: http://15.165.237.95:8080/home`
+  - 로그인 세션으로 `/home` 접근 시 HTTP 200 및 인증된 Airflow UI content 확인.
+- FastAPI 채팅:
+  - `/chat` POST HTTP 200 및 JSON 응답 확인.
+  - API proxy header 갱신 후에도 `/`, `/health`, `/chat` 모두 HTTP 200 확인.
+
+### AWS verification result
+
+- front proxy EC2 `i-0de3979e28efab599`: SSM Online, nginx reload 성공.
+- API EC2와 Airflow EC2는 기존 health 경로 정상.
+
+### Notes / Remaining
+
+- Terraform CLI가 현재 PC PATH에 없어 `terraform fmt/plan/apply`는 실행하지 못했다.
+- Terraform 템플릿은 수정했지만, 현재 EC2에는 SSM hotfix로 먼저 반영했다. 추후 Terraform apply 시 front proxy user-data 변경으로 인스턴스 교체가 발생할 수 있다.
+- FastAPI 채팅 URL은 `/chat`이다. `/api/chat`는 현재 서버 코드 기준으로 존재하지 않는다.
+
+## 2026-06-22 — FastAPI S3 env 확인 및 FAISS rebuild 저장 누락 수정
+
+### Date
+
+2026-06-22
+
+### Goal
+
+- FastAPI 내부 S3 관련 환경변수를 확인하고, S3 embedding 데이터를 찾지 못하는 원인을 확인/조치한다.
+
+### Current phase
+
+- 원인 수정 및 public endpoint 검증 완료.
+
+### Findings
+
+- FastAPI EC2 `i-044977c222032e407`의 `/opt/opik/bootstrap.env`와 실제 `uvicorn` 프로세스 env는 동일했다.
+- 확인된 S3/embedding 관련 env:
+  - `AWS_REGION=ap-northeast-2`
+  - `AWS_DEFAULT_REGION=ap-northeast-2`
+  - `S3_REGION=ap-northeast-2`
+  - `S3_BUCKET=s3-opik-bucket`
+  - `S3_BASE_PREFIX=`
+  - `STORAGE_BACKEND=auto`
+  - `BRONZE_PREFIX=bronze/dart`
+  - `SILVER_PREFIX=silver/dart`
+  - `GOLD_PREFIX=gold/dart`
+  - `EMBEDDING_PROVIDER=e5`
+  - `EMBEDDING_MODEL=intfloat/multilingual-e5-small`
+  - `EMBEDDING_VERSION=v1`
+  - `EMBEDDING_DIMENSION=384`
+  - `FAISS_INDEX_PATH=/data/opik/faiss_index.bin`
+  - `FAISS_IDMAP_PATH=/data/opik/report_ids.json`
+- S3에는 FastAPI가 읽는 prefix `gold/embeddings/`에 parquet 66개, 약 126MB가 존재했다.
+- 문제 원인은 env가 아니라 `server/opik_server.py`의 `build_index_from_s3()` 구현 누락이었다.
+  - S3에서 parquet를 찾고 embedding 배열을 모으는 부분까지는 실행됐다.
+  - 이후 FAISS index 생성, `/data/opik/faiss_index.bin` 저장, `report_ids.json` 저장, global `faiss_index` 갱신, `return n` 코드가 비어 있었다.
+  - 그 결과 `/index/rebuild`가 HTTP 200으로 끝나도 `/index/status`는 계속 `ready=false`, `size=0`이었다.
+
+### Changes made
+
+- `server/opik_server.py`
+  - `build_index_from_s3()` 끝부분에 FAISS `IndexIDMap(IndexFlatIP)` 생성 로직 추가.
+  - `FAISS_INDEX_PATH`, `FAISS_IDMAP_PATH`, `/data/opik/report_info.json` 저장 로직 추가.
+  - global `faiss_index`, `report_ids` 갱신 및 `return n` 추가.
+- 실행 중인 API EC2 `i-044977c222032e407`에도 SSM으로 동일 hotfix 적용.
+  - `/opt/opik/repo/server/opik_server.py` 백업 생성.
+  - `py_compile` 후 `opik-server` 재시작.
+  - startup rebuild로 S3 `gold/embeddings/`에서 FAISS index 생성.
+
+### Commands run
+
+- `aws ssm send-command` / `aws ssm get-command-invocation`
+- `aws s3api list-objects-v2 --bucket s3-opik-bucket --prefix gold/embeddings/`
+- EC2 내부:
+  - filtered `/opt/opik/bootstrap.env` 확인
+  - filtered `/proc/<uvicorn-pid>/environ` 확인
+  - `systemctl cat opik-server`
+  - `curl http://127.0.0.1:8000/index/status`
+  - `curl http://127.0.0.1:8000/health`
+  - `systemctl restart opik-server`
+- Public endpoint:
+  - `GET http://15.165.237.95/index/status`
+  - `GET http://15.165.237.95/health`
+  - `POST http://15.165.237.95/search`
+
+### Validation result
+
+- 수정 전:
+  - `/data/opik`에 `faiss_index.bin`, `report_ids.json` 없음.
+  - `/health` → `index_size=0`
+  - `/index/status` → `ready=false`, `size=0`
+- 수정 후:
+  - API 로그: `FAISS index built from S3: 51646 vectors, dim=384`
+  - `/data/opik/faiss_index.bin` 생성: 77MB
+  - `/data/opik/report_ids.json` 생성: 1.2MB
+  - `/data/opik/report_info.json` 생성: 27MB
+  - Public `/index/status` → `{"ready":true,"size":51646,"dim":384}`
+  - Public `/health` → `index_size=51646`
+  - Public `/search` → HTTP 200, 검색 결과 반환
+
+### AWS verification result
+
+- API EC2 `i-044977c222032e407`: `opik-server` active.
+- S3 `s3-opik-bucket/gold/embeddings/`: parquet 66개 확인.
+- front proxy는 현재 API private IP `10.20.11.37:8000`으로 proxy 중임을 확인.
+
+### Notes / Remaining
+
+- 현재 API EC2에는 SSM hotfix로 즉시 반영했다. 인스턴스가 교체되면 Git/배포 코드 기준으로 다시 적용되므로 `server/opik_server.py` 변경을 commit/push해야 유지된다.
+- `GOLD_PREFIX=gold/dart`는 DART/storage 계층용 env이고, 현재 FastAPI FAISS rebuild 코드는 `gold/embeddings/`를 하드코딩으로 읽는다. 이 동작은 현재 코드 기준 확인 내용이다.
+- 검색 결과의 일부 한글 필드명이 깨져 보이는 현상은 별도 인코딩/컬럼명 정리 이슈로 보인다. 이번 조치는 FAISS index 적재/검색 가능 상태 복구에 한정했다.
