@@ -1569,3 +1569,25 @@ def build_index_from_s3():
     n = len(all_embeddings)
     if n == 0:
         raise RuntimeError("No embeddings found in S3")
+
+    dim = all_embeddings[0].shape[0]
+    if dim != EMBEDDING_DIM:
+        logger.warning("Embedding dimension mismatch: expected=%d actual=%d", EMBEDDING_DIM, dim)
+
+    vectors = np.array(all_embeddings, dtype=np.float32)
+    ids = np.arange(n, dtype=np.int64)
+
+    new_index = faiss.IndexIDMap(faiss.IndexFlatIP(dim))
+    new_index.add_with_ids(vectors, ids)
+
+    os.makedirs(os.path.dirname(FAISS_INDEX_PATH), exist_ok=True)
+    faiss.write_index(new_index, FAISS_INDEX_PATH)
+    with open(FAISS_IDMAP_PATH, "w", encoding="utf-8") as f:
+        json.dump(all_ids, f, ensure_ascii=False)
+    with open("/data/opik/report_info.json", "w", encoding="utf-8") as f:
+        json.dump(report_texts, f, ensure_ascii=False, default=str)
+
+    faiss_index = new_index
+    report_ids = all_ids
+    logger.info("FAISS index built from S3: %d vectors, dim=%d", n, dim)
+    return n
