@@ -220,15 +220,27 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
         }
 
     # Step 2: Intent parsing.
+    # Short message with context: try intent parser first to catch DART/disclosure queries.
+    # Only force report_search if the parser doesn't clearly identify a non-report intent.
     if _context and len(user_message.strip()) <= 60:
-        logger.info("Agent pipeline: short msg + context -> forcing report_search intent")
-        intent = "report_search"
-        params = {
-            "tickers": [], "ticker_names": [], "brokerages": [], "sectors": [],
-            "time_range": None, "keywords": [user_message.strip()],
-            "compare": False, "cause_tracking": False, "interpret": False,
-            "is_greeting": False, "response_style": "detailed",
-        }
+        _quick_intent = _intent.parse(user_message)
+        _qi = _quick_intent["intent"]
+        if _qi in ("dart_disclosure", "dart_financial", "dart_insider", "dart_shareholder"):
+            logger.info("Agent pipeline: short msg with context -> DART intent %s detected, using parser", _qi)
+            intent = _qi
+            params = _quick_intent.get("intent_params", {})
+        elif _qi == "hybrid":
+            intent = _qi
+            params = _quick_intent.get("intent_params", {})
+        else:
+            logger.info("Agent pipeline: short msg + context -> forcing report_search intent (parser said %s)", _qi)
+            intent = "report_search"
+            params = {
+                "tickers": [], "ticker_names": [], "brokerages": [], "sectors": [],
+                "time_range": None, "keywords": [user_message.strip()],
+                "compare": False, "cause_tracking": False, "interpret": False,
+                "is_greeting": False, "response_style": "detailed",
+            }
     elif not _context and _is_followup_like:
         _followup_hints = ["이거", "저거", "그거", "이것", "저것", "그것",
                            "자세히", "더 알려줘",
