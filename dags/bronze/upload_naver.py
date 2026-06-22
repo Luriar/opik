@@ -170,13 +170,16 @@ def parse_naver_date(raw: str) -> str | None:
 
 def parse_naver_rows(soup: Any) -> list[Any]:
     for selector in [
-        "table.type_1 tbody tr",
-        "div.box_type_m table tbody tr",
-        "table.Nnavi tbody tr",
+        "table.type_1 tr",
+        "div.box_type_m table tr",
+        "table.Nnavi tr",
     ]:
         rows = soup.select(selector)
         if rows:
-            return [row for row in rows if row.select_one("td.file") or row.select_one("a.stock_item")]
+            return [
+                r for r in rows
+                if r.select_one("td.file") or len(r.select("td")) >= 5
+            ]
     return [row for row in soup.select("tr") if len(row.select("td")) >= 5]
 
 
@@ -257,6 +260,8 @@ async def collect_naver_date(target: date) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     page = 1
     connector = aiohttp.TCPConnector(limit=5, limit_per_host=3)
+    max_pages = 15  # safety cap
+    cookie_jar = aiohttp.CookieJar()  # persist JSESSIONID
     async with aiohttp.ClientSession(
         headers={
             "User-Agent": UA,
@@ -265,8 +270,9 @@ async def collect_naver_date(target: date) -> list[dict[str, Any]]:
             "Accept-Encoding": "gzip, deflate, br",
         },
         connector=connector,
+        cookie_jar=cookie_jar,
     ) as session:
-        while True:
+        while page <= max_pages:
             try:
                 async with session.get(
                     f"{BASE_URL}?page={page}",
@@ -307,7 +313,10 @@ async def collect_naver_date(target: date) -> list[dict[str, Any]]:
             page += 1
             await asyncio.sleep(0.3)
 
-    logger.info("Naver %s -> %d reports", target.isoformat(), len(results))
+    if len(results) == 0 and target.weekday() >= 5:
+        logger.info("Naver %s -> 0 reports (weekend)", target.isoformat())
+    else:
+        logger.info("Naver %s -> %d reports (pages: %d)", target.isoformat(), len(results), page)
     return results
 
 
@@ -387,6 +396,7 @@ async def download_all_pdfs(metas: list[dict[str, Any]], workers: int) -> dict[s
     async with aiohttp.ClientSession(
         headers={"User-Agent": UA, "Accept": "*/*", "Accept-Encoding": "gzip, deflate, br"},
         connector=connector,
+        cookie_jar=cookie_jar,
     ) as session:
         tasks = {
             meta["report_id"]: download_pdf(session, semaphore, meta)

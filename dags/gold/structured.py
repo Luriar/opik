@@ -19,10 +19,12 @@ from botocore.exceptions import ClientError
 try:
     import pendulum
     from airflow import DAG
+    from airflow.datasets import Dataset
     from airflow.operators.python import PythonOperator
     from airflow.sensors.external_task import ExternalTaskSensor
 except ImportError:  # 로컬 CLI 실행 환경에는 Airflow가 없을 수 있다.
     DAG = None
+    Dataset = None
     PythonOperator = None
     ExternalTaskSensor = None
 
@@ -78,6 +80,9 @@ logger = logging.getLogger("opik.gold.structured")
 
 GOLD_STRUCTURED_PREFIX = "gold/structured"
 RAW_SILVER_PREFIX = "silver/"
+# Dataset URI — dag_maintenance_delta_faiss가 이 URI로 본 DAG 완료를 구독한다.
+# 변경 시 dags/maintenance/dag_maintenance_delta_faiss.py의 동일 URI도 같이 수정할 것.
+GOLD_STRUCTURED_DATASET_URI = "s3://s3-opik-bucket/gold/structured/"
 REPORT_PIPELINE_SCHEDULE = os.getenv("OPIK_REPORT_PIPELINE_SCHEDULE", "0 0 * * *")
 KST_TARGET_DATE_TEMPLATE = (
     "{{ data_interval_end.in_timezone('Asia/Seoul').subtract(days=1).to_date_string() }}"
@@ -603,6 +608,8 @@ def build_dag():
             task_id="upsert_daily_structured_to_monthly_parquet",
             python_callable=run_daily_structured,
             op_kwargs={"target_date": KST_TARGET_DATE_TEMPLATE},
+            # 성공 시 Dataset 업데이트 → maintenance DAG 트리거(embeddings와 AND 조건).
+            outlets=[Dataset(GOLD_STRUCTURED_DATASET_URI)],
         )
         wait_for_silver >> structured_task
     return dag_obj

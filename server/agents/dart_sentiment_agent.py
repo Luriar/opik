@@ -250,8 +250,8 @@ class DartSentimentAgent:
     ) -> pd.DataFrame:
         """Load DART disclosure events from S3 for sentiment analysis.
 
-        Primary: Delta dart/disclosure_events (fast single read)
-        Fallback: DartCollector Gold facts/material_event (new partitioned path)
+        Primary: Delta material_event (fast single read, PK=event_id)
+        Fallback: DartCollector Gold facts/material_event Parquet (new partitioned path)
         Legacy fallback: gold/dart/disclosure_events/dt={ym}/ (may be deleted by compaction)
 
         Args:
@@ -267,7 +267,7 @@ class DartSentimentAgent:
         # Path 1: Delta (primary, fast)
         try:
             from agents.data_helper import read_gold_data
-            df_delta = read_gold_data("dart/disclosure_events")
+            df_delta = read_gold_data("material_event")
             if df_delta is not None and len(df_delta) > 0:
                 if "rcept_dt" in df_delta.columns:
                     df_delta = df_delta[

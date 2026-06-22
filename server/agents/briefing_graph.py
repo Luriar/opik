@@ -85,28 +85,38 @@ def _list_parquet_keys(prefix: str) -> List[str]:
 # ── Step Implementations ──
 
 def load_gold_structured(state: BriefingState) -> BriefingState:
-    """Step 1: Load today's Gold Structured data from S3."""
+    """Step 1: Load recent Gold Structured data from S3 (3-day lookback).
+
+    Uses a 3-day window to catch Friday reports on Monday briefings.
+    Reports are rarely published on weekends.
+    """
     date = state.date  # YYYYMMDD
     year = date[:4]
     month = date[4:6]
     key = f"gold/structured/year={year}/month={month}/data.parquet"
 
-    try:
-        df = _read_parquet_s3(key)
-        # Filter to today's report date
-        # 발행일 is the report publication date (stored as YYYYMMDD or YYYY-MM-DD)
-        today_str = f"{year}-{month}-{date[6:8]}"
-        today_compact = date
+    # Build 3-day lookback window: [date-3d, date]
+    from datetime import datetime as dt_dt, timedelta
+    target_dt = dt_dt.strptime(date, "%Y%m%d")
+    lookback_dt = target_dt - timedelta(days=3)
+    lookback_compat = lookback_dt.strftime("%Y%m%d")
 
+    try:
+        from agents.data_helper import read_gold_data
+        df = read_gold_data("structured")        # Delta-first(델타 정본), 실패 시 parquet
+        if df is None or len(df) == 0:
+            df = _read_parquet_s3(key)            # 레거시 단일 월 파티션 폴백
+        # 발행일 is the report publication date (stored as YYYYMMDD or YYYY-MM-DD)
         if "발행일" in df.columns:
-            df["발행일_str"] = df["발행일"].astype(str).str.replace("-", "")
-            df = df[df["발행일_str"] == today_compact]
+            df["발행일_str"] = df["발행일"].astype(str).str.replace("-", "").str.replace(".", "")
+            df = df[(df["발행일_str"] >= lookback_compat) & (df["발행일_str"] <= date)]
         elif "report_date" in df.columns:
             df["report_date_str"] = df["report_date"].astype(str).str.replace("-", "")
-            df = df[df["report_date_str"] == today_compact]
+            df = df[(df["report_date_str"] >= lookback_compat) & (df["report_date_str"] <= date)]
 
         state.structured = df.to_dict("records")
-        logger.info("Step 1: Gold Structured loaded — %d rows for %s", len(state.structured), date)
+        logger.info("Step 1: Gold Structured loaded — %d rows for %s (lookback >= %s)",
+                     len(state.structured), date, lookback_compat)
     except Exception as e:
         logger.warning("Step 1: Gold Structured load failed: %s", e)
         state.structured = []
@@ -135,8 +145,8 @@ def load_gold_llm(state: BriefingState) -> BriefingState:
 def load_dart_events(state: BriefingState) -> BriefingState:
     """Step 3: Load 1 quarter of DART disclosure events.
 
-    Primary: Delta dart/disclosure_events (fast single read)
-    Fallback: DartCollector Gold facts/material_event (new partitioned path)
+    Primary: Delta material_event (fast single read, PK=event_id)
+    Fallback: DartCollector Gold facts/material_event Parquet (new partitioned path)
     Legacy fallback: gold/dart/disclosure_events/dt={ym}/ (may be deleted by compaction)
     """
     target_dt = datetime.strptime(state.date, "%Y%m%d")
@@ -147,7 +157,7 @@ def load_dart_events(state: BriefingState) -> BriefingState:
     # Path 1: Delta (primary, fast)
     try:
         from agents.data_helper import read_gold_data
-        df_delta = read_gold_data("dart/disclosure_events")
+        df_delta = read_gold_data("material_event")
         if df_delta is not None and len(df_delta) > 0:
             if "rcept_dt" in df_delta.columns:
                 df_delta = df_delta[
@@ -357,12 +367,16 @@ def check_triple_consensus(state: BriefingState) -> BriefingState:
         if code and code != "000000":
             report_tickers.add(code)
 
-    # Extract model tickers with positive ranking_score
+    # Extract all model tickers (full universe, no score threshold)
+    # Score filtering happens at intersection level (best-ranked among overlap)
     model_tickers = set()
-    for m in state.model_preds:
-        code = str(m.get("ticker", "")).zfill(6)
-        if code and m.get("ranking_score", 0) > 0:
-            model_tickers.add(code)
+    model_score_map = {}
+    if state.model_preds:
+        for m in state.model_preds:
+            code = str(m.get("ticker", "")).zfill(6)
+            if code and code != "000000":
+                model_tickers.add(code)
+                model_score_map[code] = m.get("ranking_score", 0)
 
     # Calculate 1-quarter boundary (last ~92 days)
     from datetime import datetime as _dt, timedelta as _td
@@ -428,29 +442,29 @@ def check_triple_consensus(state: BriefingState) -> BriefingState:
         logger.info("Step 6: No DART quarter data — skipping DART filter")
 
 
+    # Safe scalar extraction helpers (defined at function scope)
+    def _safe_str(val):
+        if val is None:
+            return ""
+        try:
+            s = str(val)
+            return "" if s in ("None", "[]", "nan") else s
+        except Exception:
+            return ""
+
+    def _safe_float(val, default=0.0):
+        """Safely convert a value to float, handling numpy arrays."""
+        if val is None:
+            return default
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return default
+
     # Build LLM lookup: report_id → {reason, risks, keywords}
     llm_lookup = {}
     for row in state.llm_data:
         rid = row.get("report_id", "")
-        # Safe scalar extraction: Parquet list columns may return numpy arrays
-        def _safe_str(val):
-            if val is None:
-                return ""
-            try:
-                s = str(val)
-                return "" if s in ("None", "[]", "nan") else s
-            except Exception:
-                return ""
-
-        def _safe_float(val, default=0.0):
-            """Safely convert a value to float, handling numpy arrays."""
-            if val is None:
-                return default
-            try:
-                return float(val)
-            except (ValueError, TypeError):
-                return default
-
         reason_s = _safe_str(row.get("reason"))
         risks_s = _safe_str(row.get("risks"))
         if rid and (reason_s or risks_s):
