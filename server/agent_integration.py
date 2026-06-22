@@ -27,6 +27,8 @@ from typing import Optional, List
 
 import boto3
 
+from intent_parser import infer_dart_intent_override
+
 logger = logging.getLogger("opik.agent_integration")
 
 # Agent singletons — lazy init
@@ -146,6 +148,31 @@ def _filter_recent(results: list, max_days: int = 180) -> list:
         else:
             filtered.append(r)
     return filtered
+
+
+def _apply_dart_override_to_agent_intent(user_message: str, intent: str, params: dict) -> tuple[str, dict]:
+    """Keep /v2 chat routing aligned with legacy /chat deterministic DART override."""
+    override = infer_dart_intent_override(user_message)
+    if not override or intent == "refused":
+        return intent, params
+    if intent == override or intent == "hybrid":
+        return intent, params
+    if isinstance(intent, str) and intent.startswith("dart_") and intent != "dart_query":
+        return intent, params
+
+    logger.info("Agent pipeline: intent override %s -> %s for explicit DART query", intent, override)
+    params = dict(params or {})
+    params.setdefault("tickers", [])
+    params.setdefault("ticker_names", [])
+    params.setdefault("brokerages", [])
+    params.setdefault("sectors", [])
+    params.setdefault("keywords", [])
+    params.setdefault("compare", False)
+    params.setdefault("cause_tracking", False)
+    params.setdefault("interpret", False)
+    params.setdefault("is_greeting", False)
+    params.setdefault("response_style", "detailed")
+    return override, params
 
 
 def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
@@ -284,6 +311,8 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
         intent_result = _intent.parse(user_message, conversation_context=_context)
         intent = intent_result["intent"]
         params = intent_result.get("intent_params", {})
+
+    intent, params = _apply_dart_override_to_agent_intent(user_message, intent, params)
 
     # Direct date extraction: "M월 D일" without year → (current_year)-MM-DD
     _md = __import__("re").search(r"(?<!\d)(\d{1,2})월\s*(\d{1,2})일", user_message)
@@ -435,11 +464,35 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
     elif route in ("dart_agent", "dart_with_analysis"):
         ticker_names = params.get("ticker_names", [])
         time_range = params.get("time_range")
-        dart_result = _dart.query_disclosure_events(
-            companies=ticker_names,
-            date_from=time_range.get("from") if time_range else None,
-            date_to=time_range.get("to") if time_range else None,
-        )
+        date_from = params.get("date_from") or (time_range.get("from") if time_range else None)
+        date_to = params.get("date_to") or (time_range.get("to") if time_range else None)
+        codes = params.get("tickers", [])
+        if intent == "dart_financial":
+            dart_result = _dart.query_financials(
+                companies=ticker_names,
+                codes=codes,
+                date_from=date_from,
+                date_to=date_to,
+            )
+        elif intent == "dart_insider":
+            dart_result = _dart.query_insider_trades(
+                companies=ticker_names,
+                codes=codes,
+                date_from=date_from,
+                date_to=date_to,
+            )
+        elif intent == "dart_shareholder":
+            dart_result = _dart.query_major_shareholders(
+                companies=ticker_names,
+                codes=codes,
+            )
+        else:
+            dart_result = _dart.query_disclosure_events(
+                companies=ticker_names,
+                codes=codes,
+                date_from=date_from,
+                date_to=date_to,
+            )
 
         if params.get("interpret") and dart_result:
             interpretation = _dart.interpret_disclosure(dart_result, "")

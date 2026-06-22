@@ -16,12 +16,90 @@ Routes to:
 
 import json
 import logging
+import re
 import time
 from typing import Optional, Dict, Any, List
 
 import boto3
 
 logger = logging.getLogger("opik.intent")
+
+
+DART_DISCLOSURE_KEYWORDS = (
+    "공시", "dart", "opendart", "전자공시", "사업보고서", "분기보고서", "반기보고서",
+    "정기보고서", "주요사항보고서", "증권신고서", "접수번호", "rcept_no", "rcept",
+)
+DART_FINANCIAL_KEYWORDS = (
+    "재무제표", "재무", "매출", "영업이익", "당기순이익", "순이익", "자산", "부채",
+    "자본", "per", "pbr", "실적",
+)
+DART_INSIDER_KEYWORDS = (
+    "내부자", "임원 매수", "임원 매도", "임원 거래", "임원매수", "임원매도",
+    "임원거래", "주식등의대량보유", "대량보유",
+)
+DART_SHAREHOLDER_KEYWORDS = (
+    "주요주주", "최대주주", "대주주", "주주현황", "지분율", "지분 변동", "지분변동",
+)
+REPORT_KEYWORDS = (
+    "리포트", "증권사", "애널리스트", "목표주가", "목표가", "투자의견",
+    "상승여력", "broker", "report",
+)
+
+
+def _contains_any(text: str, keywords: tuple[str, ...]) -> bool:
+    compact = re.sub(r"\s+", "", text)
+    return any(keyword in text or re.sub(r"\s+", "", keyword) in compact for keyword in keywords)
+
+
+def infer_dart_intent_override(question: str) -> Optional[str]:
+    """Return a deterministic DART intent when the user explicitly asks for DART data.
+
+    Haiku occasionally classifies disclosure questions as report_search. The docs define
+    DART disclosures/financials/shareholders/insider trades as separate data sources, so
+    explicit DART terms should not depend only on LLM classification.
+    """
+    text = (question or "").lower()
+    if not text:
+        return None
+
+    has_disclosure = _contains_any(text, DART_DISCLOSURE_KEYWORDS)
+    has_financial = _contains_any(text, DART_FINANCIAL_KEYWORDS)
+    has_insider = _contains_any(text, DART_INSIDER_KEYWORDS)
+    has_shareholder = _contains_any(text, DART_SHAREHOLDER_KEYWORDS)
+    has_dart_signal = has_disclosure or has_financial or has_insider or has_shareholder
+    if not has_dart_signal:
+        return None
+
+    has_report_signal = _contains_any(text, REPORT_KEYWORDS)
+    if has_report_signal and has_dart_signal:
+        return "hybrid"
+    if has_insider:
+        return "dart_insider"
+    if has_shareholder:
+        return "dart_shareholder"
+    if has_financial:
+        return "dart_financial"
+    return "dart_disclosure"
+
+
+def apply_dart_intent_override(question: str, result: "IntentResult") -> "IntentResult":
+    """Correct LLM intent when explicit DART terms were routed to a non-DART intent."""
+    override = infer_dart_intent_override(question)
+    if not override or result.is_refusal:
+        return result
+    if result.intent == override or result.intent == "hybrid":
+        return result
+    if result.intent.startswith("dart_") and result.intent != "dart_query":
+        return result
+
+    original = result.intent
+    result.intent = override
+    result._raw["intent"] = override
+    if override != "hybrid":
+        result.search_query = None
+        result._raw["search_query"] = None
+    logger.info("Intent override: %s -> %s for explicit DART query", original, override)
+    return result
 
 INTENT_SYSTEM_PROMPT = """당신은 OPIK 챗봇의 의도 파악기입니다.
 사용자 질문을 분석하여 구조화된 JSON으로 반환하세요.
@@ -304,7 +382,7 @@ class IntentParser:
                     text = text[4:].strip()
 
             data = json.loads(text)
-            result = IntentResult(data)
+            result = apply_dart_intent_override(question, IntentResult(data))
 
             elapsed = (time.time() - t0) * 1000
             logger.info(
