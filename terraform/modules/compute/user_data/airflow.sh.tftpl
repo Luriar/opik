@@ -108,6 +108,10 @@ if [ -z "$report_schedule" ]; then
   report_schedule="0 0 * * *"
 fi
 
+# Telegram briefing/bot credentials. Optional; empty disables Telegram delivery.
+telegram_bot_token="$(json_value "$runtime_secret_json" TELEGRAM_BOT_TOKEN)"
+telegram_chat_id="$(json_value "$runtime_secret_json" TELEGRAM_CHAT_ID)"
+
 cat >/opt/opik/bootstrap.env <<ENV
 AWS_REGION=${aws_region}
 AWS_DEFAULT_REGION=${aws_region}
@@ -172,6 +176,8 @@ EMBEDDING_MODEL=${embedding_config.model}
 EMBEDDING_VERSION=${embedding_config.version}
 EMBEDDING_DIMENSION=${embedding_config.dimension}
 OPIK_REPORT_PIPELINE_SCHEDULE=$report_schedule
+TELEGRAM_BOT_TOKEN=$telegram_bot_token
+TELEGRAM_CHAT_ID=$telegram_chat_id
 OPIK_HF_CACHE_DIR=/tmp/opik-huggingface
 HF_HOME=/tmp/opik-huggingface
 ENV

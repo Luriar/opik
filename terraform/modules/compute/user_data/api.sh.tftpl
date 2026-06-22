@@ -4,11 +4,34 @@ set -euo pipefail
 exec > >(tee -a /var/log/opik-api-bootstrap.log) 2>&1
 
 dnf update -y
-dnf install -y docker git awscli python3 python3-pip python3-virtualenv
+dnf install -y docker git awscli jq python3 python3-pip python3-virtualenv
 systemctl enable --now docker
 
 mkdir -p /opt/opik /data/opik /var/log/opik
 
+# Pull non-DB runtime secrets (e.g. Telegram bot token) for the FastAPI server.
+# DB credentials come from the RDS managed secret; AWS creds come from the IAM role.
+read_secret_json() {
+  aws secretsmanager get-secret-value \
+    --region "${aws_region}" \
+    --secret-id "$1" \
+    --query SecretString \
+    --output text
+}
+
+json_value() {
+  printf '%s' "$1" | jq -r --arg key "$2" '.[$key] // empty'
+}
+
+api_runtime_secret_json="$(read_secret_json "${api_secret_arn}" 2>/dev/null || printf '{}')"
+if [ "$api_runtime_secret_json" = "None" ] || [ -z "$api_runtime_secret_json" ]; then
+  api_runtime_secret_json="{}"
+fi
+
+telegram_bot_token="$(json_value "$api_runtime_secret_json" TELEGRAM_BOT_TOKEN)"
+telegram_chat_id="$(json_value "$api_runtime_secret_json" TELEGRAM_CHAT_ID)"
+
+umask 077
 cat >/opt/opik/bootstrap.env <<ENV
 AWS_REGION=${aws_region}
 AWS_DEFAULT_REGION=${aws_region}
@@ -26,11 +49,14 @@ EMBEDDING_VERSION=${embedding_config.version}
 EMBEDDING_DIMENSION=${embedding_config.dimension}
 SERVICE_DB_ENDPOINT=${service_db_endpoint}
 API_RUNTIME_SECRET_ARN=${api_secret_arn}
+TELEGRAM_BOT_TOKEN=$telegram_bot_token
+TELEGRAM_CHAT_ID=$telegram_chat_id
 FAISS_INDEX_PATH=/data/opik/faiss_index.bin
 FAISS_IDMAP_PATH=/data/opik/report_ids.json
 CHAT_HTML_PATH=/opt/opik/repo/server/chat.html
 OPIK_AGENT_ENABLED=false
 ENV
+chmod 600 /opt/opik/bootstrap.env
 
 %{ if repo_url != "" ~}
 if [ ! -d /opt/opik/repo/.git ]; then

@@ -429,3 +429,43 @@ terraform plan -var=repo_url=https://github.com/Luriar/opik.git -detailed-exitco
 
 - 새 계정/리전 최초 배포 시: `opik-dev/airflow/runtime`, `opik-dev/api/runtime` 컨테이너를 apply 전에 `create-secret`로 1회 생성해야 함(없으면 data source 조회 실패).
 - **RDS 2개는 여전히 destroy 대상**이며 `rds_skip_final_snapshot=true`라 스냅샷 없이 삭제됨. DB 데이터 보존이 필요하면 별도 조치(스냅샷/deletion_protection) 권장.
+
+## 2026-06-22 — 현재 `.env` 기준 배치 매핑 정리 + Telegram 값 부트스트랩 배선
+
+### Date
+
+2026-06-22
+
+### Goal
+
+- 현재 루트 `.env`를 기준으로, DB 접속 정보를 제외한 각 키를 Secrets Manager / `terraform.tfvars` / RDS 관리형 시크릿 중 어디에 어떤 양식으로 넣는지 확정한다.
+- 매핑이 실제로 동작하도록(문서와 코드 일치) 누락된 키를 부트스트랩에 배선하고, 검증 후 요약 매핑 문서를 만든다.
+
+### Changes made
+
+- `terraform/ENV-MAPPING.md` 신규 추가: 현재 `.env` 30개 키별 `.env 키 → target 위치/양식` 요약표 + Secrets Manager JSON 예시(airflow/api runtime) + `terraform.tfvars` 예시 + DB 자동 조립 설명 + 주의사항.
+- `terraform/modules/compute/user_data/airflow.sh.tftpl`: runtime 시크릿에서 `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`를 읽어 `airflow.env`에 렌더하도록 추가(배선 전에는 시크릿에 넣어도 pipeline `telegram_briefing`에 전달 안 됨).
+- `terraform/modules/compute/user_data/api.sh.tftpl`: API용 `api/runtime` 시크릿을 IAM Role로 조회(`jq` 설치 추가)해 `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`를 `bootstrap.env`에 렌더(+`chmod 600`). FastAPI(`server/opik_server.py`)의 텔레그램 봇 기능에 필요.
+
+### Findings
+
+- `.env`의 `AIRFLOW__CORE__FERNET_KEY=opik-fernet-key-2026-secure-placeholder`는 **유효한 Fernet 키가 아님**(32B url-safe base64 아님). 그대로 주입 시 Airflow 기동 실패 → 유효 키 생성 명령을 문서에 명시.
+- `.env`의 `TELEGRAM_CHAT_IDS`(복수형)는 코드 어디에서도 사용하지 않음 → 배치 불필요로 표기.
+- `AIRFLOW_SECRET_KEY` 와 `AIRFLOW__WEBSERVER__SECRET_KEY`는 동일 값이며 시크릿 JSON 키 하나(`AIRFLOW__WEBSERVER__SECRET_KEY`)로 통합.
+
+### Commands run (local test, terraform 미설치 환경)
+
+- 부트스트랩의 시크릿 추출 로직(`jq -r '.[$key] // empty'`)을 Python으로 동일 의미 재현 → §2-1 JSON에서 DART/webserver/telegram/schedule 정확 추출, 빈 컨테이너 폴백(스케줄 `0 0 * * *`, 텔레그램 빈값) 무크래시 확인.
+- Fernet 유효성: `.env` placeholder=무효, `urlsafe_b64encode(os.urandom(32))` 생성키=유효 확인.
+- `api.sh.tftpl` 추가 블록(시크릿 read + `bootstrap.env` 렌더) `bash -n` 문법 검증 통과.
+
+### Validation result
+
+- 추출/폴백/Fernet 검증 어설션 통과(생성 fernet 유효, placeholder 무효).
+- 셸 문법 검증 통과.
+- `terraform validate`/`plan`/`apply`는 이 머신에 Terraform 미설치로 **미실행**(이전 배포는 다른 머신에서 수행됨). 적용 머신에서 `terraform fmt -recursive`/`validate`/`plan` 재확인 권장.
+
+### Remaining
+
+- 적용 머신에서: ① `opik-dev/api/runtime`에 텔레그램 값 `put-secret-value`, ② `terraform plan/apply`로 EC2 user-data 갱신(인스턴스 교체), ③ `/health` 및 텔레그램 동작 확인.
+- 운영 시 Fernet 키 고정값 유지(인스턴스 교체 간 암호화 connection 보존).
