@@ -13,7 +13,7 @@
 당일 DART 공시 + 증권사 신규 리포트가 나온 종목만 추출 → LLM이 평어로 요약 → 브리핑 전달.
 
 ### Phase 2 — ★/! 브리핑 + 양방향 QA 챗봇 ✅ 운영 중
-매일 07:00 KST ★/! 이진 consensus 브리핑 → Telegram DM. FAISS 임베딩 기반 RAG 검색으로 증권사 리포트 + DART 공시에 대한 양방향 QA 챗봇. EC2 r6g.large에서 Airflow 8 DAG + systemd timer로 완전 자동화.
+매일 07:00 KST ★/! 이진 consensus 브리핑 → Telegram DM. FAISS 임베딩 기반 RAG 검색으로 증권사 리포트 + DART 공시에 대한 양방향 QA 챗봇. EC2 r6g.large에서 Airflow DAG와 maintenance DAG로 자동화.
 
 ### Phase 3 — 실시간 AI 주식 비서 (미착수)
 실시간 모니터링, 즉시 시그널, 선제적 푸시 알림.
@@ -64,8 +64,8 @@ PDF 원본 + 메타  ──▶  텍스트 추출      ──▶  구조화 + 임
 - 2020~2026 84개월 완료
 
 #### Delta Lake — 운영 중
-- S3 `delta/gold_db/` 아래 3개 테이블: structured (75커밋), embeddings (61커밋), disclosure_events (1커밋)
-- `spark_silver_to_delta.py` → systemd timer 매일 06:50 KST 자동 MERGE
+- S3 `delta/gold_db/` 아래 structured, embeddings, material_event, DART facts 계열 serving table 운영
+- 현재 기준 MERGE 경로는 `spark_jobs/gold_to_delta.py`이며, `dag_maintenance_delta_faiss`가 Gold Dataset 갱신 후 Spark MERGE → FAISS rebuild → server restart 순서로 실행
 - pyspark 4.0.3 + delta-spark 4.0.0, JDK 17
 
 ### ★/! 브리핑 (Phase 2 핵심)
@@ -102,7 +102,7 @@ PDF 원본 + 메타  ──▶  텍스트 추출      ──▶  구조화 + 임
 | Gold - Structured | 완료 (84개월, 2020~2026) |
 | Gold - LLM | 완료 (84개월, Haiku 97% 커버리지) |
 | Gold - DART disclosure_events | 10개월 (2025-06~2026-03), 2026-04~06 확장 필요 |
-| Delta Lake | 운영 중 (systemd timer 06:50 KST) |
+| Delta Lake | 운영 중 (`dag_maintenance_delta_faiss` 기반 Spark MERGE) |
 | Airflow DAG ×8 | 전부 unpaused, 자동 실행 |
 | ★/! 브리핑 | E2E 검증 완료, Telegram DM 수신 확인 |
 | 챗봇 (FAISS + 7 agent) | 운영 중, Opus 4.8 Analysis |
@@ -137,7 +137,8 @@ opik/
 │   ├── model/                   # model_daily_prediction
 │   └── briefing/                # opik_briefing
 ├── spark_jobs/
-│   └── spark_silver_to_delta.py # Delta Lake MERGE (systemd timer)
+│   ├── gold_to_delta.py         # 현재 기준 Delta Lake MERGE
+│   └── spark_silver_to_delta.py # 구형 Delta MERGE 경로
 ├── src/model/                   # 찬호 LightGBM 모델 파이프라인 (57개 .py)
 └── docs/                        # 설계 + 운영 문서
     ├── ARCHITECTURE.md           # 이 문서
@@ -149,6 +150,7 @@ opik/
     ├── CHATBOT_RESPONSE_POLICY.md        # 챗봇 응답 정책
     ├── DEVELOPMENT_LOG.md        # 개발 패턴 회고
     ├── CONTRIBUTING.md           # 기여 가이드
+    ├── RAG_SPARK_FAISS_DELTA.md  # RAG/Spark/Delta/FAISS 책임 경계
     ├── HOW_BRONZE_TO_SILVER_WORKS.md     # Bronze→Silver 상세
     └── HOW_SILVER_TO_GOLD_WORKS.md       # Silver→Gold 상세
 ```
@@ -157,4 +159,5 @@ opik/
 
 - Agent 아키텍처: [AGENT_ARCHITECTURE.md](AGENT_ARCHITECTURE.md)
 - 운영 현황: [OPIK_PHASE2_OPERATIONS_STATUS.md](OPIK_PHASE2_OPERATIONS_STATUS.md)
-- Phase 2 설계: [PHASE2_MULTIAGENT_DESIGN.m
+- Phase 2 설계: [PHASE2_MULTIAGENT_DESIGN.md](PHASE2_MULTIAGENT_DESIGN.md)
+- RAG/Spark/Delta/FAISS 구조: [RAG_SPARK_FAISS_DELTA.md](RAG_SPARK_FAISS_DELTA.md)
