@@ -249,13 +249,15 @@ def load_dart_events(state: BriefingState) -> BriefingState:
 
         dfs = []
         for ym in sorted(months_set):
-            key = f"gold/dart/disclosure_events/dt={ym}/data.parquet"
+            prefix = f"gold/dart/disclosure_events/dt={ym}/"
             try:
-                df = _read_parquet_s3(key)
-                dfs.append(df)
-                logger.info("Step 3 legacy: Loaded dt=%s: %d rows", ym, len(df))
-            except Exception:
-                pass
+                keys = _list_parquet_keys(prefix)
+                if keys:
+                    df = _read_parquet_keys(keys)
+                    dfs.append(df)
+                    logger.info("Step 3 legacy: Loaded dt=%s: %d rows from %d files", ym, len(df), len(keys))
+            except Exception as e:
+                logger.debug("Step 3 legacy dt=%s skip: %s", ym, e)
 
         if dfs:
             combined = pd.concat(dfs, ignore_index=True)
