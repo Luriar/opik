@@ -259,31 +259,45 @@ def query_financials(companies, codes, date_from=None, date_to=None,
     corp_code = comp["corp_code"]
     corp_name = comp["corp_name"]
 
-    prefix = "gold/dart/facts/financial_statement/"
-    all_keys = _list_gold_partitions(prefix)
+    # 2-tier: Delta first, Parquet fallback
+    df = pd.DataFrame()
+    try:
+        from agents.data_helper import read_gold_data
+        df = read_gold_data("dart_financial_statement")
+        if df is not None and len(df) > 0:
+            logger.info("financial_statement loaded via Delta: %d rows", len(df))
+            if "bsns_year" in df.columns:
+                from_year = int(date_from[:4]) if date_from and len(date_from) >= 4 else None
+                to_year = int(date_to[:4]) if date_to and len(date_to) >= 4 else None
+                if from_year:
+                    df = df[df["bsns_year"].astype(int) >= from_year]
+                if to_year:
+                    df = df[df["bsns_year"].astype(int) <= to_year]
+            df = _filter_by_date_col(df, "rcept_dt", date_from, date_to)
+    except Exception as e:
+        logger.debug("Delta financial_statement read failed: %s", e)
 
-    from_year = int(date_from[:4]) if date_from and len(date_from) >= 4 else None
-    to_year = int(date_to[:4]) if date_to and len(date_to) >= 4 else None
-
-    relevant_keys = []
-    for key in all_keys:
-        m = re.search(r'bsns_year=(\d{4})/', key)
-        if m:
-            year = int(m.group(1))
-            if from_year and year < from_year:
-                continue
-            if to_year and year > to_year:
-                continue
-            relevant_keys.append(key)
-
-    if not relevant_keys:
-        relevant_keys = all_keys
-
-    if not relevant_keys:
-        return f"{corp_name}의 재무제표 데이터가 없습니다."
-
-    # No row limit for full scan — filter by company below
-    df = _read_parquet_keys(relevant_keys, limit_rows=10_000_000)
+    if len(df) == 0:
+        logger.info("Delta empty, trying Gold Parquet...")
+        prefix = "gold/dart/facts/financial_statement/"
+        all_keys = _list_gold_partitions(prefix)
+        from_year = int(date_from[:4]) if date_from and len(date_from) >= 4 else None
+        to_year = int(date_to[:4]) if date_to and len(date_to) >= 4 else None
+        relevant_keys = []
+        for key in all_keys:
+            m = re.search(r'bsns_year=(\d{4})/', key)
+            if m:
+                year = int(m.group(1))
+                if from_year and year < from_year:
+                    continue
+                if to_year and year > to_year:
+                    continue
+                relevant_keys.append(key)
+        if not relevant_keys:
+            relevant_keys = all_keys
+        if not relevant_keys:
+            return f"{corp_name}의 재무제표 데이터가 없습니다."
+        df = _read_parquet_keys(relevant_keys, limit_rows=10_000_000)
     if len(df) == 0:
         return f"{corp_name}의 재무제표 데이터가 없습니다."
 
@@ -331,19 +345,57 @@ def query_disclosure_events(companies, codes, date_from=None, date_to=None,
     if is_recent and not date_from:
         date_from = (datetime.now() - timedelta(days=60)).strftime("%Y-%m-%d")
 
+    # Merge all 3 sources: Delta (86 rows, fast), Gold facts (partitioned), legacy (complete)
+    # Delta material_event is incomplete (only recent backfill). Legacy disclosure_events
+    # is the most complete source. Always merge all paths, deduplicate by rcept_no.
+    dfs = []
+
+    # Path 1: Delta material_event
     try:
         from agents.data_helper import read_gold_data
-        df = read_gold_data("material_event")
-        if df is not None and len(df) > 0:
-            logger.info("material_event loaded via Delta: %d rows", len(df))
-            df = _filter_by_date_col(df, "rcept_dt", date_from, date_to)
-            if len(df) > limit_rows:
-                df = df.head(limit_rows)
-        else:
-            raise ValueError("Delta returned empty")
+        df_delta = read_gold_data("material_event")
+        if df_delta is not None and len(df_delta) > 0:
+            logger.info("material_event loaded via Delta: %d rows", len(df_delta))
+            dfs.append(df_delta)
     except Exception as e:
-        logger.debug("Delta read skipped, reading material_event facts: %s", e)
-        df = _read_material_event_facts(date_from, date_to, limit_rows)
+        logger.debug("Delta read failed: %s", e)
+
+    # Path 2: Gold facts material_event (DartCollector partitioned)
+    try:
+        df_facts = _read_material_event_facts(date_from, date_to, limit_rows=50000)
+        if len(df_facts) > 0:
+            logger.info("material_event facts loaded: %d rows", len(df_facts))
+            dfs.append(df_facts)
+    except Exception as e:
+        logger.debug("Gold facts read failed: %s", e)
+
+    # Path 3: Legacy compacted disclosure_events (most complete)
+    try:
+        df_legacy = _read_disclosure_events_fallback(date_from, date_to, limit_rows=50000)
+        if len(df_legacy) > 0:
+            logger.info("disclosure_events legacy loaded: %d rows", len(df_legacy))
+            dfs.append(df_legacy)
+    except Exception as e:
+        logger.debug("Legacy disclosure read failed: %s", e)
+
+    if not dfs:
+        return "해당 기간의 공시 데이터가 없습니다."
+
+    # Merge and deduplicate by rcept_no (which is unique per disclosure filing)
+    df = pd.concat(dfs, ignore_index=True)
+    if "rcept_no" in df.columns:
+        before = len(df)
+        df = df.drop_duplicates(subset=["rcept_no"], keep="first")
+        logger.info("Deduplicated disclosure events: %d -> %d", before, len(df))
+    elif "rcept_dt" in df.columns and "corp_name" in df.columns:
+        before = len(df)
+        df = df.drop_duplicates(subset=["rcept_dt", "corp_name", "report_nm"], keep="first")
+        logger.info("Deduplicated (fallback keys): %d -> %d", before, len(df))
+
+    # Apply date filter
+    df = _filter_by_date_col(df, "rcept_dt", date_from, date_to)
+    if len(df) > limit_rows:
+        df = df.head(limit_rows)
 
     if len(df) == 0:
         return "해당 기간의 공시 데이터가 없습니다."
@@ -405,6 +457,40 @@ def _read_material_event_facts(date_from, date_to, limit_rows=500):
         relevant_keys = all_keys
 
     df = _read_parquet_keys(relevant_keys, limit_rows)
+    df = _filter_by_date_col(df, "rcept_dt", date_from, date_to)
+    return df
+
+
+def _read_disclosure_events_fallback(date_from, date_to, limit_rows=500):
+    """Path 3 fallback: read legacy disclosure_events compacted parquet files."""
+    prefix = "gold/dart/disclosure_events/"
+    all_keys = _list_gold_partitions(prefix)
+    if not all_keys:
+        return pd.DataFrame()
+    months = _enumerate_months(date_from, date_to, default_months=3)
+    relevant_keys = []
+    for key in all_keys:
+        m = re.search(r'dt=(\d{4}-\d{2})/', key)
+        if m:
+            ym = m.group(1)
+            year, month = ym.split("-")
+            if (year, month) in months:
+                relevant_keys.append(key)
+        else:
+            relevant_keys.append(key)
+    if not relevant_keys:
+        relevant_keys = all_keys
+    logger.info("disclosure_events fallback: scanning %d keys", len(relevant_keys))
+    df = _read_parquet_keys(relevant_keys, limit_rows)
+    if len(df) == 0:
+        return df
+    # Fill empty text with report_nm placeholder (compaction may have lost text)
+    if "text" in df.columns:
+        empty_mask = df["text"].isna() | (df["text"].astype(str).str.strip() == "")
+        if empty_mask.any():
+            df.loc[empty_mask, "text"] = df.loc[empty_mask, "report_nm"].fillna("").apply(
+                lambda x: f"[{x}]" if x else ""
+            )
     df = _filter_by_date_col(df, "rcept_dt", date_from, date_to)
     return df
 
@@ -527,6 +613,23 @@ def query_major_shareholders(companies, codes, date_from=None, date_to=None,
 
 
 def _read_ownership_facts(ownership_type, date_from, date_to, limit_rows=500):
+    # Delta first, Gold Parquet fallback
+    df = pd.DataFrame()
+    try:
+        from agents.data_helper import read_gold_data
+        df = read_gold_data("dart_ownership")
+        if df is not None and len(df) > 0:
+            logger.info("ownership loaded via Delta: %d rows", len(df))
+            if "ownership_type" in df.columns:
+                df = df[df["ownership_type"].astype(str) == ownership_type]
+            df = _filter_by_date_col(df, "rcept_dt", date_from, date_to)
+    except Exception as e:
+        logger.debug("Delta ownership read failed: %s", e)
+
+    if len(df) > 0:
+        return df
+
+    logger.info("Delta empty, trying Gold Parquet for ownership type=%s", ownership_type)
     prefix = f"gold/dart/facts/ownership/ownership_type={ownership_type}/"
     all_keys = _list_gold_partitions(prefix)
     if not all_keys:

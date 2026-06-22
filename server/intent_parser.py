@@ -35,12 +35,15 @@ INTENT_SYSTEM_PROMPT = """당신은 OPIK 챗봇의 의도 파악기입니다.
 
 ## intent 분류
 
-### report_search — 데이터 기반 factual 질문
+### report_search — 데이터 기반 factual 질문 (증권사 리포트)
 애널리스트 리포트 검색이 필요한 모든 질문.
 - "삼성전자 목표주가 알려줘"
 - "한국투자증권에서 SK하이닉스 리포트 있어?"
 - "어제 올라온 반도체 리포트 보여줘"
 - "최근 리포트 요약해줘"
+
+**주의: "공시"가 포함된 질문은 report_search가 아니라 dart_disclosure입니다.**
+"공시 알려줘"는 DART 공시 데이터를 요청하는 것입니다.
 
 ### dart_financial — 재무제표 질문
 - 매출, 영업이익, 순이익, 자산, 부채, 재무제표, 실적
@@ -48,8 +51,11 @@ INTENT_SYSTEM_PROMPT = """당신은 OPIK 챗봇의 의도 파악기입니다.
 ### dart_insider — 내부자 거래 질문
 - 임원 매매, 지분 변동, 주식 매수/매도 (개인 거래)
 
-### dart_disclosure — 공시 질문
-- 공시, 공시내용, 공시 제목, 이벤트 공시
+### dart_disclosure — 공시 질문 (DART 공시 데이터)
+"공시" 키워드가 포함된 모든 질문은 무조건 이 intent로 분류하세요.
+- "공시 알려줘", "공시 보여줘", "공시 정보 줘", "공시 검색"
+- "DART 공시", "공시 이벤트", "공시 내용"
+- 날짜와 함께 "공시" → dart_disclosure (report_search가 아님!)
 
 ### dart_shareholder — 주요주주 질문
 - 주요주주, 최대주주, 주주현황, 지분율
@@ -166,8 +172,14 @@ A: {"intent": "report_search", "date_from": null, "date_to": null, "is_recent": 
 Q: 삼성전자 최근 공시랑 목표주가 같이 알려줘
 A: {"intent": "hybrid", "date_from": null, "date_to": null, "is_recent": true, "companies": ["삼성전자"], "stock_codes": ["005930"], "securities": [], "search_query": "삼성전자 목표주가 투자의견 공시", "sql_hint": "SELECT disclosure events and analyst reports for 삼성전자"}
 
+Q: 2026년6월 19일 공시 알려줘
+A: {"intent": "dart_disclosure", "date_from": "2026-06-19", "date_to": "2026-06-19", "is_recent": false, "companies": [], "stock_codes": [], "securities": [], "search_query": null, "sql_hint": null}
+
 Q: 6월 13일 dart 정보 알려줘
 A: {"intent": "dart_disclosure", "date_from": "2026-06-13", "date_to": "2026-06-13", "is_recent": false, "companies": [], "stock_codes": [], "securities": [], "search_query": null, "sql_hint": null}
+
+Q: 공시 알려줘
+A: {"intent": "dart_disclosure", "date_from": null, "date_to": null, "is_recent": true, "companies": [], "stock_codes": [], "securities": [], "search_query": null, "sql_hint": null}
 
 Q: 1월 13일 공시 보여줘
 A: {"intent": "dart_disclosure", "date_from": "2026-01-13", "date_to": "2026-01-13", "is_recent": false, "companies": [], "stock_codes": [], "securities": [], "search_query": null, "sql_hint": null}

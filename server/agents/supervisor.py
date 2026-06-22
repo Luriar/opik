@@ -27,6 +27,10 @@ class SupervisorAgent:
         "general": "general_response",
         "report_search": "report_agent",
         "dart_query": "dart_agent",
+        "dart_disclosure": "dart_agent",
+        "dart_financial": "dart_agent",
+        "dart_insider": "dart_agent",
+        "dart_shareholder": "dart_agent",
         "hybrid": "hybrid_parallel",
         "investment_advice": "safety_refusal",
     }
@@ -267,8 +271,36 @@ def build_supervisor_graph(
         if state.get("response"):
             return state
         params = state.get("intent_params", {})
+        intent = state.get("intent", "dart_disclosure")
         ticker_names = params.get("ticker_names", [])
-        result = dart_agent.query_disclosure_events(companies=ticker_names)
+        codes = params.get("ticker_codes", [])
+        date_from = params.get("date_from")
+        date_to = params.get("date_to")
+        is_recent = params.get("is_recent", False)
+
+        if intent == "dart_financial":
+            result = dart_agent.query_financials(
+                companies=ticker_names, codes=codes,
+                date_from=date_from, date_to=date_to,
+            )
+        elif intent == "dart_insider":
+            result = dart_agent.query_insider_trades(
+                companies=ticker_names, codes=codes,
+                date_from=date_from, date_to=date_to,
+            )
+        elif intent == "dart_shareholder":
+            result = dart_agent.query_major_shareholders(
+                companies=ticker_names, codes=codes,
+                date_from=date_from, date_to=date_to,
+            )
+        else:
+            # dart_disclosure or dart_query
+            result = dart_agent.query_disclosure_events(
+                companies=ticker_names, codes=codes,
+                date_from=date_from, date_to=date_to,
+                page=params.get("page", 1),
+                page_size=params.get("page_size", 20),
+            )
         state["dart_results"] = [result]
         return state
 
@@ -318,7 +350,7 @@ def build_supervisor_graph(
             return "report"  # will go to dart after
         if intent == "report_search":
             return "report"
-        if intent == "dart_query":
+        if intent in ("dart_query", "dart_disclosure", "dart_financial", "dart_insider", "dart_shareholder"):
             return "dart"
         return "compose"
 
