@@ -199,10 +199,13 @@ def load_dart_events(state: BriefingState) -> BriefingState:
             df_facts = _read_parquet_keys(relevant_keys, limit_rows=50000)
             if len(df_facts) > 0:
                 if "rcept_dt" in df_facts.columns:
+                    # Normalize: Gold facts use "2026-06-16" format (with hyphens)
+                    df_facts["_rcept_dt_norm"] = df_facts["rcept_dt"].astype(str).str.replace("-", "")
                     df_facts = df_facts[
-                        (df_facts["rcept_dt"].astype(str) >= start_dt.strftime("%Y%m%d")) &
-                        (df_facts["rcept_dt"].astype(str) <= state.date)
+                        (df_facts["_rcept_dt_norm"] >= start_dt.strftime("%Y%m%d")) &
+                        (df_facts["_rcept_dt_norm"] <= latest_dt.strftime("%Y%m%d"))
                     ]
+                    df_facts = df_facts.drop(columns=["_rcept_dt_norm"])
                 combined = df_facts
                 logger.info("Step 3: DART loaded via material_event facts — %d rows", len(combined))
         except Exception as e:
