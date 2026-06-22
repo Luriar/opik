@@ -298,6 +298,7 @@ resource "aws_instance" "api" {
     repo_url            = local.repo_url
     storage_config      = var.storage_config
     embedding_config    = var.embedding_config
+    server_config       = var.server_config
   })
 
   metadata_options {

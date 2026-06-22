@@ -170,3 +170,25 @@ variable "embedding_config" {
     dimension = number
   })
 }
+
+variable "server_config" {
+  description = "Non-secret FastAPI/RAG runtime tuning rendered into the API env file."
+  type = object({
+    opik_agent_enabled          = bool
+    search_top_k                = number
+    opik_db_path                = string
+    bedrock_model               = string
+    safety_model                = string
+    intent_model                = string
+    report_model                = string
+    dart_model                  = string
+    dart_summarize_model        = string
+    analysis_model              = string
+    composer_model              = string
+    sentiment_model             = string
+    dart_sentiment_batch_size   = number
+    dart_sentiment_concurrent   = number
+    dart_sentiment_max_retries  = number
+    dart_sentiment_retry_delay  = number
+  })
+}

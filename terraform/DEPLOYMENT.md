@@ -18,7 +18,7 @@
 | ① 인프라/앱 **비밀값** (DART 키, Bedrock 키, Airflow 키, 관리자 비번) | **AWS Secrets Manager** 런타임 컨테이너 (apply 후 수동 입력) | ❌ |
 | ② **DB 접속 정보** (RDS user/password) | **RDS 관리형 시크릿** (Terraform이 자동 생성, 값은 AWS가 관리) | ❌ |
 | ③ AWS 자격증명 (Access Key / Secret Key) | **불필요.** EC2 IAM Role로 대체 (배포 운영자 본인 자격증명은 `aws configure`) | ❌ |
-| ④ **비밀이 아닌 앱 설정** (S3 prefix, 저장계층 prefix, DART 튜닝, 임베딩) | `terraform.tfvars` (예시: `terraform.tfvars.example`) | ⚠️ `.example`만 |
+| ④ **비밀이 아닌 앱 설정** (S3 prefix, 저장계층 prefix, DART 튜닝, 임베딩, FastAPI/RAG 모델·경로·batch tuning) | `terraform.tfvars` (예시: `terraform.tfvars.example`) | ⚠️ `.example`만 |
 | ⑤ Airflow 내부 설정 (executor, UID, fernet, timezone, DB URL) | Terraform/부트스트랩이 자동 처리 — **건드릴 필요 없음** | — |
 
 ---
@@ -63,6 +63,10 @@
 | `BRONZE_PREFIX` / `SILVER_PREFIX` / `GOLD_PREFIX` | `storage_config.*_prefix` |
 | `DART_BACKFILL_*`, `DART_INCREMENTAL_DAYS`, `DART_LISTED_COMPANY_SCHEDULE`, `DART_COLLECT_MODE`, `DART_*_LIMIT`, `DART_QUOTA_REQUEST_LOG_ENABLED` | `dart_config.*` |
 | `EMBEDDING_PROVIDER` / `MODEL` / `VERSION` / `DIMENSION` | `embedding_config.*` |
+| `OPIK_AGENT_ENABLED`, `SEARCH_TOP_K`, `OPIK_DB_PATH`, `BEDROCK_MODEL`, agent model IDs, `DART_SENTIMENT_*` | `server_config.*` |
+| `PROMPT_DIR`, `CHAT_HTML_PATH`, `FAISS_INDEX_PATH`, `FAISS_IDMAP_PATH` | Terraform API bootstrap 고정 렌더링 |
+
+FastAPI 상세 매핑은 [ENV-MAPPING.md](ENV-MAPPING.md)를 기준으로 본다.
 
 ### Airflow 내부 설정 → 자동 (손대지 않음)
 `AIRFLOW_UID`, `AIRFLOW_EXECUTOR`, `AIRFLOW_TIMEZONE` 등은 부트스트랩이 고정 렌더링한다.

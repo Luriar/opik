@@ -119,4 +119,5 @@ module "compute" {
   storage_config                = var.storage_config
   dart_config                   = var.dart_config
   embedding_config              = var.embedding_config
+  server_config                 = var.server_config
 }

@@ -252,3 +252,43 @@ variable "embedding_config" {
     dimension = 384
   }
 }
+
+variable "server_config" {
+  description = "FastAPI/RAG runtime tuning rendered into the API instance env file. No secrets here."
+  type = object({
+    opik_agent_enabled          = bool
+    search_top_k                = number
+    opik_db_path                = string
+    bedrock_model               = string
+    safety_model                = string
+    intent_model                = string
+    report_model                = string
+    dart_model                  = string
+    dart_summarize_model        = string
+    analysis_model              = string
+    composer_model              = string
+    sentiment_model             = string
+    dart_sentiment_batch_size   = number
+    dart_sentiment_concurrent   = number
+    dart_sentiment_max_retries  = number
+    dart_sentiment_retry_delay  = number
+  })
+  default = {
+    opik_agent_enabled          = false
+    search_top_k                = 10
+    opik_db_path                = "/data/opik/opik.db"
+    bedrock_model               = "apac.anthropic.claude-3-haiku-20240307-v1:0"
+    safety_model                = "apac.anthropic.claude-3-haiku-20240307-v1:0"
+    intent_model                = "apac.anthropic.claude-3-haiku-20240307-v1:0"
+    report_model                = "apac.anthropic.claude-3-haiku-20240307-v1:0"
+    dart_model                  = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+    dart_summarize_model        = "global.anthropic.claude-sonnet-4-6"
+    analysis_model              = "global.anthropic.claude-opus-4-8"
+    composer_model              = "global.anthropic.claude-sonnet-4-6"
+    sentiment_model             = "apac.anthropic.claude-3-haiku-20240307-v1:0"
+    dart_sentiment_batch_size   = 25
+    dart_sentiment_concurrent   = 20
+    dart_sentiment_max_retries  = 2
+    dart_sentiment_retry_delay  = 1.5
+  }
+}

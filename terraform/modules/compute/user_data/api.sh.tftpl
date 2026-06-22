@@ -53,8 +53,24 @@ TELEGRAM_BOT_TOKEN=$telegram_bot_token
 TELEGRAM_CHAT_ID=$telegram_chat_id
 FAISS_INDEX_PATH=/data/opik/faiss_index.bin
 FAISS_IDMAP_PATH=/data/opik/report_ids.json
+OPIK_DB_PATH=${server_config.opik_db_path}
 CHAT_HTML_PATH=/opt/opik/repo/server/chat.html
-OPIK_AGENT_ENABLED=false
+PROMPT_DIR=/opt/opik/repo/server/prompts
+OPIK_AGENT_ENABLED=${server_config.opik_agent_enabled}
+SEARCH_TOP_K=${server_config.search_top_k}
+BEDROCK_MODEL=${server_config.bedrock_model}
+SAFETY_MODEL=${server_config.safety_model}
+INTENT_MODEL=${server_config.intent_model}
+REPORT_MODEL=${server_config.report_model}
+DART_MODEL=${server_config.dart_model}
+DART_SUMMARIZE_MODEL=${server_config.dart_summarize_model}
+ANALYSIS_MODEL=${server_config.analysis_model}
+COMPOSER_MODEL=${server_config.composer_model}
+SENTIMENT_MODEL=${server_config.sentiment_model}
+DART_SENTIMENT_BATCH_SIZE=${server_config.dart_sentiment_batch_size}
+DART_SENTIMENT_CONCURRENT=${server_config.dart_sentiment_concurrent}
+DART_SENTIMENT_MAX_RETRIES=${server_config.dart_sentiment_max_retries}
+DART_SENTIMENT_RETRY_DELAY=${server_config.dart_sentiment_retry_delay}
 ENV
 chmod 600 /opt/opik/bootstrap.env
 

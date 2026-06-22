@@ -469,3 +469,92 @@ terraform plan -var=repo_url=https://github.com/Luriar/opik.git -detailed-exitco
 
 - 적용 머신에서: ① `opik-dev/api/runtime`에 텔레그램 값 `put-secret-value`, ② `terraform plan/apply`로 EC2 user-data 갱신(인스턴스 교체), ③ `/health` 및 텔레그램 동작 확인.
 - 운영 시 Fernet 키 고정값 유지(인스턴스 교체 간 암호화 connection 보존).
+
+## 2026-06-22 — FastAPI/Spark env 외부화 및 공식문서 근거 매핑 정리
+
+### Date
+
+2026-06-22
+
+### Goal
+
+- Terraform 배포 시 Airflow, Server(FastAPI/RAG), Spark, DB, S3 설정값이 어디서 주입되는지 현재 코드 기준으로 정리한다.
+- FastAPI 배포 경로와 코드 기본값이 어긋나는 env를 Terraform user-data에서 명시 주입한다.
+- Spark Delta job의 S3/Delta 경로를 배포 환경별 prefix에 맞게 env로 override 가능하게 한다.
+- 공식 AWS 문서에서 확인한 근거와 OPIK 코드 기반 판단을 문서에서 분리한다.
+
+### Changes made
+
+- `terraform/ENV-MAPPING.md`를 재작성했다.
+  - 실제 secret 예시는 제거하고 위치/형식 설명으로 변경.
+  - EC2 IAM Role, Secrets Manager, RDS managed password, SSM Parameter Store 공식문서 근거 URL 추가.
+  - Airflow, FastAPI/RAG, Spark, DB/Storage별 env 주입 위치와 코드 기본값을 분리 정리.
+- `terraform/DEPLOYMENT.md`에 `server_config.*`와 FastAPI/Spark 상세 매핑 참조를 추가했다.
+- `terraform/envs/dev/variables.tf`, `terraform/envs/dev/terraform.tfvars.example`에 `server_config` object를 추가했다.
+  - `OPIK_AGENT_ENABLED`, `SEARCH_TOP_K`, `OPIK_DB_PATH`, Bedrock/agent model id, DART sentiment tuning을 배포 시점에 설정 가능하게 함.
+- `terraform/modules/compute/variables.tf`, `terraform/envs/dev/main.tf`, `terraform/modules/compute/main.tf`에 `server_config` 전달을 추가했다.
+- `terraform/modules/compute/user_data/api.sh.tftpl`
+  - `PROMPT_DIR=/opt/opik/repo/server/prompts` 추가. 기존 코드 기본값 `/root/opik-server/prompts`는 Terraform clone 경로와 불일치.
+  - `OPIK_DB_PATH`, `OPIK_AGENT_ENABLED`, `SEARCH_TOP_K`, Bedrock/agent model id, DART sentiment tuning env 렌더링 추가.
+  - Spark 경로 env(`GOLD_STRUCTURED_PREFIX`, `GOLD_EMBEDDINGS_PREFIX`, `GOLD_DISCLOSURE_PREFIX`, `DELTA_BASE_PREFIX`) 추가.
+- `terraform/modules/compute/user_data/airflow.sh.tftpl`
+  - Airflow 컨테이너 env에도 Spark 경로 env를 추가했다.
+- `spark_jobs/gold_to_delta.py`, `spark_jobs/spark_silver_to_delta.py`
+  - `S3_BASE_PREFIX`, `GOLD_STRUCTURED_PREFIX`, `GOLD_EMBEDDINGS_PREFIX`, `GOLD_DISCLOSURE_PREFIX`, `DELTA_BASE_PREFIX`를 읽도록 변경.
+  - 상대 경로는 `s3a://<bucket>/<S3_BASE_PREFIX>/<relative>`로 조립하고, `s3a://`/`s3://` 전체 URI는 그대로 사용.
+
+### Commands run
+
+- Repository inspection: `Get-Content`, `rg`.
+- Official docs lookup:
+  - AWS EC2 IAM roles for Amazon EC2
+  - AWS Secrets Manager get secret value
+  - Amazon RDS password management with Secrets Manager
+  - AWS Systems Manager Parameter Store
+
+### Validation result
+
+- 코드/문서 변경 완료.
+- `python -m py_compile spark_jobs/gold_to_delta.py spark_jobs/spark_silver_to_delta.py`: passed.
+- `terraform fmt -recursive terraform`: failed because Terraform CLI is not installed or not on PATH on this machine.
+- `terraform validate`/`terraform plan`: not run because Terraform CLI is unavailable.
+
+### AWS verification result
+
+- 실제 AWS apply/verification은 수행하지 않음.
+
+### Remaining blockers / next action
+
+- Terraform CLI가 있는 적용 머신에서 `terraform fmt -recursive`, `terraform validate`, `terraform plan`을 재실행해야 한다.
+- 이미 배포된 EC2에 반영하려면 plan/apply로 API/Airflow user-data 변경에 따른 instance replacement를 검토해야 한다.
+
+## 2026-06-22 — spark_jobs 경로 외부화 원복
+
+### Date
+
+2026-06-22
+
+### Goal
+
+- Spark job은 현재와 향후 모두 같은 S3 bucket/layout을 사용할 예정이므로, 불필요한 Spark S3 세부 경로 외부화 변경을 원복한다.
+
+### Changes made
+
+- `spark_jobs/gold_to_delta.py`, `spark_jobs/spark_silver_to_delta.py`
+  - `S3_BASE_PREFIX`, `GOLD_*_PREFIX`, `DELTA_BASE_PREFIX` override 로직 제거.
+  - 기존처럼 `S3_BUCKET`, `AWS_REGION`만 env로 받고 `gold/...`, `delta/gold_db` 경로는 코드 고정값으로 복구.
+- `terraform/modules/compute/user_data/airflow.sh.tftpl`, `terraform/modules/compute/user_data/api.sh.tftpl`
+  - Spark 전용 `GOLD_STRUCTURED_PREFIX`, `GOLD_EMBEDDINGS_PREFIX`, `GOLD_DISCLOSURE_PREFIX`, `DELTA_BASE_PREFIX` env 렌더링 제거.
+- `terraform/ENV-MAPPING.md`
+  - Spark Runtime 섹션을 고정 S3 layout 기준으로 수정.
+- `terraform/DEPLOYMENT.md`, Terraform variable descriptions
+  - FastAPI/Spark 표현 중 Spark 외부화로 오해될 수 있는 문구 정리.
+
+### Validation result
+
+- `python -m py_compile spark_jobs/gold_to_delta.py spark_jobs/spark_silver_to_delta.py`: passed.
+- `git diff -- spark_jobs/gold_to_delta.py spark_jobs/spark_silver_to_delta.py`: no diff. Spark job source changes are fully reverted.
+
+### AWS verification result
+
+- 실제 AWS apply/verification은 수행하지 않음.
