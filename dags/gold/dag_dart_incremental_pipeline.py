@@ -17,7 +17,7 @@ from dart_agent.workflows import (
 def operation_gate_open(**context) -> bool:
     """운영 게이트(ShortCircuit).
 
-    - 스케줄 실행: 백필 완료 + 평일 07:20~20:10 KST 창에서만 통과. cron(`*/3 7-20 * * 1-5`)이 대략
+    - 스케줄 실행: 백필 완료 + 평일 07:20~20:10 KST 창에서만 통과. cron(`*/6 7-20 * * 1-5`)이 대략
       좁히고, cron으로 못 박는 분 경계(07:20 시작, 20:10 종료)를 이 게이트가 강제한다.
     - 수동 트리거(Trigger DAG): **시간/요일 창을 무시하고 통과** → 날짜·시각 무관 즉시 수집.
       (백필 완료 조건은 manual도 동일하게 확인 — 백필 단계에 discovery 경합을 막기 위함)
@@ -39,7 +39,7 @@ def operation_gate_open(**context) -> bool:
 
 
 # 역할: 운영 증분 수집의 Bronze -> Silver -> Gold 경로를 한 DAG run 안에서 순서대로 실행한다.
-# 기준: 평일 07:20~20:10 KST, 3분 간격. cron은 `*/3 7-20 * * 1-5`로 좁히고, 정확한 분 경계는
+# 기준: 평일 07:20~20:10 KST, 6분 간격. cron은 `*/6 7-20 * * 1-5`로 좁히고, 정확한 분 경계는
 #       gate_operation_window(ShortCircuit)가 강제한다(창 밖이면 downstream skip).
 # 수동: Trigger DAG(수동 실행)은 시간/요일 창을 무시하고 즉시 수집한다(날짜 무관). 백필 완료 조건만 동일 적용.
 # 동시성: max_active_runs=1. 한 run의 task 런타임 예산 합이 ~9분(collect 300 + silver 120 + gold 120)이라
@@ -49,7 +49,7 @@ def operation_gate_open(**context) -> bool:
 with DAG(
     dag_id="dag_dart_incremental_pipeline",
     start_date=pendulum.datetime(2026, 1, 1, tz="Asia/Seoul"),
-    schedule="*/3 7-20 * * 1-5",
+    schedule="*/6 7-20 * * 1-5",
     catchup=False,
     max_active_runs=1,
     tags=["dart", "incremental", "pipeline"],
@@ -58,32 +58,28 @@ with DAG(
         task_id="gate_operation_window",
         python_callable=operation_gate_open,
     )
-    discover_incremental_disclosures = PythonOperator(
-        task_id="discover_incremental_disclosures",
+
+    incremental_discovery = PythonOperator(
+        task_id="incremental_discovery",
         python_callable=run_incremental_discovery,
     )
-    collect_pending_detail_jobs = PythonOperator(
-        task_id="collect_pending_detail_jobs",
+
+    detail_collector = PythonOperator(
+        task_id="detail_collector",
         python_callable=run_detail_collector,
-        op_kwargs={"batch_size": 270, "concurrency": 4, "max_runtime_seconds": 300},
+        op_kwargs={"batch_size": 50, "concurrency": 1, "max_runtime_seconds": 300},
     )
+
     silver_incremental = PythonOperator(
         task_id="silver_incremental",
         python_callable=run_silver_incremental,
         op_kwargs={"max_runtime_seconds": 120},
     )
+
     gold_incremental = PythonOperator(
         task_id="gold_incremental",
         python_callable=run_gold_incremental,
-        # chunk_size 20→10: 임베딩은 배치 flush 단위라, 배치를 줄이면 budget(120s) 오버슈트가 작아진다
-        # (한 배치 임베딩은 중단 불가). 산출물(임베딩 row)은 동일, part 파일만 잘게 나뉘고 compaction이 병합.
-        op_kwargs={"limit": 1000, "chunk_size": 10, "max_runtime_seconds": 120},
+        op_kwargs={"limit": 2000, "chunk_size": 20, "max_runtime_seconds": 120},
     )
 
-    (
-        gate_operation_window
-        >> discover_incremental_disclosures
-        >> collect_pending_detail_jobs
-        >> silver_incremental
-        >> gold_incremental
-    )
+    gate_operation_window >> incremental_discovery >> detail_collector >> silver_incremental >> gold_incremental

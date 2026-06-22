@@ -1,20 +1,20 @@
 """OPIK Model Prediction DAG
 
 Daily model training + prediction generation + S3 Gold upload.
-Runs at 06:00 KST after US market close, before the Korean market opens at 09:00.
+Runs at 06:30 KST after daily OHLCV collection (06:00), before the Korean market opens at 09:00.
 
 Output: s3://s3-opik-bucket/gold/model/predictions/dt={YYYY-MM-DD}/predictions.parquet
 Consumed by: OPIK Briefing DAG (07:00 KST) for triple consensus checking.
 
-IMPORTANT — Date offset: OHLCV/feature data arrives with ~2 day lag (T-2).
+IMPORTANT - Date offset: OHLCV/feature data arrives with ~2 day lag (T-2).
 The DAG uses `execution_date - 2 days` so training data is always available.
+Runs Mon-Fri only (weekends have no market data).
 """
 
-from datetime import datetime, timedelta
-
+from datetime import timedelta
+import pendulum
 from airflow import DAG
 from airflow.operators.bash import BashOperator
-
 import logging
 
 logger = logging.getLogger("opik.model_dag")
@@ -28,7 +28,7 @@ def notify_telegram_failure(context):
     dag_id = context["dag"].dag_id
     exec_date = context["execution_date"]
     error_msg = (
-        f"OPIK Model DAG Failure\n"
+        "OPIK Model DAG Failure\n"
         f"DAG: {dag_id}\n"
         f"Task: {task_id}\n"
         f"Date: {exec_date.strftime('%Y-%m-%d')}"
@@ -39,7 +39,6 @@ def notify_telegram_failure(context):
 default_args = {
     "owner": "opik",
     "depends_on_past": False,
-    "start_date": datetime(2026, 6, 18),
     "retries": 1,
     "retry_delay": timedelta(minutes=5),
     "execution_timeout": timedelta(hours=2),
@@ -49,11 +48,12 @@ default_args = {
 with DAG(
     dag_id="model_daily_prediction",
     default_args=default_args,
-    schedule="0 6 * * *",
+    schedule="30 6 * * 1-5",
+    start_date=pendulum.datetime(2026, 6, 18, tz="Asia/Seoul"),
     catchup=False,
     max_active_runs=1,
     tags=["opik", "model", "phase2"],
-    description="Daily LightGBM model training + prediction + S3 Gold upload (06:00 KST)",
+    description="Daily LightGBM model training + prediction + S3 Gold upload (06:30 KST, Mon-Fri)",
 ) as dag:
 
     run_model_pipeline = BashOperator(

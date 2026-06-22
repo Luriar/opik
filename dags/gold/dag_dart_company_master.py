@@ -14,7 +14,7 @@ from dart_agent.workflows import run_company_master
 with DAG(
     dag_id="dag_dart_company_master",
     start_date=pendulum.datetime(2026, 1, 1, tz="Asia/Seoul"),
-    schedule="0 15 * * 1-5",  # 15:00 KST 평일
+    schedule="0 9,15 * * 1-5",  # 15:00 KST 평일
     catchup=False,
     tags=["dart", "master"],
 ) as dag:

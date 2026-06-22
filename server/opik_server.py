@@ -713,6 +713,46 @@ def _scan_reports_by_date(date_from: str, date_to: str, limit: int = 50,
     logger.info("Scanning structured by 발행일: %s ~ %s (months %04d-%02d ~ %04d-%02d)",
                  date_from, date_to, fy, fm, ty, tm)
 
+    # Delta-first: structured Delta 테이블을 한 번에 읽어 발행일로 필터(파티션 스캔 대체).
+    # Delta가 비었거나 실패하면 아래 월 파티션 parquet 스캔으로 폴백(무회귀).
+    try:
+        from agents.data_helper import read_gold_data
+        _ddf = read_gold_data("structured")
+    except Exception:
+        _ddf = None
+    if _ddf is not None and len(_ddf) > 0 and "발행일" in _ddf.columns:
+        d = _ddf.copy()
+        d["발행일_s"] = d["발행일"].astype(str).str.replace("-", "").str.replace(".", "")
+        if date_from:
+            d = d[d["발행일_s"] >= date_from.replace("-", "")]
+        if date_to:
+            d = d[d["발행일_s"] <= date_to.replace("-", "")]
+        d = d.sort_values("발행일", ascending=False)
+        for _, row in d.iterrows():
+            rid = str(row.get("report_id", ""))
+            info = report_texts.get(rid, {})
+            title = str(row.get("title", "")) if row.get("title") is not None else ""
+            증권사 = str(row.get("증권사", "")) if row.get("증권사") is not None else ""
+            reason = f"[{증권사}] {title}" if 증권사 and title else (title or info.get("reason", ""))
+            ymd = str(row.get("발행일_s", ""))
+            all_results.append(
+                SearchResult(
+                    report_id=rid,
+                    score=1.0,
+                    종목코드=str(row.get("종목코드", "")) if row.get("종목코드") is not None else None,
+                    reason=str(reason)[:300] if reason else None,
+                    keywords=info.get("keywords"),
+                    risks=info.get("risks"),
+                    year=int(ymd[:4]) if len(ymd) >= 4 else 0,
+                    month=int(ymd[4:6]) if len(ymd) >= 6 else 0,
+                )
+            )
+        total = len(all_results)
+        results = all_results[offset:offset + limit]
+        logger.info("Date scan complete (Delta): %d total, returning %d (offset=%d) for %s~%s",
+                     total, len(results), offset, date_from, date_to)
+        return results, total
+
     for y in range(fy, ty + 1):
         m_start = fm if y == fy else 1
         m_end = tm if y == ty else 12

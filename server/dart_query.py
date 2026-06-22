@@ -333,9 +333,9 @@ def query_disclosure_events(companies, codes, date_from=None, date_to=None,
 
     try:
         from agents.data_helper import read_gold_data
-        df = read_gold_data("dart/disclosure_events")
+        df = read_gold_data("material_event")
         if df is not None and len(df) > 0:
-            logger.info("disclosure_events loaded via Delta: %d rows", len(df))
+            logger.info("material_event loaded via Delta: %d rows", len(df))
             df = _filter_by_date_col(df, "rcept_dt", date_from, date_to)
             if len(df) > limit_rows:
                 df = df.head(limit_rows)

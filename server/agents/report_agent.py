@@ -140,6 +140,38 @@ class ReportAgent:
         ty = int(date_to[:4])
         tm = int(date_to[5:7])
 
+        # Delta-first: structured Delta 테이블을 한 번에 읽어 발행일로 필터(파티션 스캔 대체).
+        # Delta가 비었거나 실패하면 아래 월 파티션 parquet 스캔으로 폴백(무회귀).
+        try:
+            from agents.data_helper import read_gold_data
+            _ddf = read_gold_data("structured")
+        except Exception:
+            _ddf = None
+        if _ddf is not None and len(_ddf) > 0 and "발행일" in _ddf.columns:
+            d = _ddf.copy()
+            d["발행일_s"] = d["발행일"].astype(str).str.replace("-", "").str.replace(".", "")
+            f, t = date_from.replace("-", ""), date_to.replace("-", "")
+            d = d[(d["발행일_s"] >= f) & (d["발행일_s"] <= t)].sort_values("발행일", ascending=False)
+            for _, row in d.iterrows():
+                rid = str(row.get("report_id", ""))
+                info = self.report_texts.get(rid, {})
+                title = str(row.get("title", "")) if row.get("title") is not None else ""
+                sec = str(row.get("증권사", "")) if row.get("증권사") is not None else ""
+                reason = f"[{sec}] {title}" if sec and title else (title or info.get("reason", ""))
+                ymd = str(row.get("발행일_s", ""))
+                results.append({
+                    "report_id": rid,
+                    "score": 1.0,
+                    "종목코드": str(row.get("종목코드", "")) if row.get("종목코드") is not None else None,
+                    "reason": str(reason)[:300] if reason else None,
+                    "keywords": info.get("keywords"),
+                    "risks": info.get("risks"),
+                    "year": int(ymd[:4]) if len(ymd) >= 4 else None,
+                    "month": int(ymd[4:6]) if len(ymd) >= 6 else None,
+                })
+            logger.info("Date scan (Delta): %s~%s → %d results", date_from, date_to, len(results))
+            return results[:limit]
+
         for y in range(fy, ty + 1):
             ms = fm if y == fy else 1
             me = tm if y == ty else 12

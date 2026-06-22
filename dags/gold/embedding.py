@@ -33,13 +33,13 @@ from botocore.exceptions import ClientError
 try:
     import pendulum
     from airflow import DAG
+    from airflow.datasets import Dataset
     from airflow.operators.python import PythonOperator
-    from airflow.operators.bash import BashOperator
     from airflow.sensors.external_task import ExternalTaskSensor
 except ImportError:  # 로컬 CLI 실행 환경에는 Airflow가 없을 수 있다.
     DAG = None
+    Dataset = None
     PythonOperator = None
-    BashOperator = None
     ExternalTaskSensor = None
 
 
@@ -100,6 +100,9 @@ if BEDROCK_API_KEY and not os.getenv("AWS_BEARER_TOKEN_BEDROCK"):
 RAW_SILVER_PREFIX = "silver/"
 EMBEDDING_INPUT_PREFIX = "silver/embedding_input/"
 GOLD_EMBEDDING_PREFIX = "gold/embeddings/"
+# Dataset URI — dag_maintenance_delta_faiss가 이 URI로 본 DAG 완료를 구독한다.
+# 변경 시 dags/maintenance/dag_maintenance_delta_faiss.py의 동일 URI도 같이 수정할 것.
+GOLD_EMBEDDINGS_DATASET_URI = "s3://s3-opik-bucket/gold/embeddings/"
 REPORT_PIPELINE_SCHEDULE = os.getenv("OPIK_REPORT_PIPELINE_SCHEDULE", "0 0 * * *")
 KST_TARGET_DATE_TEMPLATE = (
     "{{ data_interval_end.in_timezone('Asia/Seoul').subtract(days=1).to_date_string() }}"
@@ -940,61 +943,11 @@ def build_dag():
                 "fail_on_llm_error": True,
             },
             execution_timeout=timedelta(hours=1),
+            # 성공 시 Dataset 업데이트 → maintenance DAG 트리거(structured와 AND 조건).
+            outlets=[Dataset(GOLD_EMBEDDINGS_DATASET_URI)],
         )
-        faiss_rebuild = BashOperator(
-            task_id="rebuild_faiss_index",
-            bash_command="""
-                docker run --rm --privileged --pid=host alpine:latest nsenter -t 1 -m -u -i -n -p -- bash -c '
-                    echo "=== FAISS rebuild via embedding DAG at $(date -Iseconds) ==="
-                    cd /root/opik-server && python3 build_index.py
-                    echo "=== Server restart ==="
-                    systemctl restart opik-server
-                    sleep 3
-                    systemctl status opik-server --no-pager | head -5
-                '
-            """,
-            retries=1,
-            retry_delay=timedelta(minutes=5),
-            execution_timeout=timedelta(minutes=10),
-        )
-        wait_for_silver >> embedding_task >> faiss_rebuild
+        wait_for_silver >> embedding_task
     return dag_obj
 
 
 dag = build_dag()
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Daily gold/embeddings builder")
-    parser.add_argument("--date", help="처리할 하루. 예: 2026-06-16")
-    parser.add_argument("--start-date", help="기간 시작일. --date가 있으면 무시")
-    parser.add_argument("--end-date", help="기간 종료일. --date가 있으면 무시")
-    parser.add_argument("--lag-days", type=int, default=1)
-    parser.add_argument("--limit", type=int, default=0)
-    parser.add_argument("--overwrite-embedding-input", action="store_true")
-    parser.add_argument("--no-write-embedding-input", action="store_true")
-    parser.add_argument("--include-failed-llm", action="store_true")
-    parser.add_argument("--allow-llm-failures", action="store_true")
-    parser.add_argument("--dry-run", action="store_true")
-    return parser.parse_args()
-
-
-def main():
-    args = parse_args()
-    result = run_daily_embedding(
-        target_date=args.date,
-        start_date=args.start_date,
-        end_date=args.end_date,
-        lag_days=args.lag_days,
-        limit=args.limit,
-        overwrite_embedding_input=args.overwrite_embedding_input,
-        write_embedding_input=not args.no_write_embedding_input,
-        include_failed_llm=args.include_failed_llm,
-        fail_on_llm_error=not args.allow_llm_failures,
-        dry_run=args.dry_run,
-    )
-    print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
-
-
-if __name__ == "__main__":
-    main()
