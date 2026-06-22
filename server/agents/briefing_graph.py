@@ -203,7 +203,7 @@ def load_dart_events(state: BriefingState) -> BriefingState:
                     df_facts["_rcept_dt_norm"] = df_facts["rcept_dt"].astype(str).str.replace("-", "")
                     df_facts = df_facts[
                         (df_facts["_rcept_dt_norm"] >= start_dt.strftime("%Y%m%d")) &
-                        (df_facts["_rcept_dt_norm"] <= latest_dt.strftime("%Y%m%d"))
+                        (df_facts["_rcept_dt_norm"] <= target_dt.strftime("%Y%m%d"))
                     ]
                     df_facts = df_facts.drop(columns=["_rcept_dt_norm"])
                 combined = df_facts
