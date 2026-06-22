@@ -125,6 +125,56 @@ class ReportAgent:
 
         logger.info("FAISS search: '%s' → %d results", query[:60], len(results))
         return results
+    def search_by_date(self, date_from: str, date_to: str, limit: int = 50) -> list:
+        """Scan S3 gold/structured by 발행일. Used when user specifies an exact date.
+
+        Reads gold/structured/year=YYYY/month=MM/data.parquet, filters by 발행일.
+        Returns list of dicts with report_id, reason, keywords, risks, etc.
+        """
+        import io, pyarrow.parquet as pq
+        s3 = boto3.client("s3", region_name=AWS_REGION)
+        BUCKET = os.environ.get("S3_BUCKET", "s3-opik-bucket")
+        results = []
+        fy = int(date_from[:4])
+        fm = int(date_from[5:7])
+        ty = int(date_to[:4])
+        tm = int(date_to[5:7])
+
+        for y in range(fy, ty + 1):
+            ms = fm if y == fy else 1
+            me = tm if y == ty else 12
+            for m in range(ms, me + 1):
+                key = f"gold/structured/year={y:04d}/month={m:02d}/data.parquet"
+                try:
+                    resp = s3.get_object(Bucket=BUCKET, Key=key)
+                    buf = io.BytesIO(resp["Body"].read())
+                    df = pq.read_table(buf).to_pandas()
+                except Exception:
+                    continue
+                if "발행일" in df.columns:
+                    from pandas import Series
+                    mask = Series(True, index=df.index)
+                    mask = mask & (df["발행일"].astype(str) >= date_from)
+                    mask = mask & (df["발행일"].astype(str) <= date_to)
+                    df = df[mask].sort_values("발행일", ascending=False)
+                for _, row in df.iterrows():
+                    rid = str(row.get("report_id", ""))
+                    info = self.report_texts.get(rid, {})
+                    title = str(row.get("title", "")) if row.get("title") is not None else ""
+                    sec = str(row.get("증권사", "")) if row.get("증권사") is not None else ""
+                    reason = f"[{sec}] {title}" if sec and title else (title or info.get("reason", ""))
+                    results.append({
+                        "report_id": rid,
+                        "score": 1.0,
+                        "종목코드": str(row.get("종목코드", "")) if row.get("종목코드") is not None else None,
+                        "reason": str(reason)[:300] if reason else None,
+                        "keywords": info.get("keywords"),
+                        "risks": info.get("risks"),
+                        "year": y,
+                        "month": m,
+                    })
+        logger.info("Date scan: %s~%s → %d results", date_from, date_to, len(results))
+        return results[:limit]
 
     def summarise(self, user_question: str, search_results: List[dict]) -> str:
         """Summarise FAISS results with Haiku."""

@@ -18,7 +18,7 @@ Design decisions:
   - No Spark — all Pandas in-process (2-6 seconds total)
   - No composite score — triple consensus binary check
   - Single PythonOperator in Airflow (LangGraph orchestrates internals)
-  - DART data: Gold v3 report_registry (상용 Exisign/DartCollector), legacy Delta fallback
+  - DART data: OPIK disclosure_events as Phase 2 primary source
   - ! tier: B-type major disclosures only
 """
 
@@ -33,10 +33,6 @@ from typing import Optional, List, Dict, Any
 import boto3
 import pandas as pd
 import pyarrow.parquet as pq
-
-# Unified Gold data reader — Delta from S3 first, Parquet fallback
-# Gold v3: DART data now read from gold/dart/report_registry (상용 Exisign/DartCollector)
-from .data_helper import read_gold_data, read_dart_report_registry, read_dart_material_events
 
 logger = logging.getLogger("opik.briefing")
 
@@ -89,26 +85,28 @@ def _list_parquet_keys(prefix: str) -> List[str]:
 # ── Step Implementations ──
 
 def load_gold_structured(state: BriefingState) -> BriefingState:
-    """Step 1: Load today's Gold Structured data via Delta Lake from S3."""
+    """Step 1: Load today's Gold Structured data from S3."""
     date = state.date  # YYYYMMDD
     year = date[:4]
     month = date[4:6]
+    key = f"gold/structured/year={year}/month={month}/data.parquet"
 
     try:
-        df = read_gold_data("structured")
-        if df is not None and len(df) > 0:
-            # Filter to today's report date
-            today_compact = date
-            if "발행일" in df.columns:
-                df["발행일_str"] = df["발행일"].astype(str).str.replace("-", "")
-                df = df[df["발행일_str"] == today_compact]
-            elif "report_date" in df.columns:
-                df["report_date_str"] = df["report_date"].astype(str).str.replace("-", "")
-                df = df[df["report_date_str"] == today_compact]
-            state.structured = df.to_dict("records")
-            logger.info("Step 1: Gold Structured loaded via Delta — %d rows for %s", len(state.structured), date)
-        else:
-            state.structured = []
+        df = _read_parquet_s3(key)
+        # Filter to today's report date
+        # 발행일 is the report publication date (stored as YYYYMMDD or YYYY-MM-DD)
+        today_str = f"{year}-{month}-{date[6:8]}"
+        today_compact = date
+
+        if "발행일" in df.columns:
+            df["발행일_str"] = df["발행일"].astype(str).str.replace("-", "")
+            df = df[df["발행일_str"] == today_compact]
+        elif "report_date" in df.columns:
+            df["report_date_str"] = df["report_date"].astype(str).str.replace("-", "")
+            df = df[df["report_date_str"] == today_compact]
+
+        state.structured = df.to_dict("records")
+        logger.info("Step 1: Gold Structured loaded — %d rows for %s", len(state.structured), date)
     except Exception as e:
         logger.warning("Step 1: Gold Structured load failed: %s", e)
         state.structured = []
@@ -117,14 +115,16 @@ def load_gold_structured(state: BriefingState) -> BriefingState:
 
 
 def load_gold_llm(state: BriefingState) -> BriefingState:
-    """Step 2: Load today's Gold LLM (reason/risks/keywords) via Delta Lake from S3."""
+    """Step 2: Load today's Gold LLM (reason/risks/keywords) from S3."""
+    date = state.date
+    year = date[:4]
+    month = date[4:6]
+    key = f"gold/embeddings/year={year}/month={month}/data.parquet"
+
     try:
-        df = read_gold_data("embeddings")
-        if df is not None:
-            state.llm_data = df.to_dict("records")
-            logger.info("Step 2: Gold LLM loaded via Delta — %d rows", len(state.llm_data))
-        else:
-            state.llm_data = []
+        df = _read_parquet_s3(key)
+        state.llm_data = df.to_dict("records")
+        logger.info("Step 2: Gold LLM loaded — %d rows", len(state.llm_data))
     except Exception as e:
         logger.warning("Step 2: Gold LLM load failed: %s", e)
         state.llm_data = []
@@ -133,79 +133,104 @@ def load_gold_llm(state: BriefingState) -> BriefingState:
 
 
 def load_dart_events(state: BriefingState) -> BriefingState:
-    """Step 3: Load 92-day window of DART events from Gold v3 report_registry.
+    """Step 3: Load 1 quarter of DART disclosure events.
 
-    Gold v3 (상용 Exisign/DartCollector, 2026-06-19):
-      - report_registry contains ALL report types (REGULAR, MATERIAL_EVENT, etc.)
-      - Uses rcept_year/rcept_month partition scan to get recent data first.
-      - Falls back to old disclosure_events Delta if Gold v3 not available.
+    Primary: Delta dart/disclosure_events (fast single read)
+    Fallback: DartCollector Gold facts/material_event (new partitioned path)
+    Legacy fallback: gold/dart/disclosure_events/dt={ym}/ (may be deleted by compaction)
     """
     target_dt = datetime.strptime(state.date, "%Y%m%d")
     start_dt = target_dt - timedelta(days=92)  # ~1 quarter for ★ consensus window
 
-    state.dart_events_df = pd.DataFrame()
+    combined = None
+
+    # Path 1: Delta (primary, fast)
     try:
-        # Gold v3: scan partitions by year/month to get recent data first.
-        # Without year/month filter, S3 alphabetical scan returns oldest data (2024)
-        # and max_keys=50 cuts off before reaching 2026.
-        start_year = start_dt.year
-        start_month = start_dt.month
-        end_year = target_dt.year
-        end_month = target_dt.month
+        from agents.data_helper import read_gold_data
+        df_delta = read_gold_data("dart/disclosure_events")
+        if df_delta is not None and len(df_delta) > 0:
+            if "rcept_dt" in df_delta.columns:
+                df_delta = df_delta[
+                    (df_delta["rcept_dt"] >= start_dt.strftime("%Y%m%d")) &
+                    (df_delta["rcept_dt"] <= state.date)
+                ]
+            combined = df_delta
+            logger.info("Step 3: DART loaded via Delta — %d rows", len(combined))
+    except Exception as e:
+        logger.debug("Step 3: Delta read skipped: %s", e)
+
+    # Path 2: DartCollector Gold material_event facts (new)
+    if combined is None or len(combined) == 0:
+        try:
+            prefix = "gold/dart/facts/material_event/"
+            all_keys = _list_parquet_keys(prefix)
+
+            # Filter by date partitions
+            months = set()
+            d = start_dt
+            while d <= target_dt:
+                months.add((str(d.year), f"{d.month:02d}"))
+                if d.month == 12:
+                    d = datetime(d.year + 1, 1, 1)
+                else:
+                    d = datetime(d.year, d.month + 1, 1)
+
+            relevant_keys = []
+            for key in all_keys:
+                m = re.search(r'rcept_year=(\d{4})/rcept_month=(\d{2})/', key)
+                if m and (m.group(1), m.group(2)) in months:
+                    relevant_keys.append(key)
+                elif not m:
+                    relevant_keys.append(key)
+
+            if not relevant_keys and all_keys:
+                relevant_keys = all_keys
+
+            df_facts = _read_parquet_keys(relevant_keys, limit_rows=50000)
+            if len(df_facts) > 0:
+                if "rcept_dt" in df_facts.columns:
+                    df_facts = df_facts[
+                        (df_facts["rcept_dt"].astype(str) >= start_dt.strftime("%Y%m%d")) &
+                        (df_facts["rcept_dt"].astype(str) <= state.date)
+                    ]
+                combined = df_facts
+                logger.info("Step 3: DART loaded via material_event facts — %d rows", len(combined))
+        except Exception as e:
+            logger.debug("Step 3: material_event read skipped: %s", e)
+
+    # Path 3: Legacy gold/dart/disclosure_events/dt= (may be deleted by compaction)
+    if combined is None or len(combined) == 0:
+        months_set = set()
+        d = start_dt
+        while d <= target_dt:
+            months_set.add(d.strftime("%Y-%m"))
+            d = datetime(d.year, d.month, 1) + timedelta(days=32)
+            d = datetime(d.year, d.month, 1)
 
         dfs = []
-        for year in range(start_year, end_year + 1):
-            m_start = start_month if year == start_year else 1
-            m_end = end_month if year == end_year else 12
-            for month in range(m_start, m_end + 1):
-                part = read_dart_report_registry(
-                    rcept_year=str(year),
-                    rcept_month=str(month).zfill(2),
-                    max_keys=30,
-                )
-                if part is not None and not part.empty:
-                    dfs.append(part)
+        for ym in sorted(months_set):
+            key = f"gold/dart/disclosure_events/dt={ym}/data.parquet"
+            try:
+                df = _read_parquet_s3(key)
+                dfs.append(df)
+                logger.info("Step 3 legacy: Loaded dt=%s: %d rows", ym, len(df))
+            except Exception:
+                pass
 
         if dfs:
-            df = pd.concat(dfs, ignore_index=True)
-            # Deduplicate by rcept_no across all partitions
-            if "rcept_no" in df.columns:
-                df = df.drop_duplicates(subset=["rcept_no"], keep="first")
-            # Filter to 92-day window
-            if "rcept_dt" in df.columns:
-                df = df[
-                    (df["rcept_dt"] >= start_dt.strftime("%Y%m%d")) &
-                    (df["rcept_dt"] <= state.date)
+            combined = pd.concat(dfs, ignore_index=True)
+            if "rcept_dt" in combined.columns:
+                combined = combined[
+                    (combined["rcept_dt"] >= start_dt.strftime("%Y%m%d")) &
+                    (combined["rcept_dt"] <= state.date)
                 ]
-            state.dart_events_df = df
-            logger.info("Step 3: DART events loaded via Gold v3 — %d rows (%d months scanned)",
-                        len(df), len(dfs))
-        else:
-            logger.warning("Step 3: Gold v3 report_registry empty, trying legacy Delta...")
-            df = read_gold_data("dart/disclosure_events")
-            if df is not None and len(df) > 0:
-                if "rcept_dt" in df.columns:
-                    df = df[
-                        (df["rcept_dt"] >= start_dt.strftime("%Y%m%d")) &
-                        (df["rcept_dt"] <= state.date)
-                    ]
-                state.dart_events_df = df
-                logger.info("Step 3: DART events loaded via legacy Delta — %d rows", len(df))
-    except Exception as e:
-        logger.warning("Step 3: DART events load failed: %s", e)
-        # Last-resort fallback to old Delta
-        try:
-            df = read_gold_data("dart/disclosure_events")
-            if df is not None and len(df) > 0:
-                if "rcept_dt" in df.columns:
-                    df = df[
-                        (df["rcept_dt"] >= start_dt.strftime("%Y%m%d")) &
-                        (df["rcept_dt"] <= state.date)
-                    ]
-                state.dart_events_df = df
-                logger.info("Step 3: DART events loaded via legacy Delta — %d rows", len(df))
-        except Exception:
-            pass
+
+    if combined is not None and len(combined) > 0:
+        state.dart_events_df = combined
+        logger.info("Step 3: DART events loaded — %d rows", len(combined))
+    else:
+        logger.warning("Step 3: No DART events found for the period")
+        state.dart_events_df = pd.DataFrame()
 
     return state
 
@@ -645,8 +670,8 @@ def send_telegram(state: BriefingState) -> BriefingState:
         return state
 
     # Import telegram sender (from existing pipeline)
-    telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-    telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
 
     if not telegram_token or not telegram_chat_id:
         logger.warning("Step 9: Telegram credentials not configured — skipping send")
@@ -841,6 +866,5 @@ def run_briefing_pipeline(date: str) -> dict:
         "report_count": len(state.structured),
         "dart_count": len(state.dart_events_df) if state.dart_events_df is not None else 0,
         "briefing_length": len(state.final_briefing),
-        "final_briefing": state.final_briefing,
         "error": state.error,
     }

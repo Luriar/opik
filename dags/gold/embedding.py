@@ -34,10 +34,12 @@ try:
     import pendulum
     from airflow import DAG
     from airflow.operators.python import PythonOperator
+    from airflow.operators.bash import BashOperator
     from airflow.sensors.external_task import ExternalTaskSensor
 except ImportError:  # 로컬 CLI 실행 환경에는 Airflow가 없을 수 있다.
     DAG = None
     PythonOperator = None
+    BashOperator = None
     ExternalTaskSensor = None
 
 
@@ -939,7 +941,23 @@ def build_dag():
             },
             execution_timeout=timedelta(hours=1),
         )
-        wait_for_silver >> embedding_task
+        faiss_rebuild = BashOperator(
+            task_id="rebuild_faiss_index",
+            bash_command="""
+                docker run --rm --privileged --pid=host alpine:latest nsenter -t 1 -m -u -i -n -p -- bash -c '
+                    echo "=== FAISS rebuild via embedding DAG at $(date -Iseconds) ==="
+                    cd /root/opik-server && python3 build_index.py
+                    echo "=== Server restart ==="
+                    systemctl restart opik-server
+                    sleep 3
+                    systemctl status opik-server --no-pager | head -5
+                '
+            """,
+            retries=1,
+            retry_delay=timedelta(minutes=5),
+            execution_timeout=timedelta(minutes=10),
+        )
+        wait_for_silver >> embedding_task >> faiss_rebuild
     return dag_obj
 
 

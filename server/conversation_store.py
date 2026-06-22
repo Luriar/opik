@@ -31,8 +31,8 @@ class ConversationSession:
 class ConversationStore:
     """스레드 안전한 LRU 기반 대화 저장소"""
 
-    def __init__(self, max_sessions=100, max_turns_per_session=20,
-                 context_window_tokens=8000, session_ttl_minutes=60):
+    def __init__(self, max_sessions=200, max_turns_per_session=None,
+                 context_window_tokens=8000, session_ttl_minutes=180):
         self._sessions = OrderedDict()
         self._lock = threading.Lock()
         self.max_sessions = max_sessions
@@ -68,9 +68,14 @@ class ConversationStore:
         )
         session.turns.append(turn)
 
-        # 초과 턴은 요약 후 압축
-        if len(session.turns) > self.max_turns:
+        # 일정 턴 이상이면 오래된 턴을 요약 압축 (메모리 관리)
+        # max_turns_per_session=None → never compress by count; set a number for threshold
+        _limit = self.max_turns if self.max_turns else 9999
+        if len(session.turns) > _limit:
             self._compress_old_turns(session)
+
+        # Persist to SQLite (fire-and-forget, best-effort)
+        self._persist_session(session_id, session)
 
     def get_context_for_prompt(self, session_id: str) -> str:
         """프롬프트에 주입할 대화 맥락 생성"""
@@ -101,19 +106,9 @@ class ConversationStore:
         return "\n".join(parts)
 
     def is_context_full(self, session_id: str) -> bool:
-        """컨텍스트 윈도우 가득 참 여부"""
-        session = self.get_or_create(session_id)
-        turn_count = len(session.turns)
-        summary_count = sum(1 for t in session.turns if t.summary)
-        total_chars = sum(
-            len(t.summary or t.content) for t in session.turns
-        )
-
-        return (
-            turn_count > 20
-            or summary_count >= 10
-            or total_chars > self.context_window_tokens * 4  # char ≈ token/4
-        )
+        """컨텍스트 윈도우 가득 참 여부 — 항상 False.
+        텔레그램 챗봇 UX: 사용자에게 '대화가 길어졌습니다' 메시지를 보여주지 않음."""
+        return False
 
     def reset_session(self, session_id: str):
         """대화 세션 초기화"""
@@ -193,7 +188,7 @@ class ConversationStore:
 
     def _compress_old_turns(self, session: ConversationSession):
         """오래된 턴을 규칙 기반으로 압축 (LLM 요약 없이)"""
-        old_turns = session.turns[:-6]  # 최근 3왕복 제외
+        old_turns = session.turns[:-14]  # 최근 7왕복은 원문 보존
         if not old_turns:
             return
 
@@ -213,8 +208,8 @@ class ConversationStore:
         else:
             session.context_summary = new_summary
 
-        # 오래된 턴 제거
-        session.turns = session.turns[-6:]
+        # 오래된 턴 제거, 최근 7왕복만 보존
+        session.turns = session.turns[-14:]
 
     def _extract_keywords(self, turns: list) -> dict:
         """간단한 키워드 추출 (규칙 기반, LLM 호출 없음).
@@ -279,6 +274,62 @@ class ConversationStore:
             "topics": list(topics)[:5],
             "recent_dates": list(recent_dates)[:5],
         }
+
+    def _persist_session(self, session_id: str, session: ConversationSession):
+        """Best-effort persist to SQLite."""
+        try:
+            from db import save_conversation
+            chat_id = 0
+            if session_id.startswith("telegram_"):
+                try:
+                    chat_id = int(session_id.split("_", 1)[1])
+                except ValueError:
+                    chat_id = 0
+            turns_json = [
+                {"role": t.role, "content": t.content,
+                 "summary": t.summary, "timestamp": t.timestamp.isoformat()}
+                for t in session.turns
+            ]
+            save_conversation(session_id, chat_id, turns_json, session.context_summary)
+        except Exception:
+            pass
+
+    def restore_all(self):
+        """Restore active conversations from SQLite on startup."""
+        try:
+            from db import list_approved_subscribers, load_conversation_by_chat
+            subscribers = list_approved_subscribers()
+            for sub in subscribers:
+                chat_id = sub["chat_id"]
+                sessions = load_conversation_by_chat(chat_id, limit=1)
+                for s in sessions:
+                    sid = s["session_id"]
+                    cs = ConversationSession(
+                        session_id=sid,
+                        context_summary=s.get("context_summary", ""),
+                    )
+                    cs.last_active = datetime.fromisoformat(
+                        s.get("last_active", datetime.now().isoformat())
+                    ) if s.get("last_active") else datetime.now()
+                    for t in s.get("turns", []):
+                        ts = t.get("timestamp", "")
+                        try:
+                            ts_dt = datetime.fromisoformat(ts) if ts else datetime.now()
+                        except (ValueError, TypeError):
+                            ts_dt = datetime.now()
+                        cs.turns.append(ConversationTurn(
+                            role=t.get("role", "user"),
+                            content=t.get("content", ""),
+                            summary=t.get("summary", ""),
+                            timestamp=ts_dt,
+                        ))
+                    with self._lock:
+                        if sid not in self._sessions:
+                            self._sessions[sid] = cs
+            import logging
+            logging.getLogger(__name__).info("Restored %d sessions", len(self._sessions))
+        except Exception:
+            pass
 
     def _evict_expired(self):
         """TTL 만료 세션 제거"""
