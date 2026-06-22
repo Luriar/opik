@@ -276,7 +276,11 @@ class ResponseComposer:
                 ticker = item.get("ticker", "")
                 name = item.get("종목명", ticker)
                 model_pred = item.get("model_pred", {})
-                pred_price = model_pred.get("pred_close_price", "N/A")
+                raw_price = model_pred.get("pred_close_price", 0)
+                try:
+                    pred_price = f"{float(raw_price):,.0f}"
+                except (ValueError, TypeError):
+                    pred_price = "N/A"
 
                 reports = item.get("reports", [])
                 best_report = {}
