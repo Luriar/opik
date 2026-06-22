@@ -82,6 +82,36 @@ def _list_parquet_keys(prefix: str) -> List[str]:
     return keys
 
 
+def _read_parquet_keys(keys: List[str], limit_rows: int = 50000) -> pd.DataFrame:
+    """Read multiple Parquet keys from S3 and concatenate into a DataFrame.
+
+    Args:
+        keys: S3 key paths to read
+        limit_rows: stop reading after accumulating this many rows
+
+    Returns:
+        Concatenated DataFrame (empty if no keys or all reads fail)
+    """
+    s3 = _get_s3()
+    frames = []
+    total = 0
+    for key in keys:
+        if total >= limit_rows:
+            break
+        try:
+            obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
+            buf = io.BytesIO(obj["Body"].read())
+            table = pq.read_table(buf)
+            df = table.to_pandas()
+            frames.append(df)
+            total += len(df)
+        except Exception as e:
+            logger.warning("Error reading %s: %s", key, e)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
 # ── Step Implementations ──
 
 def load_gold_structured(state: BriefingState) -> BriefingState:
@@ -858,36 +888,4 @@ def build_briefing_graph():
     g.add_edge("load_structured", "load_llm")
     g.add_edge("load_llm", "load_dart")
     g.add_edge("load_dart", "sentiment")
-    g.add_edge("sentiment", "load_model")
-    g.add_edge("load_model", "consensus")
-    g.add_edge("consensus", "filter_excl")
-    g.add_edge("filter_excl", "compose")
-    g.add_edge("compose", "send")
-    g.set_finish_point("send")
-
-    return g.compile()
-
-
-# ── Airflow entrypoint ──
-
-def run_briefing_pipeline(date: str) -> dict:
-    """Entrypoint for Airflow PythonOperator.
-
-    Args:
-        date: YYYYMMDD string (from Airflow {{ ds_nodash }})
-
-    Returns:
-        dict with summary of results
-    """
-    graph = BriefingGraph()
-    state = graph.run(date)
-
-    return {
-        "date": date,
-        "star_count": len(state.star_candidates),
-        "exclamation_count": len(state.exclamation_items),
-        "report_count": len(state.structured),
-        "dart_count": len(state.dart_events_df) if state.dart_events_df is not None else 0,
-        "briefing_length": len(state.final_briefing),
-        "error": state.error,
-    }
+    g.add_edge("sentimen
