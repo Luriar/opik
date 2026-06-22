@@ -160,10 +160,13 @@ def load_dart_events(state: BriefingState) -> BriefingState:
         df_delta = read_gold_data("material_event")
         if df_delta is not None and len(df_delta) > 0:
             if "rcept_dt" in df_delta.columns:
+                # Normalize: rcept_dt may have hyphens (2026-06-16 from Gold facts)
+                df_delta["_rcept_dt_norm"] = df_delta["rcept_dt"].astype(str).str.replace("-", "")
                 df_delta = df_delta[
-                    (df_delta["rcept_dt"] >= start_dt.strftime("%Y%m%d")) &
-                    (df_delta["rcept_dt"] <= state.date)
+                    (df_delta["_rcept_dt_norm"] >= start_dt.strftime("%Y%m%d")) &
+                    (df_delta["_rcept_dt_norm"] <= target_dt.strftime("%Y%m%d"))
                 ]
+                df_delta = df_delta.drop(columns=["_rcept_dt_norm"])
             combined = df_delta
             logger.info("Step 3: DART loaded via Delta — %d rows", len(combined))
     except Exception as e:
@@ -233,10 +236,13 @@ def load_dart_events(state: BriefingState) -> BriefingState:
         if dfs:
             combined = pd.concat(dfs, ignore_index=True)
             if "rcept_dt" in combined.columns:
+                # Normalize: legacy rcept_dt may have hyphens
+                combined["_rcept_dt_norm"] = combined["rcept_dt"].astype(str).str.replace("-", "")
                 combined = combined[
-                    (combined["rcept_dt"] >= start_dt.strftime("%Y%m%d")) &
-                    (combined["rcept_dt"] <= state.date)
+                    (combined["_rcept_dt_norm"] >= start_dt.strftime("%Y%m%d")) &
+                    (combined["_rcept_dt_norm"] <= target_dt.strftime("%Y%m%d"))
                 ]
+                combined = combined.drop(columns=["_rcept_dt_norm"])
 
     if combined is not None and len(combined) > 0:
         state.dart_events_df = combined
