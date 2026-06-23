@@ -11,7 +11,7 @@ sys.modules.setdefault("pyarrow", types.ModuleType("pyarrow"))
 sys.modules.setdefault("pyarrow.parquet", types.ModuleType("pyarrow.parquet"))
 
 from dart_query import _dart_view_url, _source_line, _source_url_for_row
-from source_links import source_url_from_metadata
+from source_links import source_url_from_metadata, strip_ungrounded_dart_urls
 
 
 class DartSourceLinkTest(unittest.TestCase):
@@ -50,6 +50,44 @@ class DartSourceLinkTest(unittest.TestCase):
             source_url_from_metadata(metadata),
             "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=from-gold",
         )
+
+
+class StripUngroundedDartUrlTest(unittest.TestCase):
+    # Real regression: a 현대차증권 query whose context only holds 현대차증권 filings,
+    # but the LLM fabricated a 임원·주요주주 entry with an invented rcpNo that
+    # resolves to a 미래에셋증권 filing on the live DART site.
+    CONTEXT = (
+        "[20260430] 현대차증권 | 증권발행실적보고서\n"
+        "  DART URL: https://dart.fss.or.kr/dsaf001/main.do?rcpNo=20260430000131\n"
+        "공시번호: 20260430000815"
+    )
+
+    def test_removes_fabricated_url_keeps_grounded(self):
+        answer = (
+            "1. [20260430] 현대차증권 | 임원ㆍ주요주주특정증권등소유상황보고서\n"
+            "   - DART URL: https://dart.fss.or.kr/dsaf001/main.do?rcpNo=20260430000313\n"
+            "2. [20260430] 현대차증권 | 증권발행실적보고서\n"
+            "   - DART URL: https://dart.fss.or.kr/dsaf001/main.do?rcpNo=20260430000131"
+        )
+        clean, removed = strip_ungrounded_dart_urls(answer, self.CONTEXT)
+
+        self.assertEqual(removed, ["20260430000313"])
+        self.assertNotIn("rcpNo=20260430000313", clean)
+        self.assertIn("rcpNo=20260430000131", clean)
+
+    def test_grounded_only_answer_is_untouched(self):
+        answer = "참고: https://dart.fss.or.kr/dsaf001/main.do?rcpNo=20260430000131"
+        clean, removed = strip_ungrounded_dart_urls(answer, self.CONTEXT)
+
+        self.assertEqual(clean, answer)
+        self.assertEqual(removed, [])
+
+    def test_empty_context_strips_any_dart_url(self):
+        answer = "보세요 https://dart.fss.or.kr/dsaf001/main.do?rcpNo=99999999999999"
+        clean, removed = strip_ungrounded_dart_urls(answer, "")
+
+        self.assertEqual(removed, ["99999999999999"])
+        self.assertNotIn("rcpNo=", clean)
 
 
 if __name__ == "__main__":

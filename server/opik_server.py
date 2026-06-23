@@ -43,7 +43,7 @@ from dart_query import query_dart as query_dart_engine
 
 # Conversation memory — session-based context management (v2)
 from conversation_store import store as conversation_store
-from source_links import source_line, source_url_from_metadata
+from source_links import source_line, source_url_from_metadata, strip_ungrounded_dart_urls
 
 # Phase 2a: LangGraph multi-agent framework (optional — toggled by OPIK_AGENT_ENABLED)
 from agent_integration import init_agents, v2_chat_handler, get_agent_status
@@ -619,7 +619,8 @@ Answer investment questions based on provided data (analyst reports and/or DART 
 Rules:
 - Answer only based on the provided content. Do not speculate beyond the data.
 - Cite sources (report_id or disclosure number) in your answer.
-- If a DART item includes "DART URL:", show that exact URL below the corresponding item.
+- If a DART item includes "DART URL:", copy that exact URL below the corresponding item.
+- NEVER invent a DART receipt number (rcpNo) or URL. Receipt numbers are assigned sequentially across all companies per filing date, so a guessed number links to an unrelated company. Only reproduce a URL that was provided with the item; if none was provided, show no URL.
 - Write answers in Korean, deliver the key point first then explain details.
 - Present investment opinions (Buy/Sell/Hold) as stated in the reports, do not give direct trading advice.
 - For financial data (revenue, profit, etc.), provide exact figures from the DART data.
@@ -1291,6 +1292,15 @@ async def chat(req: ChatRequest):
     for block in resp_body.get("content", []):
         if block.get("type") == "text":
             answer += block["text"]
+
+    # Grounding guardrail: drop any DART URL whose receipt number was not in the
+    # data context. A fabricated rcpNo deep-links to an unrelated company's filing
+    # on dart.fss.or.kr (e.g. a 현대차증권 answer pointing to a 미래에셋증권 doc).
+    if context:
+        answer, _removed_urls = strip_ungrounded_dart_urls(answer, context)
+        if _removed_urls:
+            logger.warning("Stripped %d ungrounded DART URL(s) from answer: %s",
+                           len(_removed_urls), _removed_urls)
 
     # v2: Save conversation turns and check context window
     conversation_store.add_turn(session_id, "user", req.message)
