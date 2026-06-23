@@ -306,22 +306,40 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
         if not params.get("ticker_names"):
             params["ticker_names"] = []
 
+    # --- BUGFIX 2: "오늘"/"최근" keyword → force date-based search ---
+    # Handle these BEFORE time_range conversion so they always take effect.
+    # "최근" = 최근 3개월 (90일), "오늘" = 오늘 날짜.
+    _has_date_keyword = False
+    if "오늘" in user_message and not params.get("date_from"):
+        _today = __import__("datetime").datetime.now()
+        _td = _today.strftime("%Y-%m-%d")
+        logger.info("Agent pipeline: '오늘' keyword -> force date_from=%s", _td)
+        params["date_from"] = _td
+        params["date_to"] = _td
+        _has_date_keyword = True
+    if "최근" in user_message:
+        # Always override with 90-day window when user says "최근"
+        _now = __import__("datetime").datetime.now()
+        _three_mo_ago = (_now - __import__("datetime").timedelta(days=90)).strftime("%Y-%m-%d")
+        _today = _now.strftime("%Y-%m-%d")
+        logger.info("Agent pipeline: '최근' keyword -> force date range %s~%s (90 days)", _three_mo_ago, _today)
+        params["date_from"] = _three_mo_ago
+        params["date_to"] = _today
+        _has_date_keyword = True
+
     # --- FIX: Unified time_range → date_from conversion ---
     # IntentAgent returns "time_range" (e.g. {"from": "2026-06-16", "to": "2026-06-23"})
-    # for "최근", "이번 주", "지난주" etc. But report_agent/report_with_analysis routes
-    # only check params["date_from"], not time_range. Convert here so all routes benefit.
+    # for "이번 주", "지난주" etc. Convert here so all routes benefit.
+    # Only fires if keyword handlers above didn't already set date_from.
     _tr = params.get("time_range")
     if _tr and not params.get("date_from"):
         params["date_from"] = _tr.get("from")
         params["date_to"] = _tr.get("to")
-        logger.info("Agent pipeline: time_range → date_from=%s date_to=%s",
+        logger.info("Agent pipeline: time_range -> date_from=%s date_to=%s",
                      params["date_from"], params["date_to"])
 
     # --- BUGFIX 1: Pure date-only question detection ---
     # "오늘 며칠이야?", "며칠이냐?" etc. must NOT reach FAISS search.
-    # Haiku intent parser miscategorises these as report_search, causing
-    # FAISS to return random old reports and Haiku summarise to hallucinate
-    # the literal string "{today_date}".
     _msg_stripped = user_message.replace(" ", "").replace("?", "").replace("!", "").replace(".", "").replace("~", "")
     _is_date_only = False
     for _dp in _DATE_ONLY_PATTERNS:
@@ -332,7 +350,7 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
     if _is_date_only:
         _today = __import__("datetime").datetime.now()
         _elapsed = (time.time() - t0) * 1000
-        logger.info("Agent pipeline: date-only question detected → short-circuit (%r)", user_message[:40])
+        logger.info("Agent pipeline: date-only question detected -> short-circuit (%r)", user_message[:40])
         return {
             "answer": (
                 f"오늘은 {_today.year}년 {_today.month}월 {_today.day}일입니다.\n\n"
@@ -344,26 +362,6 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
             "violation_type": None,
             "elapsed_ms": _elapsed,
         }
-
-    # --- BUGFIX 2: "오늘"/"최근" keyword → force date-based search ---
-    # When user says "오늘 리포트" or "최근 리포트" without a specific date,
-    # use search_by_date instead of FAISS to avoid returning old reports.
-    _has_date_keyword = False
-    if "오늘" in user_message and not params.get("date_from"):
-        _today = __import__("datetime").datetime.now()
-        _td = _today.strftime("%Y-%m-%d")
-        logger.info("Agent pipeline: '오늘' keyword → force date_from=%s", _td)
-        params["date_from"] = _td
-        params["date_to"] = _td
-        _has_date_keyword = True
-    if "최근" in user_message and not params.get("date_from"):
-        _now = __import__("datetime").datetime.now()
-        _three_mo_ago = (_now - __import__("datetime").timedelta(days=90)).strftime("%Y-%m-%d")
-        _today = _now.strftime("%Y-%m-%d")
-        logger.info("Agent pipeline: '최근' keyword -> force date range %s~%s (90 days)", _three_mo_ago, _today)
-        params["date_from"] = _three_mo_ago
-        params["date_to"] = _today
-        _has_date_keyword = True
 
     # --- FIX: Disclosure keyword triggers ---
     # When user copy-pastes from chatbot's disclosure table or asks about
