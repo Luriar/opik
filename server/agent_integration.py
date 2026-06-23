@@ -358,12 +358,50 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
         _has_date_keyword = True
     if "최근" in user_message and not params.get("date_from"):
         _now = __import__("datetime").datetime.now()
-        _week_ago = (_now - __import__("datetime").timedelta(days=7)).strftime("%Y-%m-%d")
+        _three_mo_ago = (_now - __import__("datetime").timedelta(days=90)).strftime("%Y-%m-%d")
         _today = _now.strftime("%Y-%m-%d")
-        logger.info("Agent pipeline: '최근' keyword → force date range %s~%s", _week_ago, _today)
-        params["date_from"] = _week_ago
+        logger.info("Agent pipeline: '최근' keyword -> force date range %s~%s (90 days)", _three_mo_ago, _today)
+        params["date_from"] = _three_mo_ago
         params["date_to"] = _today
         _has_date_keyword = True
+
+    # --- FIX: Disclosure keyword triggers ---
+    # When user copy-pastes from chatbot's disclosure table or asks about
+    # specific disclosure events, IntentAgent often misclassifies as "general".
+    # Force dart_query interpret when disclosure keywords + company detected.
+    _disclosure_keywords = [
+        "소유상황", "지분 변동", "지분변동", "임원", "주요주주",
+        "유상증자", "무상증자", "자기주식", "자사주", "처분", "취득",
+        "대량보유", "공시", "보고서", "증권발행", "전환사채", "CB",
+        "BW", "교환사채", "파생결합", "ELB", "ELS", "DLB",
+    ]
+    _msg_for_kw = user_message.replace(" ", "")
+    _has_disclosure_kw = any(kw.replace(" ", "") in _msg_for_kw for kw in _disclosure_keywords)
+    if _has_disclosure_kw and not intent.startswith("dart_"):
+        # Check if there's a company name mentioned
+        _known_companies = ["삼성전자", "SK하이닉스", "한국알콜", "대신증권",
+            "미래에셋", "NH투자", "삼성증권", "한화투자", "교보증권",
+            "키움증권", "하나증권", "IBK투자", "SK증권", "유진투자",
+            "iM증권", "비비안", "리드코프", "스틱인베스트먼트",
+            "엠투엔", "제일기획", "카카오", "네이버", "현대차",
+            "기아", "LG에너지", "셀트리온", "카카오뱅크", "두산",
+            "한화", "HD현대", "포스코", "LG화학", "삼성SDI"]
+        _found_company = None
+        for _cn in _known_companies:
+            if _cn.replace(" ", "") in user_message.replace(" ", ""):
+                _found_company = _cn
+                break
+        if _found_company:
+            logger.info("Agent pipeline: disclosure kw detected -> force dart_query for %s", _found_company)
+            intent = "dart_query"
+            params["ticker_names"] = [_found_company]
+            params["interpret"] = True
+            if not params.get("date_from"):
+                _now = __import__("datetime").datetime.now()
+                _three_mo_ago = (_now - __import__("datetime").timedelta(days=90)).strftime("%Y-%m-%d")
+                _today = _now.strftime("%Y-%m-%d")
+                params["date_from"] = _three_mo_ago
+                params["date_to"] = _today
 
     # Step 3: Route and execute
     route = _supervisor.route(True, intent, params)
@@ -396,10 +434,26 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
         confidence = "high"
 
     elif route == "report_agent":
-        if params.get("date_from") and not params.get("ticker_names"):
+        if params.get("date_from"):
             search_results = _report.search_by_date(params["date_from"], params["date_to"], limit=50)
             logger.info("Using date-based browse for %s (%d results)", params["date_from"], len(search_results))
             if search_results:
+                # If ticker_names specified, filter results by ticker name match
+                _tn_list = params.get("ticker_names", [])
+                if _tn_list:
+                    _filtered = []
+                    for r in search_results:
+                        _reason = (r.get("reason", "") or "").upper()
+                        for _tn in _tn_list:
+                            if _tn.upper() in _reason:
+                                _filtered.append(r)
+                                break
+                    if _filtered:
+                        logger.info("Ticker filter: %d -> %d results for %s",
+                                    len(search_results), len(_filtered), _tn_list)
+                        search_results = _filtered
+                    else:
+                        search_results = _filtered  # empty list, will show no results
                 answer = _format_date_browse(params["date_from"], search_results)
                 # Related-company context: group by ticker code
                 _ticker_groups = {}
@@ -466,7 +520,7 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
                 confidence = "low"
 
     elif route == "report_with_analysis":
-        if params.get("date_from") and not params.get("ticker_names"):
+        if params.get("date_from"):
             search_results = _report.search_by_date(params["date_from"], params["date_to"], limit=50)
             logger.info("Using date-based browse for %s (%d results)", params["date_from"], len(search_results))
             report_summary = _format_date_browse(params["date_from"], search_results) if search_results else ""
@@ -593,7 +647,16 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
             sources = [r.get("report_id", "") for r in search_results]
 
         ticker_names = params.get("ticker_names", [])
-        dart_result = _dart.query_disclosure_events(companies=ticker_names)
+        _h_date_from = params.get("date_from")
+        _h_date_to = params.get("date_to")
+        if not _h_date_from and params.get("time_range"):
+            _h_date_from = params["time_range"].get("from")
+            _h_date_to = params["time_range"].get("to")
+        dart_result = _dart.query_disclosure_events(
+            companies=ticker_names,
+            date_from=_h_date_from,
+            date_to=_h_date_to,
+        )
         if dart_result and "데이터가 없습니다" not in dart_result:
             dart_summary = dart_result
 
