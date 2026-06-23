@@ -81,6 +81,28 @@ def _load_company_master() -> Dict[str, Dict]:
     return lookup
 
 
+def corp_code_to_name_map() -> Dict[str, str]:
+    """corp_code → corp_name map for metadata enrichment.
+
+    Keyed both zero-padded ("00137997") and stripped ("137997") so callers can
+    look up regardless of how the receipt/embedding parquet padded the code.
+    The DART RAG embedding parquet carries corp_code but NOT corp_name, so the
+    FAISS index loader uses this to attach the real company name to each chunk.
+    """
+    master = _load_company_master()
+    out: Dict[str, str] = {}
+    seen = set()
+    for info in master.values():
+        cc = str(info.get("corp_code", "")).strip()
+        nm = str(info.get("corp_name", "")).strip()
+        if not cc or not nm or cc in seen:
+            continue
+        seen.add(cc)
+        out[cc] = nm
+        out[cc.lstrip("0")] = nm
+    return out
+
+
 _KOR_ALIASES = {
     "sk": "에스케이", "lg": "엘지", "kt": "케이티", "skc": "에스케이씨",
 }

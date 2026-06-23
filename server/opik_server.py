@@ -684,6 +684,54 @@ def _filter_by_date(results, date_from, date_to):
     return filtered
 
 
+def _filter_dart_sources_by_company(results: List[SearchResult], intent) -> List[SearchResult]:
+    """Drop DART chunks belonging to a different company than the user targeted.
+
+    FAISS semantic search can surface the same report type (e.g. 임원·주요주주
+    소유상황보고서) filed by OTHER companies; with the company name missing from the
+    embedded chunk the LLM then mislabels them as the queried company (the
+    현대차증권→미래에셋 leak). Analyst-report chunks are left untouched — only DART
+    chunks are company-scoped here, and only when a company was actually named.
+    """
+    companies = list(getattr(intent, "companies", None) or [])
+    codes = list(getattr(intent, "stock_codes", None) or [])
+    if not companies and not codes:
+        return results  # no specific company targeted → nothing to scope
+
+    target_corp = None
+    target_stocks = {str(c).strip().lstrip("0") for c in codes if str(c).strip()}
+    try:
+        from dart_query import _find_company
+        comp = _find_company(companies, codes)
+        if comp:
+            if comp.get("corp_code"):
+                target_corp = str(comp["corp_code"]).lstrip("0")
+            if comp.get("stock_code"):
+                target_stocks.add(str(comp["stock_code"]).lstrip("0"))
+    except Exception as e:
+        logger.debug("company resolve for DART filter failed: %s", e)
+
+    if not target_corp and not target_stocks:
+        return results  # couldn't resolve identity → don't risk dropping data
+
+    kept, dropped = [], 0
+    for r in results:
+        if getattr(r, "source_type", None) != "dart":
+            kept.append(r)
+            continue
+        info = report_texts.get(r.report_id, {}) or {}
+        rc = str(info.get("corp_code", "") or "").lstrip("0")
+        rs = str((r.종목코드 or info.get("종목코드") or "")).lstrip("0")
+        if (target_corp and rc and rc == target_corp) or (rs and rs in target_stocks):
+            kept.append(r)
+        else:
+            dropped += 1
+    if dropped:
+        logger.info("Dropped %d cross-company DART chunk(s) (target corp=%s stocks=%s)",
+                    dropped, target_corp, target_stocks)
+    return kept
+
+
 def _safe_join(val):
     """Safely join list items, handle non-iterable values."""
     if val is None:
@@ -707,8 +755,10 @@ def _build_context(results: List[SearchResult], max_items: int = None) -> str:
         source_ref = source_line({"url": url}, indent="") if url else ""
         if reason is not None and not isinstance(reason, str):
             reason = str(reason)
+        corp_name = r.corp_name or info.get("corp_name") or ""
         parts.append(
             "[report_id: {}]\n".format(r.report_id) +
+            "기업명: {}\n".format(corp_name) +
             "종목코드: {}\n".format(r.종목코드 or "") +
             "공시번호: {}\n".format(r.rcept_no or info.get("rcept_no") or "") +
             "공시명: {}\n".format(r.report_nm or info.get("report_nm") or "") +
@@ -1091,7 +1141,8 @@ async def chat(req: ChatRequest):
             if date_from or date_to:
                 report_sources = _filter_by_date(report_sources, date_from, date_to)
 
-            sources = report_sources
+            # Anti-leakage: when a company is named, DART chunks must match it.
+            sources = _filter_dart_sources_by_company(report_sources, intent)
 
     if intent.needs_dart:
         dart_context = _query_dart(intent, page=page, page_size=page_size,
@@ -1606,6 +1657,17 @@ def build_index_from_s3():
                 keys_dart.append(obj["Key"])
     logger.info("Found %d DART embedding parquet files", len(keys_dart))
 
+    # The DART embedding parquet has corp_code but NO corp_name column. Resolve
+    # names from company_master so each chunk carries its real company — without
+    # it the LLM fills the blank with whatever company the user asked about.
+    try:
+        from dart_query import corp_code_to_name_map
+        dart_corp_names = corp_code_to_name_map()
+        logger.info("Loaded %d corp_code→name mappings for DART enrichment", len(dart_corp_names))
+    except Exception as e:
+        logger.warning("corp_code→name map load failed (DART chunks will lack names): %s", e)
+        dart_corp_names = {}
+
     dart_loaded = 0
     for key in keys_dart:
         try:
@@ -1639,7 +1701,15 @@ def build_index_from_s3():
                 base_type = str(row.get("base_report_type", "")) if row.get("base_report_type") is not None else ""
                 dart_kw = row.get("keywords")
                 source_url = source_url_from_metadata(row)
+
+                corp_code = str(row.get("corp_code", "")) if row.get("corp_code") is not None else None
+                corp_name = str(row.get("corp_name", "")) if row.get("corp_name") is not None else None
+                if (not corp_name or corp_name.lower() in ("", "none", "nan")) and corp_code:
+                    corp_name = dart_corp_names.get(corp_code) or dart_corp_names.get(corp_code.lstrip("0"))
+
                 reason_parts = [f"[DART {base_type}]"]
+                if corp_name:
+                    reason_parts.append(f"기업: {corp_name}")
                 if rcept_dt:
                     reason_parts.append(f"접수일: {rcept_dt}")
                 if rcept_no:
@@ -1655,8 +1725,8 @@ def build_index_from_s3():
                     "source_type": "dart",
                     "rcept_no": rcept_no or None,
                     "rcept_dt": rcept_dt or None,
-                    "corp_code": str(row.get("corp_code", "")) if row.get("corp_code") is not None else None,
-                    "corp_name": str(row.get("corp_name", "")) if row.get("corp_name") is not None else None,
+                    "corp_code": corp_code,
+                    "corp_name": corp_name or None,
                     "report_nm": str(row.get("report_nm", "")) if row.get("report_nm") is not None else None,
                     "base_report_type": base_type or None,
                     "dart_view_url": source_url,
