@@ -235,11 +235,19 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
         else:
             logger.info("Agent pipeline: short msg + context -> forcing report_search intent (parser said %s)", _qi)
             intent = "report_search"
+            _pp = _quick_intent.get("intent_params", {})
             params = {
-                "tickers": [], "ticker_names": [], "brokerages": [], "sectors": [],
-                "time_range": None, "keywords": [user_message.strip()],
-                "compare": False, "cause_tracking": False, "interpret": False,
-                "is_greeting": False, "response_style": "detailed",
+                "tickers": _pp.get("tickers", []),
+                "ticker_names": _pp.get("ticker_names", []),
+                "brokerages": _pp.get("brokerages", []),
+                "sectors": _pp.get("sectors", []),
+                "time_range": _pp.get("time_range"),  # preserve IntentAgent time_range
+                "keywords": _pp.get("keywords", [user_message.strip()]),
+                "compare": _pp.get("compare", False),
+                "cause_tracking": _pp.get("cause_tracking", False),
+                "interpret": _pp.get("interpret", False),
+                "is_greeting": _pp.get("is_greeting", False),
+                "response_style": _pp.get("response_style", "detailed"),
             }
     elif not _context and _is_followup_like:
         _followup_hints = ["이거", "저거", "그거", "이것", "저것", "그것",
@@ -337,15 +345,25 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
             "elapsed_ms": _elapsed,
         }
 
-    # --- BUGFIX 2: "오늘" keyword → force date-based search ---
-    # When user says "오늘 리포트" without a specific date, use search_by_date
-    # instead of FAISS to avoid returning 2022-2023 reports as "today's".
+    # --- BUGFIX 2: "오늘"/"최근" keyword → force date-based search ---
+    # When user says "오늘 리포트" or "최근 리포트" without a specific date,
+    # use search_by_date instead of FAISS to avoid returning old reports.
+    _has_date_keyword = False
     if "오늘" in user_message and not params.get("date_from"):
         _today = __import__("datetime").datetime.now()
         _td = _today.strftime("%Y-%m-%d")
         logger.info("Agent pipeline: '오늘' keyword → force date_from=%s", _td)
         params["date_from"] = _td
         params["date_to"] = _td
+        _has_date_keyword = True
+    if "최근" in user_message and not params.get("date_from"):
+        _now = __import__("datetime").datetime.now()
+        _week_ago = (_now - __import__("datetime").timedelta(days=7)).strftime("%Y-%m-%d")
+        _today = _now.strftime("%Y-%m-%d")
+        logger.info("Agent pipeline: '최근' keyword → force date range %s~%s", _week_ago, _today)
+        params["date_from"] = _week_ago
+        params["date_to"] = _today
+        _has_date_keyword = True
 
     # Step 3: Route and execute
     route = _supervisor.route(True, intent, params)
