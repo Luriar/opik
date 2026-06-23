@@ -1,0 +1,11 @@
+# Rename this file to backend.tf after creating the remote-state bucket and
+# DynamoDB lock table. Do not commit account-specific backend values.
+terraform {
+  backend "s3" {
+    bucket         = "opik-terraform-state-<account-id>"
+    key            = "opik/dev/terraform.tfstate"
+    region         = "ap-northeast-2"
+    dynamodb_table = "opik-terraform-locks"
+    encrypt        = true
+  }
+}

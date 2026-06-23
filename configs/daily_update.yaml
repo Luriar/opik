@@ -1,4 +1,6 @@
 daily_update:
+  # Absolute paths to AI_Trading_System data (shared data store).
+  # On EC2 production, these point to the EBS-mounted data volume.
   universe_file: data/metadata/full_universe_260616.csv
   ticker_name_file: data/metadata/ticker_names.csv
 
@@ -8,7 +10,7 @@ daily_update:
   feature_file: data/features/full_universe_features_optimized.parquet
   training_dataset_file: data/processed/full_universe_training_dataset.parquet
 
-  rolling_train_days: 350
+  rolling_train_days: 250
 
   daily_raw_dir: data/daily/raw
   daily_processed_dir: data/daily/processed
@@ -21,12 +23,11 @@ daily_update:
   daily_status_dir: outputs/daily_status
   log_dir: logs
 
-  recommended_run_time: "08:30"
+  recommended_run_time: "06:00"
   market_open_time: "09:00"
-  pipeline_start_time: "08:30"
+  pipeline_start_time: "06:00"
   production_mode: true
   strict_feature_source_check: true
-  us_macro_max_age_calendar_days: 5
   enable_us10y_check: false
   enable_gold_check: false
   enable_dxy_check: false

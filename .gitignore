@@ -1,46 +1,81 @@
-__pycache__/
-**pycache**/
-*.pyc
-
+# Secrets & credentials
 .env
+.env.*
+!.env.example
+*.env
+credentials
+*.pem
+*.key
+*.token
+secrets/
+*secret*
 
+# AWS credentials
+.aws/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
 .venv/
 venv/
-.cache/
+env/
 
-.ipynb_checkpoints/
-
-outputs/
-outputs/archive/
-outputs/legacy/
-
-logs/
-
-data/raw/
-data/processed/
-data/features/
-data/daily/
-
-reports/daily/daily_update_summary_*.md
-
-/models/
-
-*.parquet
-*.feather
-*.csv
-*.xlsx
-*.pkl
-*.joblib
-*.log
-
-coverage/
-
-.pytest_cache/
-
-.mypy_cache/
-
-.idea/
+# IDE
 .vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
 
-!reports/**/*.md
-!docs/**/*.md
+# Cache & checkpoints
+*.cache
+*.cache.json
+.silver_keys_cache.json
+.silver_manifest_cache.json
+.silver_checkpoint.json
+*_checkpoint.json
+.backfill_checkpoint*.json
+
+# Backup files
+*.bak
+
+# Sample/test data
+sample_*.pdf
+
+# Output / generated data
+*.parquet
+*.csv
+*.jsonl
+*.zip
+data/
+tmp/
+*.tmp
+
+# Batch processing output (Bedrock batch)
+batch_output/
+*.out
+
+# Terraform local state and plan artifacts
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+*.tfplan
+tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Large dependencies (installed separately)
+pylib/
