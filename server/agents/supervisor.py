@@ -164,8 +164,10 @@ class SupervisorAgent:
         elif route in ("dart_agent", "dart_with_analysis"):
             if dart_agent:
                 ticker_names = params.get("ticker_names", [])
+                tickers = params.get("tickers", [])
                 dart_result = dart_agent.query_disclosure_events(
                     companies=ticker_names,
+                    codes=tickers,
                     date_from=params.get("time_range", {}).get("from") if params.get("time_range") else None,
                     date_to=params.get("time_range", {}).get("to") if params.get("time_range") else None,
                 )

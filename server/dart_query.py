@@ -23,13 +23,6 @@ import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 
-from source_links import (
-    dart_view_url as _shared_dart_view_url,
-    first_non_empty as _shared_first_non_empty,
-    source_line as _shared_source_line,
-    source_url_from_metadata as _shared_source_url_from_metadata,
-)
-
 logger = logging.getLogger("opik.dart")
 
 S3_BUCKET = "s3-opik-bucket"
@@ -66,7 +59,7 @@ def _load_company_master() -> Dict[str, Dict]:
         name = str(row.get("corp_name", "")).strip()
         code = str(row.get("stock_code", "")).strip()
         corp_code = str(row.get("corp_code", "")).strip()
-        key = name.replace("(주)", "").strip()
+        key = name.replace("(주)", "").replace("주식회사 ", "").strip()
         lookup[key] = {"stock_code": code, "corp_code": corp_code, "corp_name": name}
         if name != key:
             lookup[name] = lookup[key]
@@ -98,7 +91,7 @@ def _find_company(query_companies, query_codes):
     master = _load_company_master()
     search_names = []
     for name in query_companies:
-        clean = name.replace("(주)", "").strip()
+        clean = name.replace("(주)", "").replace("주식회사 ", "").strip()
         search_names.extend([name, clean, _normalize_name(name), _normalize_name(clean)])
     for name in search_names:
         if name in master:
@@ -200,23 +193,6 @@ def _fmt_won(val):
     if abs(v) >= 10000_0000_0000:
         return f"{v/1_0000_0000_0000:.2f}조원"
     return f"{v//100_000_000:,}억원"
-
-
-def _dart_view_url(rcept_no) -> Optional[str]:
-    """Build the DART filing viewer URL from a receipt number."""
-    return _shared_dart_view_url(rcept_no)
-
-
-def _first_non_empty(row, *fields) -> Optional[str]:
-    return _shared_first_non_empty(row, *fields)
-
-
-def _source_url_for_row(row) -> Optional[str]:
-    return _shared_source_url_from_metadata(row)
-
-
-def _source_line(row, indent: str = "  ") -> str:
-    return _shared_source_line(row, indent=indent)
 
 
 _FINANCIAL_KEY_ACCOUNTS = [
@@ -352,9 +328,6 @@ def query_financials(companies, codes, date_from=None, date_to=None,
 
         lines.append(f"\n[{year}년] {reprt_code} ({fs_label})")
         lines.append(f"  접수일자: {rcept_dt}")
-        source_line = _source_line(grp.iloc[0])
-        if source_line:
-            lines.append(source_line.strip("\n"))
 
         for label, patterns in _FINANCIAL_KEY_ACCOUNTS:
             val = _find_account_value(grp, patterns)
@@ -372,20 +345,20 @@ def query_disclosure_events(companies, codes, date_from=None, date_to=None,
     if is_recent and not date_from:
         date_from = (datetime.now() - timedelta(days=60)).strftime("%Y-%m-%d")
 
-    # Merge all 3 sources: Delta (86 rows, fast), Gold facts (partitioned), legacy (complete)
-    # Delta material_event is incomplete (only recent backfill). Legacy disclosure_events
-    # is the most complete source. Always merge all paths, deduplicate by rcept_no.
+    # Merge all 3 sources: Delta material_event (active pipeline, sparse),
+    # Gold facts material_event (DartCollector partitioned), legacy compacted
+    # disclosure_events (historical data). Always merge all paths, deduplicate by rcept_no.
     dfs = []
 
-    # Path 1: Delta material_event
+    # Path 1: Delta material_event (active pipeline output, sparse backfill ~86 rows)
     try:
         from agents.data_helper import read_gold_data
-        df_delta = read_gold_data("material_event")
-        if df_delta is not None and len(df_delta) > 0:
-            logger.info("material_event loaded via Delta: %d rows", len(df_delta))
-            dfs.append(df_delta)
+        df_delta_me = read_gold_data("material_event")
+        if df_delta_me is not None and len(df_delta_me) > 0:
+            logger.info("material_event loaded via Delta: %d rows", len(df_delta_me))
+            dfs.append(df_delta_me)
     except Exception as e:
-        logger.debug("Delta read failed: %s", e)
+        logger.debug("Delta material_event read failed: %s", e)
 
     # Path 2: Gold facts material_event (DartCollector partitioned)
     try:
@@ -396,7 +369,7 @@ def query_disclosure_events(companies, codes, date_from=None, date_to=None,
     except Exception as e:
         logger.debug("Gold facts read failed: %s", e)
 
-    # Path 3: Legacy compacted disclosure_events (most complete)
+    # Path 3: Legacy compacted disclosure_events (historical, most complete)
     try:
         df_legacy = _read_disclosure_events_fallback(date_from, date_to, limit_rows=50000)
         if len(df_legacy) > 0:
@@ -407,6 +380,23 @@ def query_disclosure_events(companies, codes, date_from=None, date_to=None,
 
     if not dfs:
         return "해당 기간의 공시 데이터가 없습니다."
+
+    # Normalize columns across sources before merge
+    for d in dfs:
+        # Unify event_type -> event_category
+        if "event_type" in d.columns and "event_category" not in d.columns:
+            d["event_category"] = d["event_type"]
+        # Fill text from report_nm if text is missing
+        if "text" in d.columns:
+            d["text"] = d["text"].fillna("")
+            empty_mask = d["text"].astype(str).str.strip() == ""
+            if empty_mask.any() and "report_nm" in d.columns:
+                d.loc[empty_mask, "text"] = d.loc[empty_mask, "report_nm"].fillna("")
+        elif "report_nm" in d.columns:
+            d["text"] = d["report_nm"].fillna("")
+        # Normalize rcept_dt format (remove hyphens for consistent dedup)
+        if "rcept_dt" in d.columns:
+            d["rcept_dt"] = d["rcept_dt"].astype(str).str.replace("-", "")
 
     # Merge and deduplicate by rcept_no (which is unique per disclosure filing)
     df = pd.concat(dfs, ignore_index=True)
@@ -421,8 +411,6 @@ def query_disclosure_events(companies, codes, date_from=None, date_to=None,
 
     # Apply date filter
     df = _filter_by_date_col(df, "rcept_dt", date_from, date_to)
-    if len(df) > limit_rows:
-        df = df.head(limit_rows)
 
     if len(df) == 0:
         return "해당 기간의 공시 데이터가 없습니다."
@@ -433,6 +421,9 @@ def query_disclosure_events(companies, codes, date_from=None, date_to=None,
         df = df[df["corp_code"].astype(str).str.lstrip("0") == corp_code.lstrip("0")]
         if len(df) == 0:
             return f"{comp['corp_name']}의 공시 내역이 없습니다."
+
+    if len(df) > limit_rows:
+        df = df.head(limit_rows)
 
     total_count = len(df)
     df_sorted = df.sort_values("rcept_dt", ascending=False)
@@ -460,7 +451,6 @@ def query_disclosure_events(companies, codes, date_from=None, date_to=None,
             f"{report_nm} | "
             f"유형: {category}\n"
             f"  내용: {text}"
-            f"{_source_line(row)}"
         )
 
     lines.append(f"\n[페이지 {page}/{total_pages}, 총 {total_count}건]")
@@ -578,7 +568,6 @@ def query_insider_transactions(companies, codes, date_from=None, date_to=None,
             f"{direction} {abs(irds):,}주 | "
             f"보유 {stkqy:,}주 | "
             f"사유: {report_resn}"
-            f"{_source_line(row)}"
         )
 
     lines.append(f"\n[페이지 {page}/{total_pages}, 총 {total_count}건]")
@@ -635,7 +624,6 @@ def query_major_shareholders(companies, codes, date_from=None, date_to=None,
             f"{repror} ({report_tp}) | "
             f"보유 {stkqy:,}주 ({stkrt:.2f}%){change_str} | "
             f"사유: {report_resn}"
-            f"{_source_line(row)}"
         )
 
     lines.append(f"\n[페이지 {page}/{total_pages}, 총 {total_count}건]")
