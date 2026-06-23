@@ -31,7 +31,7 @@ class ConversationSession:
 class ConversationStore:
     """스레드 안전한 LRU 기반 대화 저장소"""
 
-    def __init__(self, max_sessions=200, max_turns_per_session=None,
+    def __init__(self, max_sessions=200, max_turns_per_session=14,
                  context_window_tokens=8000, session_ttl_minutes=180):
         self._sessions = OrderedDict()
         self._lock = threading.Lock()
@@ -201,6 +201,8 @@ class ConversationStore:
             summary_parts.append(f"관심 섹터: {', '.join(keywords['sectors'])}")
         if keywords["topics"]:
             summary_parts.append(f"논의 주제: {', '.join(keywords['topics'])}")
+        if keywords.get("recent_dates"):
+            summary_parts.append(f"최근 논의 날짜: {', '.join(sorted(keywords['recent_dates']))}")
 
         new_summary = "이전 대화 요약 — " + "; ".join(summary_parts) + "."
         if session.context_summary:
