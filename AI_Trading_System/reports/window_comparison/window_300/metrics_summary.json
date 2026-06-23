@@ -1,0 +1,61 @@
+{
+  "evaluation": {
+    "procedure": "90-trading-day walk-forward production replay with 300-trading-day rolling train window",
+    "evaluation_days": 90,
+    "evaluation_start_date": "2026-01-30",
+    "evaluation_end_date": "2026-06-17",
+    "rolling_train_days": 300,
+    "prediction_rows": 31319,
+    "top10_rows": 900,
+    "feature_count": 55
+  },
+  "ranking_model": {
+    "rmse": 0.0531020166691893,
+    "mae": 0.03709845291745611,
+    "r2": -0.037195624167140506,
+    "pearson_correlation": 0.1085743404158271,
+    "spearman_rank_correlation_ic": 0.07705100514198496,
+    "daily_mean_spearman_ic": 0.0033174538546860317,
+    "top10_hit_rate": 0.0811111111111111,
+    "top20_hit_rate": 0.11388888888888891,
+    "ndcg_at_10": 0.4855056154280487
+  },
+  "gap_model": {
+    "rmse": 0.03064157656025574,
+    "direction_accuracy": 0.5353299913790351
+  },
+  "intraday_model": {
+    "rmse": 0.04342136545416712,
+    "direction_accuracy": 0.4803793224560171
+  },
+  "portfolio_top10_equal_weight": {
+    "cumulative_return": 0.9613317326651805,
+    "average_return": 0.00835266941773415,
+    "win_rate": 0.5888888888888889,
+    "volatility": 0.041043409589906946,
+    "sharpe_ratio": 3.230592138957236,
+    "maximum_drawdown": -0.22690984303394768,
+    "cagr": 5.59390906695535
+  },
+  "kospi200_equal_weight_benchmark_proxy": {
+    "cumulative_return": 0.16895802824101125,
+    "average_return": 0.0021292550189849356,
+    "win_rate": 0.6,
+    "volatility": 0.027934897502062107,
+    "sharpe_ratio": 1.2099874555088808,
+    "maximum_drawdown": -0.1705173376828939,
+    "cagr": 0.548235318280762
+  },
+  "timing_and_size": {
+    "training_time_total_seconds": 374.18916309974156,
+    "training_time_mean_seconds": 4.157657367774906,
+    "prediction_time_total_seconds": 1.2924565002322197,
+    "prediction_time_mean_seconds": 0.014360627780357996,
+    "train_rows_mean": 104084.72222222222,
+    "feature_count": 55,
+    "model_size_mean_bytes": 1928989.7444444445,
+    "ranking_model_size_mean_bytes": 641412.088888889,
+    "gap_model_size_mean_bytes": 646172.3333333334,
+    "intraday_model_size_mean_bytes": 641405.3222222222
+  }
+}

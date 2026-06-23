@@ -1,0 +1,173 @@
+﻿validation:
+  version: "v1.0"
+
+  method: "walk_forward"
+
+  date_column: "date"
+  id_column: "ticker"
+
+  walk_forward:
+    enabled: true
+
+    start_date: "2018-01-01"
+    end_date: "2025-12-31"
+
+    train_start_date: "2018-01-01"
+
+    train_window_type: "expanding"
+
+    validation_years: 1
+    test_years: 1
+
+    min_train_years: 4
+
+    retraining_frequency: "monthly"
+
+    folds:
+      - fold_id: 1
+        train_start_date: "2018-01-01"
+        train_end_date: "2021-12-31"
+        valid_start_date: "2022-01-01"
+        valid_end_date: "2022-12-31"
+        test_start_date: "2023-01-01"
+        test_end_date: "2023-12-31"
+
+      - fold_id: 2
+        train_start_date: "2018-01-01"
+        train_end_date: "2022-12-31"
+        valid_start_date: "2023-01-01"
+        valid_end_date: "2023-12-31"
+        test_start_date: "2024-01-01"
+        test_end_date: "2024-12-31"
+
+      - fold_id: 3
+        train_start_date: "2018-01-01"
+        train_end_date: "2023-12-31"
+        valid_start_date: "2024-01-01"
+        valid_end_date: "2024-12-31"
+        test_start_date: "2025-01-01"
+        test_end_date: "2025-12-31"
+
+  split_rules:
+    time_order_required: true
+    allow_random_split: false
+    allow_shuffle: false
+
+    require_train_before_validation: true
+    require_validation_before_test: true
+
+    allow_overlap_between_train_valid: false
+    allow_overlap_between_valid_test: false
+    allow_overlap_between_train_test: false
+
+  leakage_guard:
+    feature_date_must_be_before_target_date: true
+    forbid_target_in_features: true
+    forbid_t_day_ohlcv_in_features: true
+    forbid_test_for_hyperparameter_tuning: true
+    forbid_full_dataset_scaler_fit: true
+    forbid_full_dataset_feature_selection: true
+
+  scaler:
+    enabled: false
+    fit_on: "train_only"
+
+  encoder:
+    enabled: false
+    fit_on: "train_only"
+
+  feature_selection:
+    enabled: false
+    fit_on: "train_only"
+    allow_test_period_usage: false
+
+  hyperparameter_tuning:
+    enabled: true
+    tune_on: "validation"
+    use_test_period: false
+
+  model_refit:
+    refit_train_valid_before_test: true
+    use_best_iteration: true
+
+  metrics:
+    ranking_model:
+      - ic
+      - rank_ic
+      - top10_return
+      - top20_return
+      - top10_hit_ratio
+      - ndcg_at_10
+      - long_short_spread
+
+    gap_model:
+      - mae
+      - rmse
+      - directional_accuracy
+      - correlation
+      - gap_sign_accuracy
+
+    intraday_model:
+      - mae
+      - rmse
+      - directional_accuracy
+      - correlation
+      - top10_intraday_return
+
+    portfolio:
+      - cumulative_return
+      - annual_return
+      - annual_volatility
+      - sharpe_ratio
+      - sortino_ratio
+      - maximum_drawdown
+      - calmar_ratio
+      - win_rate
+      - turnover
+      - average_trade_return
+
+  output:
+    base_dir: "outputs/walk_forward"
+
+    fold_file: "outputs/walk_forward/folds.csv"
+
+    predictions_dir: "outputs/walk_forward/predictions"
+    metrics_dir: "outputs/walk_forward/metrics"
+
+    save_fold_predictions: true
+    save_fold_metrics: true
+    save_aggregated_predictions: true
+    save_aggregated_metrics: true
+
+    aggregated_predictions_file: "outputs/walk_forward/predictions/all_folds_predictions.parquet"
+    aggregated_metrics_file: "outputs/walk_forward/metrics/all_folds_metrics.json"
+
+  required_prediction_columns:
+    - date
+    - ticker
+    - fold_id
+    - model_version
+    - ranking_score
+    - pred_gap
+    - pred_intraday
+    - pred_open
+    - pred_close
+    - expected_return
+    - target_rank_return
+    - target_gap
+    - target_intraday
+
+  tests:
+    required:
+      - test_walk_forward.py
+      - test_data_leakage.py
+
+    must_pass:
+      - train_validation_test_order
+      - no_random_shuffle
+      - no_fold_overlap
+      - scaler_fit_train_only
+      - feature_selection_train_only
+      - hyperparameter_tuning_validation_only
+      - prediction_has_fold_id
+      - aggregated_predictions_no_duplicates

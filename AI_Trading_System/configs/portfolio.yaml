@@ -1,0 +1,343 @@
+﻿portfolio:
+  version: "v1.0"
+
+  # ============================================================
+  # Portfolio Philosophy
+  # ============================================================
+
+  portfolio_name: "AI_Top10_Portfolio"
+
+  candidate_size: 30
+  portfolio_size: 10
+
+  rebalance_frequency: "daily"
+
+  weighting_method: "equal_weight"
+
+  fully_invested: true
+
+  # ============================================================
+  # Candidate Selection
+  # ============================================================
+
+  candidate_selection:
+
+    primary_score: "ranking_score"
+
+    primary_order: "descending"
+
+    candidate_size: 30
+
+    secondary_score: "expected_return"
+
+    secondary_order: "descending"
+
+  # ============================================================
+  # Expected Return
+  # ============================================================
+
+  expected_return:
+
+    formula: "(1 + pred_gap) * (1 + pred_intraday) - 1"
+
+    pred_gap_column: "pred_gap"
+
+    pred_intraday_column: "pred_intraday"
+
+    output_column: "expected_return"
+
+  # ============================================================
+  # Portfolio Score
+  # ============================================================
+
+  portfolio_score:
+
+    enabled: true
+
+    formula:
+
+      ranking_score_weight: 0.50
+
+      expected_return_rank_weight: 0.30
+
+      liquidity_rank_weight: 0.10
+
+      momentum_rank_weight: 0.10
+
+    output_column: "portfolio_score"
+
+  # ============================================================
+  # Liquidity Filter
+  # ============================================================
+
+  liquidity_filter:
+
+    enabled: true
+
+    min_trading_value_ma20: 5000000000
+
+    alternative:
+
+      use_rank: true
+
+      min_trading_value_rank_pct: 0.20
+
+  # ============================================================
+  # Risk Filter
+  # ============================================================
+
+  risk_filter:
+
+    enabled: true
+
+    max_atr_percent: 0.08
+
+    max_volatility_20d: 0.08
+
+    max_abs_pred_gap: 0.10
+
+  # ============================================================
+  # Diversification
+  # ============================================================
+
+  diversification:
+
+    enabled: true
+
+    sector:
+
+      max_names: 3
+
+      max_weight: 0.30
+
+    market_type:
+
+      max_weight: 0.70
+
+    market_cap:
+
+      enabled: true
+
+      top20_max_weight: 0.40
+
+      top50_max_weight: 0.70
+
+      others_min_weight: 0.10
+
+  # ============================================================
+  # Position Sizing
+  # ============================================================
+
+  position_sizing:
+
+    method: "equal_weight"
+
+    equal_weight:
+
+      enabled: true
+
+    expected_return_weight:
+
+      enabled: false
+
+    risk_parity:
+
+      enabled: false
+
+    volatility_weight:
+
+      enabled: false
+
+    confidence_weight:
+
+      enabled: false
+
+  # ============================================================
+  # Position Constraints
+  # ============================================================
+
+  constraints:
+
+    min_position_weight: 0.10
+
+    max_position_weight: 0.10
+
+    max_sector_weight: 0.30
+
+    max_market_weight: 0.70
+
+    max_turnover: 1.00
+
+  # ============================================================
+  # Cash Management
+  # ============================================================
+
+  cash:
+
+    fully_invested: true
+
+    minimum_cash_ratio: 0.00
+
+    maximum_cash_ratio: 0.00
+
+  # ============================================================
+  # Daily Metrics
+  # ============================================================
+
+  daily_metrics:
+
+    - expected_return
+
+    - expected_volatility
+
+    - average_atr
+
+    - average_volatility
+
+    - average_ranking_score
+
+    - average_expected_return
+
+    - sector_exposure
+
+    - market_exposure
+
+    - turnover
+
+    - number_of_positions
+
+  # ============================================================
+  # Portfolio Output Columns
+  # ============================================================
+
+  output_columns:
+
+    - date
+
+    - ticker
+
+    - weight
+
+    - ranking_score
+
+    - pred_gap
+
+    - pred_intraday
+
+    - expected_return
+
+    - portfolio_score
+
+    - sector
+
+    - market_type
+
+    - market_cap_group
+
+  # ============================================================
+  # Output
+  # ============================================================
+
+  output:
+
+    base_dir: "outputs/portfolio"
+
+    daily_portfolio: "outputs/portfolio/daily_portfolio.parquet"
+
+    daily_positions: "outputs/portfolio/daily_positions.parquet"
+
+    daily_metrics: "outputs/portfolio/daily_metrics.json"
+
+    daily_orders: "outputs/portfolio/daily_orders.parquet"
+
+    save_parquet: true
+
+    save_csv: true
+
+    save_json: true
+
+  # ============================================================
+  # Required Functions
+  # ============================================================
+
+  implementation:
+
+    required_functions:
+
+      - build_candidate_list
+
+      - calculate_expected_return
+
+      - calculate_portfolio_score
+
+      - apply_liquidity_filter
+
+      - apply_risk_filter
+
+      - apply_sector_limit
+
+      - apply_market_limit
+
+      - calculate_position_weight
+
+      - build_daily_portfolio
+
+      - generate_daily_metrics
+
+  # ============================================================
+  # Required Tests
+  # ============================================================
+
+  tests:
+
+    required:
+
+      - test_portfolio.py
+
+    must_pass:
+
+      - candidate_size_is_30
+
+      - final_portfolio_size_is_10
+
+      - expected_return_formula_correct
+
+      - portfolio_score_formula_correct
+
+      - liquidity_filter_applied
+
+      - risk_filter_applied
+
+      - sector_limit_applied
+
+      - market_limit_applied
+
+      - equal_weight_sum_is_one
+
+      - no_duplicate_ticker
+
+      - output_columns_exist
+
+  # ============================================================
+  # Forbidden Rules
+  # ============================================================
+
+  forbidden:
+
+    use_actual_return_for_selection: true
+
+    use_target_gap_for_selection: true
+
+    use_target_intraday_for_selection: true
+
+    use_close_t_for_selection: true
+
+    ignore_liquidity_filter: false
+
+    ignore_risk_filter: false
+
+    ignore_sector_limit: false
+
+    ignore_transaction_cost: true
+
+    ignore_slippage: true

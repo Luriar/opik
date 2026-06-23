@@ -1,0 +1,62 @@
+{
+  "evaluation": {
+    "procedure": "90-trading-day rolling walk-forward production replay with 150-trading-day rolling train window",
+    "evaluation_days": 90,
+    "evaluation_start_date": "2026-01-30",
+    "evaluation_end_date": "2026-06-17",
+    "rolling_train_days": 150,
+    "prediction_rows": 31319,
+    "top10_rows": 900,
+    "feature_count": 55,
+    "leakage_rule": "Each fold trains only on rows with target_date < evaluation_date, then selects previous 150 feature dates.",
+    "benchmark_note": "KOSPI benchmark is approximated as equal-weight KOSPI200 constituents from full_universe_260616.csv because no standalone KOSPI index return series exists in the production training dataset."
+  },
+  "ranking_model": {
+    "rmse": 0.05692291609788085,
+    "mae": 0.04015514120984138,
+    "r2": -0.1918261970545323,
+    "pearson_correlation": -0.0024126361947311393,
+    "spearman_rank_correlation_ic": -0.0003384121786593162,
+    "daily_mean_spearman_ic": 0.0014463611806054026,
+    "top10_hit_rate": 0.0811111111111111,
+    "top20_hit_rate": 0.11166666666666668,
+    "ndcg_at_10": 0.4643253832837464,
+    "ndcg_at_20": 0.5078992572420696
+  },
+  "gap_model": {
+    "rmse": 0.03301471020677302,
+    "mae": 0.022210827927505252,
+    "direction_accuracy": 0.5254637759826304,
+    "correlation": 0.037688150704753724
+  },
+  "intraday_model": {
+    "rmse": 0.044830289247619864,
+    "mae": 0.03159550546426721,
+    "direction_accuracy": 0.48542418340304605,
+    "correlation": -0.06947746203128154
+  },
+  "portfolio_top10_equal_weight": {
+    "cumulative_return": 0.1157152618429389,
+    "average_return": 0.0021931998719607955,
+    "win_rate": 0.5,
+    "volatility": 0.0442474724607219,
+    "sharpe_ratio": 0.786846495037827,
+    "maximum_drawdown": -0.22531324841346423
+  },
+  "kospi200_equal_weight_benchmark_proxy": {
+    "cumulative_return": 0.1689580282410117,
+    "average_return": 0.0021292550189849356,
+    "win_rate": 0.6,
+    "volatility": 0.027934897502062107,
+    "sharpe_ratio": 1.2099874555088808,
+    "maximum_drawdown": -0.1705173376828939
+  },
+  "full_universe_equal_weight_reference": {
+    "cumulative_return": 0.08244187179134399,
+    "average_return": 0.0013581803957465218,
+    "win_rate": 0.5333333333333333,
+    "volatility": 0.030851064908132452,
+    "sharpe_ratio": 0.6988557912167271,
+    "maximum_drawdown": -0.17789867166045803
+  }
+}

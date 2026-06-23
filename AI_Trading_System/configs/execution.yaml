@@ -1,0 +1,72 @@
+﻿execution:
+  version: "v1.0"
+  mode: "paper"
+  initial_capital: 100000000
+
+  order:
+    buy_side: "BUY"
+    sell_side: "SELL"
+    order_type: "MARKET"
+    buy_price: "open"
+    sell_price: "close"
+    allow_short: false
+    allow_leverage: false
+
+  cost:
+    buy_cost: 0.0015
+    sell_cost: 0.0015
+
+  slippage:
+    buy_slippage: 0.001
+    sell_slippage: 0.001
+
+  risk_check:
+    enabled: true
+    max_order_weight: 0.10
+    max_total_weight: 1.00
+    max_sector_weight: 0.30
+    max_market_weight: 0.70
+    require_positive_weight: true
+    forbid_duplicate_ticker: true
+
+  failure_policy:
+    critical_error: "stop"
+    invalid_order: "skip"
+    missing_price: "skip"
+    log_failure: true
+
+  output:
+    base_dir: "outputs/execution"
+    orders: "outputs/execution/orders.parquet"
+    execution_report: "outputs/execution/execution_report.json"
+    daily_log: "outputs/execution/daily_log.txt"
+
+  required_columns:
+    portfolio:
+      - date
+      - ticker
+      - weight
+      - ranking_score
+      - pred_gap
+      - pred_intraday
+      - expected_return
+      - portfolio_score
+      - sector
+      - market_type
+
+    orders:
+      - date
+      - ticker
+      - side
+      - weight
+      - target_amount
+      - order_type
+      - execution_mode
+
+  forbidden:
+    use_actual_return: true
+    use_target_gap: true
+    use_target_intraday: true
+    use_target_rank_return: true
+    live_broker_api_v1: true
+

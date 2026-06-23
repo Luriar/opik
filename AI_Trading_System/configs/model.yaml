@@ -1,0 +1,188 @@
+﻿model:
+  version: "v1.0"
+  primary_algorithm: "lightgbm"
+
+  common:
+    random_seed: 42
+    time_column: "date"
+    id_column: "ticker"
+
+    categorical_features:
+      - sector
+      - market_type
+      - market_cap_group
+
+    excluded_columns:
+      - date
+      - ticker
+      - name
+      - target_rank_return
+      - target_gap
+      - target_intraday
+      - open
+      - high
+      - low
+      - close
+      - volume
+
+  ranking_model:
+    enabled: true
+    model_name: "ranking_model"
+    model_type: "regressor"
+    algorithm: "lightgbm"
+    target: "target_rank_return"
+    prediction_column: "ranking_score"
+
+    objective: "regression"
+    metric:
+      - rmse
+      - l1
+
+    evaluation_metrics:
+      - ic
+      - rank_ic
+      - top10_return
+      - top20_return
+      - top10_hit_ratio
+      - ndcg_at_10
+      - long_short_spread
+
+    lightgbm_params:
+      objective: "regression"
+      metric: "rmse"
+      learning_rate: 0.03
+      num_leaves: 31
+      max_depth: -1
+      min_data_in_leaf: 100
+      feature_fraction: 0.8
+      bagging_fraction: 0.8
+      bagging_freq: 1
+      lambda_l1: 0.0
+      lambda_l2: 1.0
+      n_estimators: 2000
+      early_stopping_rounds: 100
+      random_state: 42
+      verbosity: -1
+
+  gap_model:
+    enabled: true
+    model_name: "gap_model"
+    model_type: "regressor"
+    algorithm: "lightgbm"
+    target: "target_gap"
+    prediction_column: "pred_gap"
+
+    objective: "regression"
+    metric:
+      - rmse
+      - l1
+
+    evaluation_metrics:
+      - mae
+      - rmse
+      - directional_accuracy
+      - correlation
+      - gap_sign_accuracy
+
+    lightgbm_params:
+      objective: "regression"
+      metric: "rmse"
+      learning_rate: 0.03
+      num_leaves: 31
+      max_depth: -1
+      min_data_in_leaf: 100
+      feature_fraction: 0.8
+      bagging_fraction: 0.8
+      bagging_freq: 1
+      lambda_l1: 0.0
+      lambda_l2: 1.0
+      n_estimators: 2000
+      early_stopping_rounds: 100
+      random_state: 42
+      verbosity: -1
+
+  intraday_model:
+    enabled: true
+    model_name: "intraday_model"
+    model_type: "regressor"
+    algorithm: "lightgbm"
+    target: "target_intraday"
+    prediction_column: "pred_intraday"
+
+    objective: "regression"
+    metric:
+      - rmse
+      - l1
+
+    evaluation_metrics:
+      - mae
+      - rmse
+      - directional_accuracy
+      - correlation
+      - top10_intraday_return
+
+    lightgbm_params:
+      objective: "regression"
+      metric: "rmse"
+      learning_rate: 0.03
+      num_leaves: 31
+      max_depth: -1
+      min_data_in_leaf: 100
+      feature_fraction: 0.8
+      bagging_fraction: 0.8
+      bagging_freq: 1
+      lambda_l1: 0.0
+      lambda_l2: 1.0
+      n_estimators: 2000
+      early_stopping_rounds: 100
+      random_state: 42
+      verbosity: -1
+
+  training:
+    validation_method: "walk_forward"
+    train_window_type: "expanding"
+    retraining_frequency: "monthly"
+    use_early_stopping: true
+    save_best_iteration: true
+    refit_train_valid_before_test: true
+
+  prediction:
+    output_columns:
+      - date
+      - ticker
+      - ranking_score
+      - pred_gap
+      - pred_intraday
+      - pred_open
+      - pred_close
+      - expected_return
+      - model_version
+
+    expected_return_formula: "(1 + pred_gap) * (1 + pred_intraday) - 1"
+
+  model_storage:
+    base_dir: "outputs/models"
+
+    ranking_model_dir: "outputs/models/ranking_model"
+    gap_model_dir: "outputs/models/gap_model"
+    intraday_model_dir: "outputs/models/intraday_model"
+
+    save_model_file: true
+    save_metadata_file: true
+    save_feature_importance: true
+    save_shap_values: false
+
+  forbidden:
+    random_shuffle_split: true
+    use_test_for_hyperparameter_tuning: false
+    use_target_as_feature: false
+    use_t_day_ohlcv_as_feature: false
+    use_ticker_as_categorical_feature: false
+
+  future_extensions:
+    xgboost: false
+    catboost: false
+    lambdarank: false
+    transformer: false
+    lstm: false
+    ensemble: false

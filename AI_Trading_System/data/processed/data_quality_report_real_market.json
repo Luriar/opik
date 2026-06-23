@@ -1,0 +1,167 @@
+{
+  "input_files": {
+    "ohlcv": "C:\\Users\\Dell3571\\Desktop\\PROJECTS\\LLM_mini_PJT\\AI_Trading_System\\data\\raw\\kr_stock\\ohlcv_20230615_20260614.parquet",
+    "macro": "C:\\Users\\Dell3571\\Desktop\\PROJECTS\\LLM_mini_PJT\\AI_Trading_System\\data\\raw\\macro\\macro_20230615_20260614.parquet"
+  },
+  "ohlcv": {
+    "strict_existing_validator": {
+      "passed": false,
+      "error": "DataValidationError: open must be positive"
+    },
+    "checks": [
+      {
+        "name": "required_columns",
+        "passed": true,
+        "detail": []
+      },
+      {
+        "name": "date_dtype",
+        "passed": true,
+        "detail": "datetime64[us]"
+      },
+      {
+        "name": "ticker_dtype",
+        "passed": true,
+        "detail": "str"
+      },
+      {
+        "name": "duplicate_date_ticker_rows",
+        "passed": true,
+        "detail": 0
+      },
+      {
+        "name": "positive_open_high_low_close",
+        "passed": false,
+        "detail": null
+      },
+      {
+        "name": "non_negative_volume",
+        "passed": true,
+        "detail": null
+      },
+      {
+        "name": "high_greater_equal_low",
+        "passed": true,
+        "detail": null
+      },
+      {
+        "name": "high_greater_equal_open_close",
+        "passed": false,
+        "detail": null
+      },
+      {
+        "name": "low_less_equal_open_close",
+        "passed": true,
+        "detail": null
+      },
+      {
+        "name": "non_negative_trading_value",
+        "passed": true,
+        "detail": null
+      },
+      {
+        "name": "ticker_005930_exists",
+        "passed": true,
+        "detail": null
+      }
+    ],
+    "row_count": 73670,
+    "unique_ticker_count": 102,
+    "unique_trading_dates": 728,
+    "min_date": "2023-06-15",
+    "max_date": "2026-06-12",
+    "ticker_005930_exists": true,
+    "missing_values": {
+      "date": 0,
+      "ticker": 0,
+      "open": 0,
+      "high": 0,
+      "low": 0,
+      "close": 0,
+      "volume": 0,
+      "trading_value": 0
+    },
+    "violation_counts": {
+      "open_nonpositive": 140,
+      "high_nonpositive": 140,
+      "low_nonpositive": 140,
+      "close_nonpositive": 0,
+      "volume_negative": 0,
+      "trading_value_negative": 0,
+      "high_less_than_low": 0,
+      "high_less_than_open": 0,
+      "high_less_than_close": 147,
+      "low_greater_than_open": 0,
+      "low_greater_than_close": 0
+    },
+    "zero_ohl_rows": {
+      "row_count": 140,
+      "unique_tickers": 7,
+      "tickers": [
+        "025900",
+        "058470",
+        "086520",
+        "091990",
+        "182400",
+        "214370",
+        "348370"
+      ]
+    }
+  },
+  "macro": {
+    "strict_existing_validator": {
+      "passed": false,
+      "error": "DataValidationError: wti_close must be positive"
+    },
+    "checks": [
+      {
+        "name": "required_columns",
+        "passed": true,
+        "detail": []
+      },
+      {
+        "name": "date_dtype",
+        "passed": true,
+        "detail": "datetime64[ms]"
+      },
+      {
+        "name": "non_missing_macro_values_positive",
+        "passed": true,
+        "detail": {
+          "nasdaq_close": true,
+          "sox_close": true,
+          "sp500_close": true,
+          "usdkrw": true,
+          "vix_close": true,
+          "wti_close": true
+        }
+      }
+    ],
+    "row_count": 778,
+    "unique_trading_dates": 778,
+    "min_date": "2023-06-15",
+    "max_date": "2026-06-12",
+    "missing_values": {
+      "date": 0,
+      "nasdaq_close": 27,
+      "sox_close": 27,
+      "sp500_close": 27,
+      "vix_close": 26,
+      "usdkrw": 1,
+      "wti_close": 25
+    },
+    "safe_fill_policy_proposal": {
+      "policy": "Sort by date, forward-fill macro columns using only previous available observations, then optionally backward-fill only initial leading gaps from first available historical observations before the validation period.",
+      "leakage_guard": "Do not use future same-period values to fill earlier dates inside validation/test windows; fit any imputer policy on train only when used in model pipelines.",
+      "apply_now": false
+    },
+    "positive_check_excluding_missing": {
+      "nasdaq_close": true,
+      "sox_close": true,
+      "sp500_close": true,
+      "vix_close": true,
+      "usdkrw": true,
+      "wti_close": true
+    }
+  }
+}

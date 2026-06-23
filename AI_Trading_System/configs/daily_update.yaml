@@ -1,0 +1,33 @@
+daily_update:
+  universe_file: data/metadata/full_universe_260616.csv
+  ticker_name_file: data/metadata/ticker_names.csv
+
+  raw_ohlcv_file: data/raw/kr_stock/ohlcv_full_universe_20230615_20260614.parquet
+  clean_ohlcv_file: data/processed/kr_stock/ohlcv_full_universe_clean_20230615_20260614.parquet
+  macro_file: data/processed/macro/macro_clean_20230615_20260614.parquet
+  feature_file: data/features/full_universe_features_optimized.parquet
+  training_dataset_file: data/processed/full_universe_training_dataset.parquet
+
+  rolling_train_days: 350
+
+  daily_raw_dir: data/daily/raw
+  daily_processed_dir: data/daily/processed
+  daily_feature_dir: data/daily/features
+  daily_training_dir: data/daily/training
+
+  daily_prediction_dir: outputs/daily_predictions
+  daily_model_dir: outputs/daily_models
+  daily_report_dir: reports/daily
+  daily_status_dir: outputs/daily_status
+  log_dir: logs
+
+  recommended_run_time: "08:30"
+  market_open_time: "09:00"
+  pipeline_start_time: "08:30"
+  production_mode: true
+  strict_feature_source_check: true
+  us_macro_max_age_calendar_days: 5
+  enable_us10y_check: false
+  enable_gold_check: false
+  enable_dxy_check: false
+  model_n_estimators_cap: 200
