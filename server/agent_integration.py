@@ -401,6 +401,18 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
             logger.info("Using date-based browse for %s (%d results)", params["date_from"], len(search_results))
             if search_results:
                 answer = _format_date_browse(params["date_from"], search_results)
+                # Related-company context: group by ticker code
+                _ticker_groups = {}
+                for r in search_results:
+                    _tc = str(r.get("종목코드", "")).strip()
+                    if _tc and _tc != "None":
+                        _tn = (r.get("reason", "") or "")[:80]
+                        if _tc not in _ticker_groups:
+                            _ticker_groups[_tc] = _tn
+                if len(_ticker_groups) >= 3 and not params.get("ticker_names"):
+                    _ticker_list = list(_ticker_groups.values())[:5]
+                    _more = f" (+{len(_ticker_groups)-5}종목)" if len(_ticker_groups) > 5 else ""
+                    answer += f"\n\n[관련 기업 현황] {', '.join(_ticker_list)}{_more} 등 {len(_ticker_groups)}종목의 리포트가 있습니다. 특정 종목에 대해 더 자세히 알고 싶으시면 종목명을 말씀해주세요."
                 sources = [r.get("report_id", "") for r in search_results]
                 confidence = "high"
             else:
@@ -421,7 +433,30 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
                     logger.info("Recency filter: %d → %d results (dropped %d old reports)",
                                 _before, len(search_results), _before - len(search_results))
             if search_results:
-                answer = _report.summarise(user_message, search_results)
+                report_summary = _report.summarise(user_message, search_results)
+                # Auto-compare: 2+ reports from different brokerages -> add comparison
+                analysis = ""
+                _brokerages = set()
+                for r in search_results:
+                    _b = r.get("증권사") or r.get("brokerage", "")
+                    if _b:
+                        _brokerages.add(_b)
+                _tk = params.get("ticker_names", [])
+                _ticker_name = _tk[0] if _tk else ""
+                if len(_brokerages) >= 2 and len(search_results) >= 2:
+                    logger.info("Auto-compare: %d brokerages, %d reports for %s",
+                                len(_brokerages), len(search_results), _ticker_name)
+                    analysis = _analysis.compare_reports(search_results, _ticker_name)
+                if analysis:
+                    answer = _composer.compose_chat_response(
+                        intent="report_search",
+                        report_summary=report_summary,
+                        analysis=analysis,
+                        sources=[r.get("report_id", "") for r in search_results],
+                        confidence="medium",
+                    )
+                else:
+                    answer = report_summary
                 sources = [r.get("report_id", "") for r in search_results]
                 confidence = "high"
             else:
@@ -450,7 +485,36 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
         if params.get("compare") and len(search_results) >= 2:
             analysis = _analysis.compare_reports(search_results, ticker_name)
         elif params.get("cause_tracking"):
-            analysis = _analysis.trace_cause(ticker_name, "최근 1주일", search_results, [])
+            # Fetch DART disclosures for richer cause analysis
+            _dart_events = []
+            if ticker_name:
+                try:
+                    _de = _dart.query_disclosure_events(
+                        companies=[ticker_name],
+                        date_from=params.get("date_from"),
+                        date_to=params.get("date_to"),
+                    )
+                    if _de and "데이터가 없습니다" not in _de:
+                        _lines = _de.strip().split("\n")
+                        for _l in _lines:
+                            if ":" in _l and len(_l) > 15:
+                                _parts = _l.split(":", 1)
+                                _dart_events.append({
+                                    "date": params.get("date_from", ""),
+                                    "event": _parts[0].strip(),
+                                    "summary": _parts[1].strip()[:200],
+                                })
+                        if not _dart_events and _lines:
+                            _dart_events.append({
+                                "date": params.get("date_from", ""),
+                                "event": "공시 이벤트",
+                                "summary": _lines[0][:200],
+                            })
+                    logger.info("Cause tracking: +%d dart events for %s",
+                                len(_dart_events), ticker_name)
+                except Exception as _ce:
+                    logger.warning("Cause tracking dart error: %s", _ce)
+            analysis = _analysis.trace_cause(ticker_name, "최근 1주일", search_results, _dart_events)
 
         answer = _composer.compose_chat_response(
             intent="report_search",
@@ -487,16 +551,28 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
             date_to=date_to,
         )
 
-        if params.get("interpret") and dart_result:
-            interpretation = _dart.interpret_disclosure(dart_result, "")
-            answer = _composer.compose_chat_response(
-                intent="dart_query",
-                dart_summary=f"{dart_result}\n\n[공시 해석]\n{interpretation}",
-                confidence="medium",
-            )
+        # Auto-interpret disclosures: users always want to know meaning.
+        # - Explicit interpret=True -> detailed Sonnet analysis
+        # - Default -> basic Haiku impact assessment
+        has_data = bool(dart_result and "데이터가 없습니다" not in dart_result)
+        if has_data:
+            if params.get("interpret"):
+                interpretation = _dart.summarize_disclosure(dart_result, "")
+                answer = _composer.compose_chat_response(
+                    intent="dart_query",
+                    dart_summary=f"{dart_result}\n\n[공시 해석 (상세)]\n{interpretation}",
+                    confidence="medium",
+                )
+            else:
+                interpretation = _dart.interpret_disclosure(dart_result, "")
+                answer = _composer.compose_chat_response(
+                    intent="dart_query",
+                    dart_summary=f"{dart_result}\n\n[공시 의미]\n{interpretation}",
+                    confidence="medium",
+                )
         else:
             answer = dart_result
-            confidence = "high" if dart_result and "데이터가 없습니다" not in dart_result else "low"
+            confidence = "low"
 
     elif route == "hybrid_parallel":
         report_summary = ""
