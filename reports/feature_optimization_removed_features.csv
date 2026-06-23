@@ -1,0 +1,7 @@
+feature,reason,detail
+momentum_20d,explicit_duplicate,identical to return_5d/return_20d
+momentum_5d,explicit_duplicate,identical to return_5d/return_20d
+market_cap_group,identity_excluded,excluded from model feature store for now
+market_type,identity_excluded,excluded from model feature store for now
+sector,identity_excluded,excluded from model feature store for now
+momentum_rank_pct,rank_duplicate,exact duplicate of preferred rank feature

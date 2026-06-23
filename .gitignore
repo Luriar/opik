@@ -1,81 +1,46 @@
-# Secrets & credentials
-.env
-.env.*
-!.env.example
-*.env
-credentials
-*.pem
-*.key
-*.token
-secrets/
-*secret*
-
-# AWS credentials
-.aws/
-
-# Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
-*.egg-info/
-dist/
-build/
-*.egg
+**pycache**/
+*.pyc
+
+.env
+
 .venv/
 venv/
-env/
+.cache/
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-.DS_Store
+.ipynb_checkpoints/
 
-# Cache & checkpoints
-*.cache
-*.cache.json
-.silver_keys_cache.json
-.silver_manifest_cache.json
-.silver_checkpoint.json
-*_checkpoint.json
-.backfill_checkpoint*.json
+outputs/
+outputs/archive/
+outputs/legacy/
 
-# Backup files
-*.bak
+logs/
 
-# Sample/test data
-sample_*.pdf
+data/raw/
+data/processed/
+data/features/
+data/daily/
 
-# Output / generated data
+reports/daily/daily_update_summary_*.md
+
+/models/
+
 *.parquet
+*.feather
 *.csv
-*.jsonl
-*.zip
-data/
-tmp/
-*.tmp
+*.xlsx
+*.pkl
+*.joblib
+*.log
 
-# Batch processing output (Bedrock batch)
-batch_output/
-*.out
+coverage/
 
-# Terraform local state and plan artifacts
-**/.terraform/
-*.tfstate
-*.tfstate.*
-*.tfvars
-!*.tfvars.example
-*.tfplan
-tfplan
-crash.log
-crash.*.log
-override.tf
-override.tf.json
-*_override.tf
-*_override.tf.json
+.pytest_cache/
 
-# Large dependencies (installed separately)
-pylib/
+.mypy_cache/
+
+.idea/
+.vscode/
+
+!reports/**/*.md
+!docs/**/*.md

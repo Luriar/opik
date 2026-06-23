@@ -1,353 +1,759 @@
-# OPIK — AI 한국 주식 브리핑 시스템
+# AI Trading System v1.0
 
-증권사 리포트·DART 공시 데이터를 수집·가공하여 AI 기반 일일 브리핑과 종목 추천을 제공하는 시스템입니다. 뉴스 같은 불확실한 데이터를 배제하고, 확실한 '공시'와 '리포트'에 집중하여 가치를 검증합니다.
+## Production-grade Quant AI Trading Framework
 
-## 로드맵
+---
 
-| Phase | 내용 | 상태 |
-|-------|------|------|
-| **Phase 1** | 증권사 리포트 수집 → 텍스트 추출 → 정규식 구조화 → 카카오톡 브리핑 | 완료 |
-| **Phase 2** | EC2/Airflow/Spark/Delta Lake → DART Sentiment Agent → 3-way Consensus 브리핑 → RAG QA 챗봇 | 설계 완료, 브리핑·DAG·Spark·RAG·모델 통합 구현 중 |
-| **Phase 3** | 실시간 모니터링, 즉시 Consensus, 선제적 푸시 알림 | 예정 |
+# Overview
 
-## 아키텍처
+AI Trading System v1.0은
 
-```
-Bronze (S3 PDF 원본)  →  Silver (S3 JSON 텍스트)  →  Gold (Delta Lake 구조화 + LLM)
-        ↑                         ↑                            ↓
-   네이버 금융               PyMuPDF 추출              Spark 3.5 + Delta Lake
-   한국투자증권              99.99% 성공률              투자의견·목표주가·종목코드
-   DART 공시                                         → 종합 스코어링 → 텔레그램
-```
+**한국 주식(KOSPI200 + KOSDAQ150)을 대상으로 하는 Machine Learning 기반 Daily Trading Framework**이다.
 
-## 현재 성과 (Phase 1)
-
-- **수집**: 네이버 31개 증권사 ~37,000건, 한국투자증권 자체 사이트 ~30,000건 (2020~2026)
-- **텍스트 추출**: 51,294건 PDF → 텍스트 변환 완료 (PyMuPDF, 99.99% 성공)
-- **구조화 추출** (정규식 기반, 비용 제로):
-  - 투자의견 90.8% 정확도
-  - 목표주가 75.0% 추출률 (9-layer false positive 방어, 오탐율 0.044% 이하)
-  - 종목코드 87.5% 추출률
-- **텔레그램 브리핑**: 일일 브리핑 HTML 포맷 전송 완료
-
-## Phase 2 설계 요약
-
-| 구성요소 | 선택 |
-|----------|------|
-| 컴퓨팅 | EC2 r6g.large (ARM64, 16GB) |
-| 배치 처리 | Apache Spark 3.5 (local mode) + Delta Lake 3.0 |
-| 워크플로우 | Airflow 2.10.0, Bronze/Silver/Gold 일배치 DAG |
-| LLM 추출 | Claude Haiku (건당 $0.005, reason/risks/keywords) |
-| 스코어링 | Triple Consensus: report BUY + DART positive + model ranking_score > 0 |
-| QA 챗봇 | RAG: 임베딩(384d) 유사도 검색 + Haiku 응답 생성 |
-| 전달 | Telegram Bot (@Luriarbot) HTML 브리핑 + 대화형 QA |
-| 월 운영비 | 약 8.5만원 (EC2 예약 + S3 + Haiku API) |
-
-## 팀
-
-| 팀원 | 담당 | 데이터 소스 |
-|------|------|-----------|
-| **박찬호** | 주가 예측 모델 | 주가 데이터 |
-| **신상용** | DART 공시 수집·분석 | DART Open API |
-| **윤준호 + 강태주** | 증권사 리포트 수집·가공 | 네이버 금융, 증권사 자체 사이트 |
-
-## 현재 Airflow DAG 구성
-
-`taeju-airflow` 브랜치 기준으로 증권사 리포트 파이프라인은 일배치 DAG 형태로 전환되어 있습니다.
-
-| DAG | 파일 | 역할 | 기본 스케줄 |
-|-----|------|------|-------------|
-| `opik_bronze_naver` | `dags/bronze/upload_naver.py` | 네이버 금융 경유 증권사 리포트 PDF를 S3 `bronze/`에 적재 | 매일 00:00 KST |
-| `opik_bronze_koreainvest` | `dags/bronze/upload_koreainvest.py` | 한국투자증권 사이트 리포트 PDF를 S3 `bronze/`에 적재 | 매일 00:00 KST |
-| `opik_bronze_shinhaninvest` | `dags/bronze/upload_shinhaninvest.py` | 신한투자증권 API 리포트 PDF를 S3 `bronze/`에 적재 | 매일 00:00 KST |
-| `opik_silver_extract` | `dags/silver/silver.py` | 세 Bronze 완료 후 PDF를 S3 `silver/` JSON으로 변환 | 매일 00:00 KST, sensor 대기 |
-| `opik_gold_structured` | `dags/gold/structured.py` | Silver 완료 후 투자지표를 월별 `gold/structured` Parquet에 upsert | 매일 00:00 KST, sensor 대기 |
-| `opik_gold_embeddings` | `dags/gold/embedding.py` | Silver 완료 후 Haiku/E5 결과를 월별 `gold/embeddings` Parquet에 upsert | 매일 00:00 KST, sensor 대기 |
-| `model_daily_prediction` | `dags/model/daily_prediction.py` | LightGBM 3-model daily training + prediction + S3 Gold upload | 매일 06:00 KST |
-| `opik_briefing` | `dags/briefing/daily_briefing.py` | Triple Consensus ★/! 브리핑 생성 → Telegram 전송 | 매일 07:00 KST |
-
-실행 의존성:
+시스템은
 
 ```text
-opik_bronze_naver ─────────┐
-opik_bronze_koreainvest ───┼─> opik_silver_extract ─┬─> opik_gold_structured
-opik_bronze_shinhaninvest ─┘                         └─> opik_gold_embeddings
+Feature Engineering
 
-model_daily_prediction (06:00 KST, independent)
-  → s3://s3-opik-bucket/gold/model/predictions/dt={date}/predictions.parquet
+↓
 
-opik_briefing (07:00 KST) — depends on:
-  → opik_gold_structured + opik_gold_embeddings (report BUY signal)
-  → model_daily_prediction (ranking_score > 0 signal)
-  → DART Gold (전일 08:00 compaction 기준, 1영업일 lag)
-  → DART Sentiment Agent (Haiku batch: 25건/배치, asyncio 20 병렬)
+AI Prediction
+
+↓
+
+Portfolio Construction
+
+↓
+
+Execution
+
+↓
+
+Backtest
+
+↓
+
+Evaluation
 ```
 
-공통 설정:
+전체 Pipeline을 하나의 Framework로 구현한다.
 
-- 모든 DAG는 `catchup=False`, `max_active_runs=1` 기준입니다.
-- Report DAG(Bronze/Silver/Gold)는 `OPIK_REPORT_PIPELINE_SCHEDULE`을 공유합니다. 기본값은 `0 0 * * *`입니다.
-- Model DAG는 `0 6 * * *`, Briefing DAG는 `0 7 * * *`로 독립 schedule입니다.
-- Silver의 세 `ExternalTaskSensor`가 같은 target date의 Bronze task 성공을 모두 기다립니다.
-- 각 Gold DAG의 `ExternalTaskSensor`가 같은 target date의 Silver task 성공을 기다립니다.
-- 센서는 worker slot을 점유하지 않는 `reschedule` 모드이며 60초 간격, 최대 6시간 대기합니다.
-- target date는 `data_interval_end`를 `Asia/Seoul`로 변환한 뒤 하루를 뺀 날짜입니다. 6월 18일 자정 실행은 발행이 끝난 6월 17일 데이터를 처리합니다.
-- Silver는 해당 날짜의 `bronze/{증권사}/{YYYY-MM-DD}/_manifest.json`만 읽습니다.
-- Gold는 해당 날짜의 Silver JSON을 기존 월 Parquet와 `report_id` 기준으로 upsert하므로 재실행해도 중복되지 않습니다.
-- Gold 출력은 `gold/structured/year=YYYY/month=MM/data.parquet`, `gold/embeddings/year=YYYY/month=MM/data.parquet`입니다.
-- 한국투자증권은 사이트 보안/세션 특성이 있어 일배치 순회 제한을 둡니다.
-  - `KOREAINVEST_DAILY_PAGE_BATCH`: 기본 `5`
-  - `KOREAINVEST_DAILY_MAX_PAGES`: 기본 `50`
+---
 
-기존 `{{ ds }}`는 Airflow logical date의 UTC 날짜였습니다. 자정 이후 예약 실행은 이전 data interval의 시작 시각을 logical date로 사용하므로 6월 18일 새벽 실행이 6월 16일로 렌더링될 수 있었고, 오후 수동 실행은 현재 날짜를 사용해 결과가 달라졌습니다. 현재는 KST `data_interval_end - 1일`을 사용하므로 6월 18일 중 예약·수동 실행 모두 6월 17일을 처리합니다.
+# Current Production Status
 
-## EC2 / Docker Airflow 운영 인수인계
+현재 v1.0 production pipeline은 다음 범위를 지원한다.
 
-### 1. DAG 파일 배치
+- KOSPI200 + KOSDAQ150 기반 약 350개 종목 universe
+- 일별 데이터 수집부터 예측과 보관까지 이어지는 자동 업데이트 pipeline
+- 최근 350 trading days를 사용하는 rolling training window
+- Ranking / Gap / Intraday LightGBM 모델의 독립 학습과 예측
+- `ranking_score`, `pred_gap`, `pred_intraday` 기반 Top10 portfolio 생성
+- 모델, 예측, Top10, 학습 데이터, 상태 및 metadata를 보존하는 archive system
+- 시간 순서를 유지하고 미래 데이터를 차단하는 walk-forward evaluation framework
 
-EC2 Airflow 컨테이너는 `/opt/airflow/dags` 아래의 파일을 파싱합니다. 로컬 repo는 `dags/bronze`, `dags/silver` 하위 구조를 쓰지만, EC2에서는 필요에 따라 파일을 flat하게 둘 수 있습니다.
+Production entry point:
 
-예시:
+```bat
+run_daily_update.bat
+```
+
+---
+
+# Project Philosophy
+
+본 프로젝트는
 
 ```text
-/opt/airflow/dags/
-├── upload_naver.py
-├── upload_koreainvest.py
-├── upload_shinhaninvest.py
-├── silver.py
-├── structured.py
-└── embedding.py
+높은 Backtest 수익률
 ```
 
-파일을 바꾼 뒤에는 scheduler/worker가 새 파일을 읽도록 재시작하는 것이 가장 확실합니다.
-
-```bash
-docker compose restart airflow-scheduler airflow-worker
-```
-
-### 2. 환경변수
-
-AWS 자격증명은 EC2 IAM Role 또는 컨테이너 환경변수 중 하나로 공급합니다. `.env` 파일에는 비밀값을 커밋하지 않습니다.
-
-필수/권장 환경변수:
-
-```env
-S3_BUCKET=s3-opik-bucket
-S3_REGION=ap-northeast-2
-AWS_REGION=ap-northeast-2
-AWS_DEFAULT_REGION=ap-northeast-2
-
-# EC2 IAM Role을 쓰지 않는 경우에만 필요
-AWS_ACCESS_KEY_ID=...
-AWS_SECRET_ACCESS_KEY=...
-
-# Airflow UI에서 worker task log 403/JWT 에러 방지용
-AIRFLOW__WEBSERVER__SECRET_KEY=opik-airflow-fixed-secret-key-2026
-
-# Gold/LLM 작업에서 필요
-BEDROCK_REGION=ap-northeast-2
-BEDROCK_API_KEY=...
-BEDROCK_LLM_MODEL_ID=anthropic.claude-3-haiku-20240307-v1:0
-
-# 다섯 DAG가 반드시 같은 값을 공유해야 함
-OPIK_REPORT_PIPELINE_SCHEDULE="0 0 * * *"
-```
-
-`AIRFLOW__WEBSERVER__SECRET_KEY`는 webserver/scheduler/worker에 동일하게 주입되어야 합니다. 값이 다르면 UI에서 task log를 열 때 다음과 같은 에러가 날 수 있습니다.
+보다
 
 ```text
-Could not read served logs: 403 Client Error: FORBIDDEN
-jwt.exceptions.InvalidSignatureError: Signature verification failed
+Leakage-Free
+
+Reproducible
+
+Production Ready
+
+Maintainable
 ```
 
-이 에러는 증권사 사이트 차단이 아니라 Airflow 내부 log server 인증 문제입니다.
+System 구축을 목표로 한다.
 
-### 3. Airflow 이미지와 Python 패키지
+---
 
-Airflow 컨테이너에서 DAG를 파싱/실행하려면 `requirements.txt`의 패키지가 설치되어 있어야 합니다.
+# Core Principles
 
-주요 패키지:
+모든 구현은 다음 원칙을 따른다.
 
-- `boto3`: S3 접근
-- `requests`: 신한투자증권 API/PDF 다운로드
-- `aiohttp`: 네이버/한국투자증권 비동기 HTTP
-- `beautifulsoup4`: 네이버/한국투자증권 HTML 파싱
-- `pymupdf`: Silver PDF 텍스트 추출 (`fitz`)
-- `pyarrow`, `sentence-transformers`: Gold/embedding 작업
-- `pendulum`: Airflow DAG timezone-aware `start_date`
+```
+Correctness
 
-운영 서버에서는 실행 중인 컨테이너에 직접 `pip install`하지 않습니다. 해당 변경은 컨테이너 재생성 시 사라지고, 범위 버전 설치는 Airflow의 Celery/Click 의존성을 깨뜨릴 수 있습니다. 저장소의 `Dockerfile.airflow`로 공통 이미지를 빌드합니다.
+>
 
-`docker-compose.yaml`과 같은 경로에 `Dockerfile.airflow`, `requirements.txt`를 둔 뒤 공통 설정을 다음과 같이 지정합니다.
+Reproducibility
 
-```yaml
-x-airflow-common:
-  &airflow-common
-  image: opik-airflow:2.10.0
-  build:
-    context: .
-    dockerfile: Dockerfile.airflow
+>
+
+Risk Control
+
+>
+
+Performance
 ```
 
-최초 배포 또는 requirements 변경 시:
+---
 
-```bash
-docker compose build --no-cache
-docker compose up -d --force-recreate
+# System Architecture
+
+```
+Universe
+
+↓
+
+Feature Library
+
+↓
+
+Ranking Model
+
+↓
+
+Gap Model
+
+↓
+
+Intraday Model
+
+↓
+
+Prediction Merge
+
+↓
+
+Portfolio Construction
+
+↓
+
+Execution Engine
+
+↓
+
+Backtest
+
+↓
+
+Performance Evaluation
 ```
 
-모든 Airflow 서비스가 같은 이미지와 패키지 버전을 사용해야 합니다. worker만 별도 설치하면 scheduler와 실행 환경이 달라져 DAG 파싱 또는 task 실행 결과가 달라질 수 있습니다.
+---
 
-핵심 버전은 다음과 같이 고정되어 있습니다.
+# Daily Production Pipeline
 
 ```text
-apache-airflow                  2.10.0
-apache-airflow-providers-celery 3.7.3
-celery                         5.4.0
-click                          8.1.7
-sentence-transformers          3.0.1
-transformers                   4.41.2
-huggingface-hub                0.23.4
+run_daily_update.bat
+
+↓
+
+Config Load
+
+↓
+
+Target Update Date Selection
+
+↓
+
+KRX OHLCV Download
+
+↓
+
+Macro Data Download
+
+↓
+
+Feature Generation
+
+↓
+
+Feature Completeness Check
+
+↓
+
+Training Dataset Update
+
+↓
+
+350-Day Rolling Train
+
+↓
+
+Ranking / Gap / Intraday Training
+
+↓
+
+Prediction
+
+↓
+
+Top10 Selection
+
+↓
+
+Archive
 ```
 
-최신 `sentence-transformers`/`huggingface-hub`를 제한 없이 설치하면 `click`이 8.4 이상으로 올라갈 수 있습니다. Airflow 2.10.0의 Celery worker는 이 조합에서 hostname을 `None`으로 전달받아 다음 오류로 재시작됩니다.
+각 단계는 config 기반으로 실행되며, 필수 데이터 검증에 실패하면 production pipeline을 중단한다. 성공한 실행은 재현에 필요한 모델, 예측, portfolio, training window, status, hash 및 metadata를 archive에 기록한다.
+
+---
+
+# Models
+
+본 시스템은 서로 다른 target을 담당하는 3개의 독립 LightGBM 모델을 사용한다. 세 모델을 하나로 합치지 않으며, 모든 입력은 prediction date 기준 T-1까지 확정된 feature만 사용한다.
+
+## Model 1: Ranking Model
+
+- Target: `target_ranking`
+- Formula: `Close(T) / Close(T-1) - 1`
+- Purpose: 약 350개 종목의 next-day close return을 예측하고 상대 순위를 생성
+- Output: `ranking_score`
+- Usage: Top10 후보 선정의 기본 점수
+
+## Model 2: Gap Model
+
+- Target: `target_gap`
+- Formula: `Open(T) / Close(T-1) - 1`
+- Purpose: 전일 종가 대비 다음 거래일 시가 gap 예측
+- Output: `pred_gap`
+
+## Model 3: Intraday Model
+
+- Target: `target_intraday`
+- Formula: `Close(T) / Open(T) - 1`
+- Purpose: 다음 거래일 시가부터 종가까지의 intraday return 예측
+- Output: `pred_intraday`
+
+Prediction merge 단계는 `pred_gap`과 `pred_intraday`를 결합해 expected return과 예상 가격 수준을 계산하고, Ranking Model의 상대 순위와 함께 portfolio construction에 전달한다.
+
+---
+
+# Universe
+
+```
+KOSPI200
+
++
+
+KOSDAQ150
+
+≈350 Stocks
+```
+
+Daily Universe를 사용한다.
+
+---
+
+# Feature Library
+
+Production model은 약 55개의 feature를 사용한다. Feature library의 주요 그룹은 다음과 같다.
+
+- **Momentum**: 1일, 3일, 5일, 20일, 60일 수익률과 momentum acceleration
+- **Trend**: 이동평균 대비 가격 비율과 중장기 추세 위치
+- **Relative Strength**: 동일 거래일 universe 내 cross-sectional percentile rank
+- **Liquidity**: 거래량, 거래대금, 상대 거래대금 및 liquidity rank
+- **Volatility**: rolling volatility, ATR, intraday range 및 volatility rank
+- **Candlestick**: body, upper/lower shadow와 전일 candle 구조
+- **Breakout**: 과거 high/low 범위 대비 위치와 breakout strength
+- **Technical Indicators**: RSI, MACD, Bollinger Band 계열 지표
+- **Macro Features**: NASDAQ, S&P500, VIX, WTI, USD/KRW 및 SOX 기반 변화율
+
+모든 Feature는
+
+```
+T-1
+```
+
+기준으로 생성된다.
+
+---
+
+# Data Leakage Policy
+
+가장 중요한 원칙
+
+```
+Feature Date
+
+<
+
+Target Date
+```
+
+항상
+
+```
+T-1 Feature
+
+↓
+
+Predict T
+```
+
+를 따른다.
+
+---
+
+# Walk-forward Validation
+
+Random Split은 금지한다.
+
+항상
+
+```
+Train
+
+↓
+
+Validation
+
+↓
+
+Test
+```
+
+순서를 유지한다.
+
+기본 구조
+
+```
+Expanding Window
+
+Monthly Retraining
+```
+
+---
+
+# Evaluation Results
+
+최신 production-aligned 350-day window walk-forward replay 결과는 다음과 같다.
+
+| Metric | Result |
+|---|---:|
+| Evaluation window | 90 trading days |
+| Evaluation period | 2026-01-30 to 2026-06-17 |
+| Rolling train window | 350 trading days |
+| Feature count | 55 |
+| Top10 average daily return | 0.98% |
+| Sharpe ratio | 3.64 |
+| CAGR | 822.84% |
+| Maximum drawdown | -23.14% |
+
+평가는 각 fold에서 evaluation date 이전의 데이터만 학습에 사용한 walk-forward replay다. Top10은 `ranking_score` 내림차순, equal weight, 1 trading day holding 조건으로 계산했다.
+
+상세 결과는 [`reports/window_comparison/window_350/evaluation_report.md`](reports/window_comparison/window_350/evaluation_report.md)와 [`metrics_summary.json`](reports/window_comparison/window_350/metrics_summary.json)에서 확인할 수 있다.
+
+> 과거 walk-forward 성과는 미래 수익을 보장하지 않는다. 특히 CAGR은 90 trading day 표본을 연율화한 값이므로 장기 기대수익으로 해석해서는 안 된다.
+
+---
+
+# Portfolio Construction
+
+```
+Ranking Score
+
+↓
+
+Top30 Candidate
+
+↓
+
+Expected Return
+
+↓
+
+Risk Filter
+
+↓
+
+Diversification
+
+↓
+
+Equal Weight
+
+↓
+
+Top10 Portfolio
+```
+
+---
+
+# Execution
+
+기본 Execution
+
+```
+Prediction
+
+↓
+
+Order Plan
+
+↓
+
+Paper Trading
+
+↓
+
+Performance Tracking
+```
+
+실거래 API는 v2.0에서 지원한다.
+
+---
+
+# Repository Structure
 
 ```text
-AttributeError: 'NoneType' object has no attribute 'split'
-Error: No nodes replied within time constraint
+AI-Trading-System/
+
+├── configs/   # Feature, model, validation, portfolio, execution, daily configs
+├── scripts/   # Dataset, training, evaluation, and daily pipeline entry points
+├── src/       # Production data, feature, model, pipeline, validation modules
+├── tests/     # Leakage, pipeline, model, prediction, and integration tests
+├── docs/      # Architecture and system specifications
+├── reports/   # Curated audits and walk-forward evaluation reports
+├── data/      # Local runtime market/feature/training data (Git ignored)
+└── outputs/   # Local models, predictions, status, and archives (Git ignored)
 ```
 
-버전과 worker 상태 확인:
+대용량 market data와 generated runtime artifacts는 repository history에 포함하지 않는다. 필요한 directory는 pipeline 실행 시 생성된다.
 
-```bash
-docker compose exec -T airflow-scheduler python - <<'PY'
-from importlib.metadata import version
+---
 
-for name in [
-    "apache-airflow",
-    "apache-airflow-providers-celery",
-    "celery",
-    "click",
-    "kombu",
-    "billiard",
-]:
-    print(name, version(name))
-PY
-
-docker compose exec airflow-worker \
-  celery --app airflow.providers.celery.executors.celery_executor.app \
-  inspect ping --timeout=10
-```
-
-정상 worker는 `pong`을 반환합니다.
-
-이미 실행 중인 서버에서 위 Click 오류가 발생한 경우에만 임시 복구합니다.
-
-```bash
-docker compose exec --user airflow airflow-scheduler \
-  python -m pip install --no-cache-dir "click==8.1.7"
-
-until docker compose exec --user airflow airflow-worker \
-  python -m pip install --no-cache-dir "click==8.1.7"
-do
-  sleep 2
-done
-
-docker compose restart airflow-scheduler airflow-worker
-```
-
-이 방식은 컨테이너 writable layer만 수정하므로 영구 배포 방법이 아닙니다. 복구 후 반드시 커스텀 이미지를 다시 빌드합니다.
-
-패키지 import 확인:
-
-```bash
-docker compose exec airflow-worker python -c "import fitz, bs4, aiohttp, boto3, pendulum; print('ok')"
-docker compose exec airflow-scheduler python -c "import fitz, bs4, aiohttp, boto3, pendulum; print('ok')"
-docker compose exec airflow-worker python -c "import pyarrow, sentence_transformers; print('gold packages ok')"
-```
-
-### 4. DAG 등록 확인
-
-```bash
-docker compose exec airflow-scheduler airflow dags list | grep opik
-docker compose exec airflow-scheduler airflow dags list-import-errors
-```
-
-UI에서 `No results`가 보이면 import error가 아니라 scheduler 갱신 지연일 수 있습니다. 잠시 기다리거나 scheduler를 재시작합니다.
-
-```bash
-docker compose restart airflow-scheduler
-```
-
-### 5. Task 로그 확인
-
-UI log가 403으로 안 열릴 때는 worker 컨테이너 로그 파일을 직접 확인합니다.
-
-```bash
-docker compose exec airflow-worker bash -lc '
-find /opt/airflow/logs/dag_id=opik_bronze_koreainvest -type f -name "*.log" -print | sort
-'
-```
-
-최신 로그 tail:
-
-```bash
-docker compose exec airflow-worker bash -lc '
-tail -n 200 "$(find /opt/airflow/logs/dag_id=opik_bronze_koreainvest -type f -name "*.log" | sort | tail -1)"
-'
-```
-
-실시간 worker 로그:
-
-```bash
-docker compose logs -f airflow-worker | grep -Ei "koreainvest|한국투자|naver|shinhan|manifest|error|failed|traceback|done|uploaded"
-```
-
-## 파일 구조
+# Documentation
 
 ```
-opik/
-├── dags/
-│   ├── bronze/
-│   │   ├── upload_naver.py             # 네이버 금융 → S3 Bronze
-│   │   ├── upload_koreainvest.py       # 한국투자증권 → S3 Bronze
-│   │   └── upload_shinhaninvest.py     # 신한투자증권 → S3 Bronze
-│   ├── silver/
-│   │   └── silver.py                   # Bronze PDF → Silver JSON
-│   ├── gold/
-│   │   ├── embedding.py                # Silver → Haiku/E5 → 월별 Gold embeddings DAG
-│   │   └── structured.py               # Silver → 정규식 → 월별 Gold structured DAG
-│   └── model/
-│       └── daily_prediction.py         # LightGBM 3-model training + prediction → S3 Gold (06:00 KST)
-│   └── briefing/
-│       └── daily_briefing.py           # ★/! Triple Consensus Briefing DAG (07:00 KST)
-├── src/
-│   └── model/                          # 찬호 AI_Trading_System medallion 구조 통합
-│       ├── data/                       # calendar, data_loader, macro_loader, universe
-│       ├── features/                   # 10 feature groups (breakout, momentum, volatility, ...)
-│       ├── models/                     # LightGBM 3-model (ranking, gap, intraday)
-│       ├── pipeline/                   # 12-step daily pipeline + S3 upload
-│       ├── validation/                 # walk-forward, retrainer, fold generator
-│       ├── backtest/                   # backtest framework
-│       └── utils/                      # config_loader, logger, paths, seed
-├── configs/                            # 7 YAML (daily_update, model, features, backtest, ...)
-├── scripts/model/run_prediction.py     # 독립 실행형 모델 prediction 스크립트
-├── pipeline/                           # 독립 실행용 스크립트 (extract_silver, telegram_briefing, ...)
-├── server/                             # EC2 챗봇 서버 (FastAPI + FAISS + Bedrock Haiku)
-│   └── agents/                         # LangGraph 멀티에이전트 (8개 Agent + Briefing Graph)
-├── spark_jobs/                         # Spark Delta Lake MERGE jobs (Phase 2b)
-├── docs/                               # 설계/작업 문서
-├── Dockerfile.airflow                  # Airflow 2.10.0 공통 실행 이미지
-├── docker-compose.yaml                 # Airflow Celery cluster (scheduler, worker, webserver, ...)
-├── .dockerignore                       # 이미지 빌드 시 비밀값/불필요 파일 제외
-└── requirements.txt                    # Airflow 호환 버전으로 고정된 DAG 의존성
+docs/
+
+01_system_architecture.md
+
+02_universe.md
+
+03_targets.md
+
+04_models.md
+
+05_feature_library.md
+
+06_data_leakage_rules.md
+
+07_walk_forward_validation.md
+
+08_backtest.md
+
+09_portfolio.md
+
+10_execution.md
 ```
 
-## 개발 접근법
+---
 
-Build → Validate → Refine → Document → Design Next
+# Configuration
 
-일단 데이터를 만지고, 거기서 배운 걸로 설계합니다. 자세한 내용은 [DEVELOPMENT_LOG.md](DEVELOPMENT_LOG.md) 참고.
+```
+configs/
+
+feature.yaml
+
+model.yaml
+
+validation.yaml
+
+backtest.yaml
+
+portfolio.yaml
+
+execution.yaml
+```
+
+모든 Parameter는 Config 기반으로 관리한다.
+
+Hard Coding은 금지한다.
+
+---
+
+# Tests
+
+모든 구현은 Test를 포함해야 한다.
+
+```
+tests/
+
+test_feature_generation.py
+
+test_data_leakage.py
+
+test_walk_forward.py
+
+test_backtest.py
+
+test_portfolio.py
+
+test_execution.py
+```
+
+모든 Test는 통과해야 한다.
+
+```
+pytest
+
+↓
+
+100% PASS
+
+↓
+
+Merge
+```
+
+---
+
+# Development Workflow
+
+모든 개발은 다음 순서를 따른다.
+
+```
+Specification
+
+↓
+
+Test
+
+↓
+
+Implementation
+
+↓
+
+Validation
+
+↓
+
+Backtest
+
+↓
+
+Review
+```
+
+Test 없이 구현하지 않는다.
+
+---
+
+# Coding Rules
+
+```
+Simple
+
+Readable
+
+Typed
+
+Config Driven
+
+Unit Tested
+
+Leakage Free
+```
+
+를 기본 원칙으로 한다.
+
+---
+
+# Forbidden
+
+절대 금지
+
+```
+Random Shuffle
+
+Future Data
+
+Target as Feature
+
+Actual Return Selection
+
+Transaction Cost Ignore
+
+Slippage Ignore
+
+Hard Coding
+
+Silent Exception
+```
+
+---
+
+# Output
+
+Pipeline은 항상 다음 결과를 생성한다.
+
+```
+Prediction
+
+Portfolio
+
+Execution
+
+Metrics
+
+Logs
+```
+
+모든 실행은 재현 가능해야 한다.
+
+---
+
+# Technology Stack
+
+```
+Python 3.12+
+
+pandas
+
+numpy
+
+lightgbm
+
+pyyaml
+
+pytest
+
+pyarrow
+```
+
+---
+
+# Future Roadmap
+
+v1.0
+
+```
+Daily Prediction
+
+Walk-forward
+
+Portfolio
+
+Paper Trading
+```
+
+v1.1
+
+```
+Dashboard
+
+SHAP Analysis
+
+Model Monitoring
+```
+
+v2.0
+
+```
+Broker API
+
+Automatic Execution
+
+Real-time Prediction
+
+Risk Monitoring
+```
+
+---
+
+# Final Philosophy
+
+본 프로젝트는
+
+```
+Machine Learning Project
+```
+
+가 아니라
+
+```
+Production Quant Trading System
+```
+
+이다.
+
+최종 목표는
+
+```
+Good Model
+
++
+
+Good Portfolio
+
++
+
+Good Execution
+
++
+
+Good Risk Control
+
+=
+
+Good Trading System
+```
+
+이다.
+
+---
+
+# One Rule
+
+언제든 판단이 어려울 경우 다음 원칙을 따른다.
+
+```
+Leakage-Free
+
+>
+
+Higher Backtest Return
+
+Simple
+
+>
+
+Complex
+
+Reproducible
+
+>
+
+Optimized
+```
+
+이 원칙은 모든 구현보다 우선한다.
+
+---
+
+# README Changelog
+
+## 2026-06-22
+
+- Current Production Status와 daily automated pipeline 추가
+- Ranking / Gap / Intraday 모델 target 및 formula 명시
+- 약 55개 production feature group 정리
+- 350-day rolling window 기반 90-day walk-forward 평가 결과 추가
+- 현재 GitHub repository structure와 runtime data 정책 반영
+
 
 ## 최근 운영 환경 변경 사항 (2026-06)
 
@@ -424,7 +830,3 @@ Build → Validate → Refine → Document → Design Next
 * 유지보수 용이성(Maintainability)
 
 모든 Feature는 반드시 Target Date 이전 시점의 정보만 사용하며, 운영 환경에서는 Feature Source Completeness 검증을 통과한 경우에만 Prediction 및 Top10 생성이 허용됩니다.
-
-## 라이선스
-
-MIT

@@ -1,1 +1,0 @@
-# OPIK Pipeline
