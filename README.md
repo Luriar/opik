@@ -349,6 +349,82 @@ Build → Validate → Refine → Document → Design Next
 
 일단 데이터를 만지고, 거기서 배운 걸로 설계합니다. 자세한 내용은 [DEVELOPMENT_LOG.md](DEVELOPMENT_LOG.md) 참고.
 
+## 최근 운영 환경 변경 사항 (2026-06)
+
+### 학습 기간(Training Window) 변경
+
+* 운영 환경의 Rolling Training Window를 **250영업일 → 350영업일**로 변경하였습니다.
+* 150D / 200D / 250D / 300D / 350D / 500D 비교 실험 결과, 본 프로젝트에서는 **350영업일 학습 구간이 가장 우수한 포트폴리오 성과(CAGR, Sharpe Ratio)를 기록**하였습니다.
+* 이에 따라 운영 기본 설정(Production Default)을 350영업일로 변경하였습니다.
+
+### 시장별 휴일을 고려한 Macro 데이터 검증 정책 도입
+
+* 한국(KRX)과 미국 시장의 휴일 차이로 인해 발생할 수 있는 Macro 데이터 불일치 문제를 해결하였습니다.
+* KRX 데이터는 기존과 동일하게 **Target Update Date와 정확히 일치**해야 합니다.
+* 미국 Macro 데이터(NASDAQ, SOX, S&P500, VIX, WTI, USD/KRW)는 **최근 유효 거래일 기준 허용 범위 내 데이터 사용**이 가능하도록 정책을 개선하였습니다.
+* 이를 통해 미국 휴장일에도 안정적인 운영이 가능하도록 하였습니다.
+
+### SOX Feature 운영 계약(Production Contract) 추가
+
+* 반도체 업종 지표인 **SOX (^SOX)** 를 공식 운영 Feature로 추가하였습니다.
+* SOX 데이터 다운로드, 검증, 상태 추적(Status Tracking)을 운영 파이프라인에 포함하였습니다.
+* SOX 데이터가 누락되거나 오래된 경우 Prediction 생성이 차단되도록 개선하였습니다.
+* Feature Source Completeness Check에 SOX 검증을 추가하여 데이터 무결성을 강화하였습니다.
+
+### SOX 데이터 복구 및 백필(Backfill)
+
+* 운영 과정에서 발견된 SOX 데이터 누락 문제를 분석하고 원인을 확인하였습니다.
+
+* 누락된 SOX 이력을 복구하였으며, 다음 날짜에 대해 Backfill을 수행하였습니다.
+
+  * 2026-06-17
+  * 2026-06-18
+  * 2026-06-19
+
+* 영향을 받은 Feature Snapshot을 재생성하여 정상화하였습니다.
+
+* 모든 운영 Feature에 대해 SOX 기반 수익률(`sox_return_1d`)이 정상 계산되는 것을 확인하였습니다.
+
+### 현재 운영 환경
+
+* Universe
+
+  * KOSPI200 + KOSDAQ150
+  * 약 350개 종목
+
+* Rolling Training Window
+
+  * 350 영업일
+
+* Feature 개수
+
+  * 55개
+
+* 모델 구성
+
+  * Ranking Model
+  * Gap Model
+  * Intraday Model
+
+### 검증 결과
+
+* Daily Update Pipeline 테스트 통과
+* Model Training 테스트 통과
+* Prediction 테스트 통과
+* 최신 검증 결과: **178개 테스트 통과**
+
+### 운영 원칙
+
+본 시스템은 높은 백테스트 수익률보다 다음 원칙을 우선합니다.
+
+* Data Leakage 방지
+* 재현 가능성(Reproducibility)
+* 데이터 무결성(Data Integrity)
+* 운영 안정성(Production Stability)
+* 유지보수 용이성(Maintainability)
+
+모든 Feature는 반드시 Target Date 이전 시점의 정보만 사용하며, 운영 환경에서는 Feature Source Completeness 검증을 통과한 경우에만 Prediction 및 Top10 생성이 허용됩니다.
+
 ## 라이선스
 
 MIT
