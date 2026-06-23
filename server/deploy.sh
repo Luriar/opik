@@ -20,7 +20,7 @@ ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$REMOTE_USER@$EC2_IP" \
 
 scp -i "$SSH_KEY" opik_server.py agent_integration.py requirements.txt opik-server.service \
   "$REMOTE_USER@$EC2_IP:~/opik-server/"
-scp -i "$SSH_KEY" conversation_store.py dart_query.py intent_parser.py \
+scp -i "$SSH_KEY" conversation_store.py dart_query.py intent_parser.py source_links.py \
   "$REMOTE_USER@$EC2_IP:~/opik-server/"
 scp -i "$SSH_KEY" prompts/system.md prompts/intent_parser.md prompts/answer_generator.md \
   "$REMOTE_USER@$EC2_IP:~/opik-server/prompts/"
