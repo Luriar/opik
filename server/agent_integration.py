@@ -92,7 +92,7 @@ def get_agent_status() -> dict:
 
 
 def _format_date_browse(date_from: str, date_to: str, results: list) -> str:
-    """Format date-based browse results — clean, readable output."""
+    """Format date-based browse results — compact, readable, Telegram-optimised."""
     if not results:
         return f"해당 날짜({date_from}~{date_to})의 증권사 리포트 데이터가 없습니다."
 
@@ -104,7 +104,6 @@ def _format_date_browse(date_from: str, date_to: str, results: list) -> str:
     lines = [f"📊 {date_label} 증권사 리포트 ({len(results)}건)", ""]
 
     def _clean_list(val):
-        """Convert Python list str/repr to clean comma-separated text."""
         if not val or val in ("None", "[]"):
             return ""
         if isinstance(val, list):
@@ -114,12 +113,45 @@ def _format_date_browse(date_from: str, date_to: str, results: list) -> str:
         items = [x.strip().strip("'\"") for x in s.split(",") if x.strip()]
         return ", ".join(items) if items else ""
 
+    _OPINION_MAP = {"BUY": "매수", "HOLD": "중립", "SELL": "매도", "NOT_RATED": "의견없음"}
+
     for i, r in enumerate(results[:20]):
         reason = r.get("reason", "") or ""
+        sec = r.get("증권사", "")
+        opinion = r.get("투자의견", "")
+        tp = r.get("목표주가", "")
+        upside = r.get("상승여력_pct", "")
+        rdate = r.get("발행일", "")
         kw = _clean_list(r.get("keywords", ""))
         risk = _clean_list(r.get("risks", ""))
-        # Show a number for easier scanning
-        lines.append(f"{i+1}. {reason}")
+
+        # Bold the brokerage portion: **[한국투자증권]** 나머지
+        if sec and reason.startswith(f"[{sec}]"):
+            reason_display = f"**[{sec}]**{reason[len(f'[{sec}]'):]}"
+        else:
+            reason_display = reason
+
+        lines.append(f"{i+1}. {reason_display}")
+
+        # Compact info line: date · opinion · target · upside
+        info_parts = []
+        if rdate:
+            info_parts.append(rdate)
+        if opinion and opinion not in ("nan", "None"):
+            info_parts.append(_OPINION_MAP.get(opinion, opinion))
+        if tp and tp not in ("nan", "None"):
+            try:
+                info_parts.append(f"목표가 {int(float(tp)):,}원")
+            except (ValueError, TypeError):
+                pass
+        if upside and upside not in ("nan", "None"):
+            try:
+                info_parts.append(f"+{float(upside):.1f}%")
+            except (ValueError, TypeError):
+                pass
+
+        if info_parts:
+            lines.append(f"   {' · '.join(info_parts)}")
         if kw:
             lines.append(f"   Keyword: {kw}")
         if risk:
