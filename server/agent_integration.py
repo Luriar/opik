@@ -482,9 +482,9 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
                         _faiss_fallback_used = False
                         _tk_query = " ".join(_tn_list) + " 리포트"
                         _faiss_hits = _report.search(_tk_query, top_k=10)
-                        _has_year_ref_fb = bool(__import__("re").search(r"\b(20\d{2})년", user_message))
-                        if not _has_year_ref_fb and _faiss_hits:
-                            _faiss_hits = _filter_recent(_faiss_hits)
+                        # NOTE: _filter_recent skip — FAISS already returns relevant results;
+                        # applying 30-day filter here killed all 10 results in production.
+                        # Let the summariser handle recency context instead.
                         if _faiss_hits:
                             logger.info("Ticker FAISS fallback: %d results for %s",
                                         len(_faiss_hits), _tn_list)
@@ -617,6 +617,18 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
                     logger.info("Cause tracking: no %s-specific reports in %d, using all",
                                 ticker_name, len(search_results))
                     _ct_reports = search_results
+                # Low report count (<5): supplement with FAISS search for this ticker
+                if len(_ct_reports) < 5 and ticker_name:
+                    logger.info("Cause tracking: only %d reports, supplementing with FAISS", len(_ct_reports))
+                    _ct_faiss = _report.search(f"{ticker_name} 증권사 리포트", top_k=15)
+                    if _ct_faiss:
+                        _ct_existing_ids = {r.get("report_id", "") for r in _ct_reports}
+                        for _cf in _ct_faiss:
+                            _cf_id = _cf.get("report_id", "")
+                            if _cf_id and _cf_id not in _ct_existing_ids:
+                                _ct_reports.append(_cf)
+                                _ct_existing_ids.add(_cf_id)
+                        logger.info("Cause tracking: supplemented -> %d reports total", len(_ct_reports))
                 else:
                     logger.info("Cause tracking: filtered %d -> %d reports for %s",
                                 len(search_results), len(_ct_reports), ticker_name)
