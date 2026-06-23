@@ -43,6 +43,69 @@ AWS_REGION = os.environ.get("AWS_REGION", "ap-northeast-2")
 AGENT_ENABLED = os.environ.get("OPIK_AGENT_ENABLED", "true").lower() != "false"
 
 
+def _source_refs(results: list) -> list:
+    refs = []
+    for r in results or []:
+        rid = r.get("report_id", "") if isinstance(r, dict) else str(r)
+        if not rid:
+            continue
+        ref = {"report_id": rid}
+        if isinstance(r, dict):
+            for key in ("url", "source_type", "rcept_no", "rcept_dt", "corp_name", "report_nm"):
+                if r.get(key):
+                    ref[key] = r.get(key)
+        refs.append(ref)
+    return refs
+
+
+def _source_labels(results: list) -> list:
+    labels = []
+    for r in results or []:
+        if isinstance(r, dict):
+            label = r.get("report_id", "")
+            if r.get("url"):
+                label = f"{label} ({r.get('url')})"
+            if label:
+                labels.append(label)
+        elif r:
+            labels.append(str(r))
+    return labels
+
+
+def _apply_dart_override_to_agent_intent(user_message: str, intent: str, params: dict) -> tuple:
+    """Apply the same deterministic DART override used by the v1 intent parser."""
+    try:
+        from intent_parser import IntentResult, apply_dart_intent_override
+        result = IntentResult({
+            "intent": intent,
+            "date_from": params.get("date_from"),
+            "date_to": params.get("date_to"),
+            "is_recent": params.get("is_recent", False),
+            "companies": params.get("ticker_names", []),
+            "stock_codes": params.get("stock_codes", []),
+            "securities": params.get("securities", []),
+            "search_query": params.get("search_query"),
+        })
+        fixed = apply_dart_intent_override(user_message, result)
+        if fixed.intent == intent:
+            return intent, params
+
+        new_params = dict(params)
+        new_params["date_from"] = fixed.date_from
+        new_params["date_to"] = fixed.date_to
+        new_params["is_recent"] = fixed.is_recent
+        if fixed.companies and not new_params.get("ticker_names"):
+            new_params["ticker_names"] = fixed.companies
+        if fixed.stock_codes:
+            new_params["stock_codes"] = fixed.stock_codes
+        new_params["search_query"] = fixed.search_query
+        logger.info("Agent DART intent override: %s -> %s", intent, fixed.intent)
+        return fixed.intent, new_params
+    except Exception as e:
+        logger.warning("Agent DART intent override failed: %s", e)
+        return intent, params
+
+
 def init_agents(faiss_index, report_ids: list, report_texts: dict, embedder):
     """Wire server globals into the agent singletons. Call after FAISS loads."""
     global _safety, _intent, _report, _dart, _analysis, _composer, _supervisor, _ready
@@ -284,6 +347,7 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
         intent_result = _intent.parse(user_message, conversation_context=_context)
         intent = intent_result["intent"]
         params = intent_result.get("intent_params", {})
+    intent, params = _apply_dart_override_to_agent_intent(user_message, intent, params)
 
     # Direct date extraction: "M월 D일" without year → (current_year)-MM-DD
     _md = __import__("re").search(r"(?<!\d)(\d{1,2})월\s*(\d{1,2})일", user_message)
@@ -372,7 +436,7 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
             logger.info("Using date-based browse for %s (%d results)", params["date_from"], len(search_results))
             if search_results:
                 answer = _format_date_browse(params["date_from"], search_results)
-                sources = [r.get("report_id", "") for r in search_results]
+                sources = _source_refs(search_results)
                 confidence = "high"
             else:
                 answer = f"해당 날짜({params['date_from']})의 증권사 리포트 데이터가 없습니다."
@@ -393,7 +457,7 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
                                 _before, len(search_results), _before - len(search_results))
             if search_results:
                 answer = _report.summarise(user_message, search_results)
-                sources = [r.get("report_id", "") for r in search_results]
+                sources = _source_refs(search_results)
                 confidence = "high"
             else:
                 ticker_names = params.get("ticker_names", [])
@@ -427,10 +491,10 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
             intent="report_search",
             report_summary=report_summary or None,
             analysis=analysis or None,
-            sources=[r.get("report_id", "") for r in search_results],
+            sources=_source_labels(search_results),
             confidence="medium",
         )
-        sources = [r.get("report_id", "") for r in search_results]
+        sources = _source_refs(search_results)
 
     elif route in ("dart_agent", "dart_with_analysis"):
         ticker_names = params.get("ticker_names", [])
@@ -468,7 +532,7 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
                 if _before > len(search_results):
                     logger.info("Recency filter (hybrid): %d → %d results", _before, len(search_results))
             report_summary = _report.summarise(user_message, search_results) if search_results else ""
-            sources = [r.get("report_id", "") for r in search_results]
+            sources = _source_refs(search_results)
 
         ticker_names = params.get("ticker_names", [])
         dart_result = _dart.query_disclosure_events(companies=ticker_names)
@@ -564,7 +628,8 @@ async def v2_chat_handler(req) -> dict:
     return {
         "answer": answer,
         "sources": [
-            {"report_id": s} for s in result.get("sources", [])
+            s if isinstance(s, dict) else {"report_id": s}
+            for s in result.get("sources", [])
         ],
         "elapsed_ms": round(result.get("elapsed_ms", (time.time() - t0) * 1000), 1),
         "intent": {

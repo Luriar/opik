@@ -22,6 +22,7 @@ from typing import Optional, List
 
 import boto3
 import numpy as np
+from source_links import source_url_from_metadata
 
 logger = logging.getLogger("opik.report_agent")
 
@@ -121,6 +122,12 @@ class ReportAgent:
                 "risks": info.get("risks"),
                 "year": info.get("year"),
                 "month": info.get("month"),
+                "source_type": info.get("source_type"),
+                "rcept_no": info.get("rcept_no"),
+                "rcept_dt": info.get("rcept_dt"),
+                "corp_name": info.get("corp_name"),
+                "report_nm": info.get("report_nm"),
+                "url": source_url_from_metadata(info),
             })
 
         logger.info("FAISS search: '%s' → %d results", query[:60], len(results))
@@ -216,12 +223,15 @@ class ReportAgent:
         # Build context from search results
         context_lines = []
         for r in search_results[:10]:
+            url = r.get("url") or source_url_from_metadata(r)
+            source_suffix = f" DART URL={url}" if url else ""
             context_lines.append(
                 f"[report_id={r['report_id']} score={r['score']:.3f}] "
                 f"종목코드={r.get('종목코드', 'N/A')} "
                 f"reason={r.get('reason', '정보 없음')} "
                 f"risks={r.get('risks', '정보 없음')} "
                 f"keywords={r.get('keywords', '정보 없음')}"
+                f"{source_suffix}"
             )
         context = "\n".join(context_lines)
 
