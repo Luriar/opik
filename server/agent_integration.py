@@ -123,7 +123,7 @@ _DATE_ONLY_PATTERNS = [
 ]
 
 
-def _filter_recent(results: list, max_days: int = 180) -> list:
+def _filter_recent(results: list, max_days: int = 30) -> list:
     """Filter search results to recent reports (within max_days).
 
     When no date/time_range is specified and the user hasn't asked for
@@ -298,6 +298,17 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
         if not params.get("ticker_names"):
             params["ticker_names"] = []
 
+    # --- FIX: Unified time_range → date_from conversion ---
+    # IntentAgent returns "time_range" (e.g. {"from": "2026-06-16", "to": "2026-06-23"})
+    # for "최근", "이번 주", "지난주" etc. But report_agent/report_with_analysis routes
+    # only check params["date_from"], not time_range. Convert here so all routes benefit.
+    _tr = params.get("time_range")
+    if _tr and not params.get("date_from"):
+        params["date_from"] = _tr.get("from")
+        params["date_to"] = _tr.get("to")
+        logger.info("Agent pipeline: time_range → date_from=%s date_to=%s",
+                     params["date_from"], params["date_to"])
+
     # --- BUGFIX 1: Pure date-only question detection ---
     # "오늘 며칠이야?", "며칠이냐?" etc. must NOT reach FAISS search.
     # Haiku intent parser miscategorises these as report_search, causing
@@ -435,10 +446,27 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
     elif route in ("dart_agent", "dart_with_analysis"):
         ticker_names = params.get("ticker_names", [])
         time_range = params.get("time_range")
+        # Use explicit date_from/date_to first (from regex extraction), fallback to time_range
+        date_from = params.get("date_from")
+        date_to = params.get("date_to")
+        if not date_from and time_range:
+            date_from = time_range.get("from")
+        if not date_to and time_range:
+            date_to = time_range.get("to")
+        # If still no date but interpret=True, try extracting from conversation context
+        if not date_from and not date_to and params.get("interpret") and conversation_context:
+            import re as _re2
+            _ctxt_dates = _re2.findall(r"(\d{1,2})월\s*(\d{1,2})일", conversation_context)
+            if _ctxt_dates:
+                _cy = str(__import__("datetime").datetime.now().year)
+                _last = _ctxt_dates[-1]
+                date_from = f"{_cy}-{_last[0].zfill(2)}-{_last[1].zfill(2)}"
+                date_to = date_from
+                logger.info("DART interpret: using context date %s", date_from)
         dart_result = _dart.query_disclosure_events(
             companies=ticker_names,
-            date_from=time_range.get("from") if time_range else None,
-            date_to=time_range.get("to") if time_range else None,
+            date_from=date_from,
+            date_to=date_to,
         )
 
         if params.get("interpret") and dart_result:
