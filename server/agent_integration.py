@@ -120,9 +120,9 @@ def _format_date_browse(date_from: str, date_to: str, results: list) -> str:
         # Show a number for easier scanning
         lines.append(f"{i+1}. {reason}")
         if kw:
-            lines.append(f"   🔑 {kw}")
+            lines.append(f"   Keyword: {kw}")
         if risk:
-            lines.append(f"   ⚠️  {risk}")
+            lines.append(f"   Risk: {risk}")
         lines.append("")
 
     if len(results) > 20:
@@ -139,6 +139,57 @@ _DATE_ONLY_PATTERNS = [
     "오늘은 며칠", "오늘이 며칠", "오늘 뭐냐", "날짜 알려줘",
     "오늘 몇일", "오늘이 몇일",
 ]
+
+
+def _sanitize_for_telegram(text: str) -> str:
+    """Convert common markdown to HTML for Telegram rendering (parse_mode=HTML).
+
+    LLMs (Sonnet, Haiku) output markdown but Telegram parse_mode is "HTML".
+    This converts the most common patterns so they render correctly instead
+    of showing raw ##, **, |---|---| markup.
+    """
+    if not text:
+        return text
+
+    # 1. Headings: ## heading or ### heading → <b>heading</b>
+    text = re.sub(r'^#{2,4}\s+(.+?)$', r'<b>\1</b>', text, flags=re.MULTILINE)
+    text = re.sub(r'^#\s+(.+?)$', r'<b>\1</b>', text, flags=re.MULTILINE)
+
+    # 2. Bold: **text** → <b>text</b>
+    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+
+    # 3. Italic: *text* → <i>text</i> (but not ** handled above)
+    text = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'<i>\1</i>', text)
+
+    # 4. Horizontal rules: --- or *** alone → empty line
+    text = re.sub(r'^[-*]{3,}\s*$', '', text, flags=re.MULTILINE)
+
+    # 5. Unordered lists: - item → · item
+    text = re.sub(r'^(\s*)-\s+', r'\1· ', text, flags=re.MULTILINE)
+
+    # 6. Table: convert markdown table to readable text
+    # | col | col | →  col | col (with header separator stripped)
+    lines = text.split('\n')
+    clean_lines = []
+    skip_next_sep = False
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith('|') and stripped.endswith('|'):
+            # Keep table rows as text (remove leading/trailing |)
+            is_sep = bool(re.match(r'^[\s|\-:]+$', stripped))
+            if is_sep:
+                skip_next_sep = True
+                continue
+            # Clean up cell edges
+            cells = [c.strip() for c in stripped.split('|') if c.strip()]
+            if cells:
+                clean_lines.append('  ' + ' | '.join(cells))
+        else:
+            clean_lines.append(line)
+    if clean_lines:
+        text = '\n'.join(clean_lines)
+
+    return text
 
 
 def _filter_recent(results: list, max_days: int = 30) -> list:
@@ -536,15 +587,26 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
                     answer = f"'{' '.join(_tn_list)}' 관련 최근 리포트를 찾을 수 없습니다."
                     sources = []
                     confidence = "low"
-                # Related-company context: group by ticker code
+                # Related-company context: group by ticker code, show company names
                 _ticker_groups = {}
+                _code_to_name = {}
+                # Try to load company name mapping from Delta
+                try:
+                    from agents.data_helper import read_gold_data
+                    _cm = read_gold_data("structured")
+                    if _cm is not None and len(_cm) > 0:
+                        _cm = _cm[["종목코드", "종목명"]].drop_duplicates(subset="종목코드")
+                        _code_to_name = dict(zip(_cm["종목코드"].astype(str), _cm["종목명"].astype(str)))
+                except Exception:
+                    pass
                 for r in search_results:
                     _tc = str(r.get("종목코드", "")).strip()
                     if _tc and _tc != "None":
                         if _tc not in _ticker_groups:
-                            _ticker_groups[_tc] = (_tc, (r.get("reason", "") or "").strip())
+                            _name = _code_to_name.get(_tc, _tc)
+                            _ticker_groups[_tc] = _name
                 if len(_ticker_groups) >= 3 and not params.get("ticker_names"):
-                    _ticker_list = [_v[0] for _v in list(_ticker_groups.values())[:8]]
+                    _ticker_list = list(_ticker_groups.values())[:8]
                     answer += f"\n\n📌 이 외에도 {', '.join(_ticker_list)} 등 {len(_ticker_groups)}개 종목의 리포트가 있습니다. 관심 종목명을 입력하시면 상세히 알려드립니다."
                 sources = [r.get("report_id", "") for r in search_results]
                 confidence = "high"
