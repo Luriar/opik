@@ -46,7 +46,7 @@ from conversation_store import store as conversation_store
 from source_links import source_line, source_url_from_metadata, strip_ungrounded_dart_urls
 
 # Phase 2a: LangGraph multi-agent framework (optional — toggled by OPIK_AGENT_ENABLED)
-from agent_integration import init_agents, v2_chat_handler, get_agent_status
+from agent_integration import init_agents, v2_chat_handler, get_agent_status, _sanitize_for_telegram
 
 # config
 S3_BUCKET = os.environ.get("S3_BUCKET", "s3-opik-bucket")
@@ -59,9 +59,6 @@ BEDROCK_MODEL = os.environ.get("BEDROCK_MODEL", "apac.anthropic.claude-3-haiku-2
 SEARCH_TOP_K = int(os.environ.get("SEARCH_TOP_K", "10"))
 AGENT_ENABLED_STR = os.environ.get("OPIK_AGENT_ENABLED", "true")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-DART_RAG_EMBEDDING_PREFIX = (
-    "gold/dart/rag/embedding/model=intfloat_multilingual-e5-small/version=v1/"
-)
 
 from db import (upsert_subscriber, is_approved, approve_subscriber,
                 add_briefing_recipient, remove_briefing_recipient,
@@ -167,10 +164,18 @@ def _search_faiss_for_companies(companies: list, base_query: str, top_k: int = 2
                 if rid in seen_ids:
                     continue
                 seen_ids.add(rid)
-                all_results.append(_search_result_from_metadata(
-                    rid,
-                    score=round(float(distances[0][i]), 4),
-                ))
+                all_results.append(
+                    SearchResult(
+                        report_id=rid,
+                        score=round(float(distances[0][i]), 4),
+                        종목코드=report_texts.get(rid, {}).get("종목코드"),
+                        reason=report_texts.get(rid, {}).get("reason"),
+                        keywords=report_texts.get(rid, {}).get("keywords"),
+                        risks=report_texts.get(rid, {}).get("risks"),
+                        year=report_texts.get(rid, {}).get("year"),
+                        month=report_texts.get(rid, {}).get("month"),
+                    )
+                )
         except Exception as e:
             logger.warning("Multi-ticker search failed for %s: %s", company, e)
     
@@ -366,12 +371,6 @@ class SearchResult(BaseModel):
     risks: Optional[List[str]] = None
     year: Optional[int] = None
     month: Optional[int] = None
-    source_type: Optional[str] = None
-    rcept_no: Optional[str] = None
-    rcept_dt: Optional[str] = None
-    corp_name: Optional[str] = None
-    report_nm: Optional[str] = None
-    url: Optional[str] = None
 
 
 class SearchResponse(BaseModel):
@@ -405,34 +404,6 @@ class ChatResponse(BaseModel):
     # v2: conversation metadata
     context_full: bool = False
     turn_count: int = 0
-
-
-def _search_result_from_metadata(report_id: str, score: Optional[float] = None,
-                                 overrides: Optional[dict] = None) -> SearchResult:
-    info = report_texts.get(str(report_id), {}) or {}
-    data = {
-        "report_id": str(report_id),
-        "score": score,
-        "종목코드": info.get("종목코드"),
-        "reason": info.get("reason"),
-        "keywords": info.get("keywords"),
-        "risks": info.get("risks"),
-        "year": info.get("year"),
-        "month": info.get("month"),
-        "source_type": info.get("source_type"),
-        "rcept_no": info.get("rcept_no"),
-        "rcept_dt": info.get("rcept_dt"),
-        "corp_name": info.get("corp_name"),
-        "report_nm": info.get("report_nm"),
-        "url": source_url_from_metadata(info),
-    }
-    if overrides:
-        for key, value in overrides.items():
-            if value is not None:
-                data[key] = value
-    if not data.get("url"):
-        data["url"] = source_url_from_metadata(data)
-    return SearchResult(**data)
 
 
 # lifecycle
@@ -581,10 +552,18 @@ async def search(req: SearchRequest):
             continue
         rid = report_ids[idx]
         score = float(distances[0][i])
-        results.append(_search_result_from_metadata(
-            rid,
-            score=round(score, 4),
-        ))
+        results.append(
+            SearchResult(
+                report_id=rid,
+                score=round(score, 4),
+                종목코드=report_texts.get(rid, {}).get("종목코드"),
+                reason=report_texts.get(rid, {}).get("reason"),
+                keywords=report_texts.get(rid, {}).get("keywords"),
+                risks=report_texts.get(rid, {}).get("risks"),
+                year=report_texts.get(rid, {}).get("year"),
+                month=report_texts.get(rid, {}).get("month"),
+            )
+        )
 
     # date filter
     if req.date_from or req.date_to:
@@ -751,8 +730,6 @@ def _build_context(results: List[SearchResult], max_items: int = None) -> str:
         kw = _safe_join(info.get("keywords", r.keywords))
         rs = _safe_join(info.get("risks", r.risks))
         reason = info.get("reason", r.reason)
-        url = r.url or source_url_from_metadata(info)
-        source_ref = source_line({"url": url}, indent="") if url else ""
         if reason is not None and not isinstance(reason, str):
             reason = str(reason)
         corp_name = r.corp_name or info.get("corp_name") or ""
@@ -760,12 +737,9 @@ def _build_context(results: List[SearchResult], max_items: int = None) -> str:
             "[report_id: {}]\n".format(r.report_id) +
             "기업명: {}\n".format(corp_name) +
             "종목코드: {}\n".format(r.종목코드 or "") +
-            "공시번호: {}\n".format(r.rcept_no or info.get("rcept_no") or "") +
-            "공시명: {}\n".format(r.report_nm or info.get("report_nm") or "") +
             "투자이유: {}\n".format(reason or "") +
             "키워드: {}\n".format(kw) +
-            "리스크: {}\n".format(rs) +
-            source_ref
+            "리스크: {}\n".format(rs)
         )
     return "\n---\n".join(parts)
 
@@ -1133,10 +1107,18 @@ async def chat(req: ChatRequest):
                 if idx == -1 or idx >= len(report_ids):
                     continue
                 rid = report_ids[idx]
-                report_sources.append(_search_result_from_metadata(
-                    rid,
-                    score=round(float(distances[0][i]), 4),
-                ))
+                report_sources.append(
+                    SearchResult(
+                        report_id=rid,
+                        score=round(float(distances[0][i]), 4),
+                        종목코드=report_texts.get(rid, {}).get("종목코드"),
+                        reason=report_texts.get(rid, {}).get("reason"),
+                        keywords=report_texts.get(rid, {}).get("keywords"),
+                        risks=report_texts.get(rid, {}).get("risks"),
+                        year=report_texts.get(rid, {}).get("year"),
+                        month=report_texts.get(rid, {}).get("month"),
+                    )
+                )
 
             if date_from or date_to:
                 report_sources = _filter_by_date(report_sources, date_from, date_to)
@@ -1438,6 +1420,7 @@ async def v2_chat(req: ChatRequest):
 def _send_telegram(chat_id, text, parse_mode="HTML"):
     if not TELEGRAM_BOT_TOKEN:
         return False
+    text = _sanitize_for_telegram(text)
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         for i in range(0, len(text), 4000):
@@ -1533,8 +1516,15 @@ def _process_telegram_message(chat_id, text, username, first_name):
 
 
 def _telegram_polling_loop(stop_event):
+    # Persist offset so server restart doesn't re-process old messages
+    _offset_file = Path(__file__).resolve().parent / ".telegram_offset"
     offset = 0
-    logger.info("Telegram polling started")
+    try:
+        if _offset_file.exists():
+            offset = int(_offset_file.read_text().strip())
+    except Exception:
+        pass
+    logger.info("Telegram polling started (offset=%d)", offset)
     while not stop_event.is_set():
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
@@ -1547,6 +1537,11 @@ def _telegram_polling_loop(stop_event):
                 continue
             for upd in data.get("result", []):
                 offset = upd["update_id"] + 1
+                # Persist offset every processed message
+                try:
+                    _offset_file.write_text(str(offset))
+                except Exception:
+                    pass
                 msg = upd.get("message")
                 if not msg:
                     continue
@@ -1603,8 +1598,7 @@ async def index_status():
 def build_index_from_s3():
     global faiss_index, report_ids, report_texts
 
-    logger.info("Building FAISS index from S3: s3://%s/gold/embeddings/ + %s",
-                S3_BUCKET, DART_RAG_EMBEDDING_PREFIX)
+    logger.info("Building FAISS index from S3: s3://%s/gold/embeddings/", S3_BUCKET)
     s3 = boto3.client("s3", region_name=AWS_REGION)
 
     keys = []
@@ -1618,7 +1612,6 @@ def build_index_from_s3():
 
     all_embeddings = []
     all_ids = []
-    new_report_texts = {}
 
     for key in keys:
         try:
@@ -1636,16 +1629,15 @@ def build_index_from_s3():
                 if emb is None or len(emb) == 0:
                     continue
                 all_embeddings.append(np.array(emb, dtype=np.float32))
-                rid = str(row["report_id"])
+                rid = row["report_id"]
                 all_ids.append(rid)
-                new_report_texts[rid] = {
+                report_texts[rid] = {
                     "종목코드": row.get("종목코드"),
                     "reason": row.get("reason"),
                     "keywords": row.get("keywords"),
                     "risks": row.get("risks"),
                     "year": year,
                     "month": month,
-                    "source_type": "report",
                 }
         except Exception as e:
             logger.warning("Error reading %s: %s", key, e)
@@ -1753,15 +1745,4 @@ def build_index_from_s3():
     new_index = faiss.IndexIDMap(faiss.IndexFlatIP(dim))
     new_index.add_with_ids(vectors, ids)
 
-    os.makedirs(os.path.dirname(FAISS_INDEX_PATH), exist_ok=True)
-    faiss.write_index(new_index, FAISS_INDEX_PATH)
-    with open(FAISS_IDMAP_PATH, "w", encoding="utf-8") as f:
-        json.dump(all_ids, f, ensure_ascii=False)
-    with open("/data/opik/report_info.json", "w", encoding="utf-8") as f:
-        json.dump(new_report_texts, f, ensure_ascii=False, default=str)
-
-    faiss_index = new_index
-    report_ids = all_ids
-    report_texts = new_report_texts
-    logger.info("FAISS index built from S3: %d vectors, dim=%d", n, dim)
-    return n
+    os.makedirs
