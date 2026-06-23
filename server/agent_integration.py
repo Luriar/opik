@@ -99,7 +99,8 @@ def _format_date_browse(date_from: str, date_to: str, results: list) -> str:
     if date_from == date_to:
         date_label = date_from
     else:
-        date_label = f"{date_from} ~ {date_to}"
+        # When showing a range (e.g. "최근" = 90 days), highlight latest date
+        date_label = f"최근 ({date_from} ~ {date_to}, {date_to} 기준)"
     lines = [f"*{date_label} 증권사 리포트* ({len(results)}건)", ""]
     for r in results[:20]:
         reason = r.get("reason", "") or ""
@@ -368,6 +369,19 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
             "elapsed_ms": _elapsed,
         }
 
+    # --- FIX: Auto-date for ticker queries without date ---
+    # When user asks about a specific company without specifying date range,
+    # default to last 90 days so FAISS/date search has something to work with.
+    _tn = params.get("ticker_names", [])
+    if _tn and not params.get("date_from") and "최근" not in user_message and "오늘" not in user_message:
+        _now = __import__("datetime").datetime.now()
+        _three_mo_ago = (_now - __import__("datetime").timedelta(days=90)).strftime("%Y-%m-%d")
+        _today = _now.strftime("%Y-%m-%d")
+        logger.info("Agent pipeline: ticker query without date -> default 90-day range %s~%s",
+                     _three_mo_ago, _today)
+        params["date_from"] = _three_mo_ago
+        params["date_to"] = _today
+
     # --- FIX: Disclosure keyword triggers ---
     # When user copy-pastes from chatbot's disclosure table or asks about
     # specific disclosure events, IntentAgent often misclassifies as "general".
@@ -578,13 +592,21 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
                     logger.warning("Cause tracking dart error: %s", _ce)
             analysis = _analysis.trace_cause(ticker_name, "최근 1주일", search_results, _dart_events)
 
-        answer = _composer.compose_chat_response(
-            intent="report_search",
-            report_summary=report_summary or None,
-            analysis=analysis or None,
-            sources=[r.get("report_id", "") for r in search_results],
-            confidence="medium",
-        )
+        if params.get("cause_tracking") and analysis:
+            # Cause tracking: build focused response front and center
+            answer = f"## 📈 {ticker_name} 주가 변동 원인 분석\n\n{analysis}"
+            if params.get("date_from"):
+                answer += f"\n\n---\n\n*분석 기간: {params['date_from']} ~ {params.get('date_to', params['date_from'])}*"
+                answer += f"\n*참고 리포트: {len(search_results)}건*"
+            answer += "\n\n※ 본 분석은 AI 추론이며 투자 권유가 아닙니다."
+        else:
+            answer = _composer.compose_chat_response(
+                intent="report_search",
+                report_summary=report_summary or None,
+                analysis=analysis or None,
+                sources=[r.get("report_id", "") for r in search_results],
+                confidence="medium",
+            )
         sources = [r.get("report_id", "") for r in search_results]
 
     elif route in ("dart_agent", "dart_with_analysis"):
