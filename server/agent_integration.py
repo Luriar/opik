@@ -91,31 +91,43 @@ def get_agent_status() -> dict:
 
 
 def _format_date_browse(date_from: str, date_to: str, results: list) -> str:
-    """Format date-based browse results directly — no LLM summarise needed."""
+    """Format date-based browse results — clean, readable output."""
     if not results:
         return f"해당 날짜({date_from}~{date_to})의 증권사 리포트 데이터가 없습니다."
 
-    # Show date range, or single date if from==to
     if date_from == date_to:
         date_label = date_from
     else:
-        # When showing a range (e.g. "최근" = 90 days), highlight latest date
         date_label = f"최근 ({date_from} ~ {date_to}, {date_to} 기준)"
-    lines = [f"*{date_label} 증권사 리포트* ({len(results)}건)", ""]
-    for r in results[:20]:
+
+    lines = [f"📊 {date_label} 증권사 리포트 ({len(results)}건)", ""]
+
+    def _clean_list(val):
+        """Convert Python list str/repr to clean comma-separated text."""
+        if not val or val in ("None", "[]"):
+            return ""
+        if isinstance(val, list):
+            items = [str(x).strip("'\"") for x in val if x]
+            return ", ".join(items) if items else ""
+        s = str(val).strip("[]")
+        items = [x.strip().strip("'\"") for x in s.split(",") if x.strip()]
+        return ", ".join(items) if items else ""
+
+    for i, r in enumerate(results[:20]):
         reason = r.get("reason", "") or ""
-        kw = r.get("keywords", "") or ""
-        risk = r.get("risks", "") or ""
-        lines.append(f"• {reason}")
+        kw = _clean_list(r.get("keywords", ""))
+        risk = _clean_list(r.get("risks", ""))
+        # Show a number for easier scanning
+        lines.append(f"{i+1}. {reason}")
         if kw:
-            lines.append(f"  키워드: {kw}")
+            lines.append(f"   🔑 {kw}")
         if risk:
-            lines.append(f"  리스크: {risk}")
+            lines.append(f"   ⚠️  {risk}")
         lines.append("")
 
     if len(results) > 20:
-        lines.append(f"... 외 {len(results) - 20}건")
-    lines.append("※ 본 정보는 증권사 리포트의 사실적 요약이며 투자 권유가 아닙니다.")
+        lines.append(f"… 외 {len(results) - 20}건 생략")
+    lines.append("※ 증권사 리포트 요약이며 투자 권유가 아닙니다.")
     return "\n".join(lines)
 
 
@@ -529,13 +541,11 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
                 for r in search_results:
                     _tc = str(r.get("종목코드", "")).strip()
                     if _tc and _tc != "None":
-                        _tn = (r.get("reason", "") or "")[:80]
                         if _tc not in _ticker_groups:
-                            _ticker_groups[_tc] = _tn
+                            _ticker_groups[_tc] = (_tc, (r.get("reason", "") or "").strip())
                 if len(_ticker_groups) >= 3 and not params.get("ticker_names"):
-                    _ticker_list = list(_ticker_groups.values())[:5]
-                    _more = f" (+{len(_ticker_groups)-5}종목)" if len(_ticker_groups) > 5 else ""
-                    answer += f"\n\n[관련 기업 현황] {', '.join(_ticker_list)}{_more} 등 {len(_ticker_groups)}종목의 리포트가 있습니다. 특정 종목에 대해 더 자세히 알고 싶으시면 종목명을 말씀해주세요."
+                    _ticker_list = [_v[0] for _v in list(_ticker_groups.values())[:8]]
+                    answer += f"\n\n📌 이 외에도 {', '.join(_ticker_list)} 등 {len(_ticker_groups)}개 종목의 리포트가 있습니다. 관심 종목명을 입력하시면 상세히 알려드립니다."
                 sources = [r.get("report_id", "") for r in search_results]
                 confidence = "high"
             else:
