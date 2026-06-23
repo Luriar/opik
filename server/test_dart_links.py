@@ -11,6 +11,7 @@ sys.modules.setdefault("pyarrow", types.ModuleType("pyarrow"))
 sys.modules.setdefault("pyarrow.parquet", types.ModuleType("pyarrow.parquet"))
 
 from dart_query import _dart_view_url, _source_line, _source_url_for_row
+from source_links import source_url_from_metadata
 
 
 class DartSourceLinkTest(unittest.TestCase):
@@ -36,7 +37,18 @@ class DartSourceLinkTest(unittest.TestCase):
 
         self.assertEqual(
             _source_line(row),
-            "\n  원문: https://dart.fss.or.kr/dsaf001/main.do?rcpNo=20260101000001",
+            "\n  DART URL: https://dart.fss.or.kr/dsaf001/main.do?rcpNo=20260101000001",
+        )
+
+    def test_embedding_metadata_prefers_preserved_url(self):
+        metadata = {
+            "rcept_no": "20260101000001",
+            "source_url": "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=from-gold",
+        }
+
+        self.assertEqual(
+            source_url_from_metadata(metadata),
+            "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=from-gold",
         )
 
 

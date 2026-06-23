@@ -23,6 +23,13 @@ import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 
+from source_links import (
+    dart_view_url as _shared_dart_view_url,
+    first_non_empty as _shared_first_non_empty,
+    source_line as _shared_source_line,
+    source_url_from_metadata as _shared_source_url_from_metadata,
+)
+
 logger = logging.getLogger("opik.dart")
 
 S3_BUCKET = "s3-opik-bucket"
@@ -197,36 +204,19 @@ def _fmt_won(val):
 
 def _dart_view_url(rcept_no) -> Optional[str]:
     """Build the DART filing viewer URL from a receipt number."""
-    s = str(rcept_no or "").strip()
-    if not s or s.lower() in {"nan", "none", "null", "-"}:
-        return None
-    return f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={s}"
+    return _shared_dart_view_url(rcept_no)
 
 
 def _first_non_empty(row, *fields) -> Optional[str]:
-    for field in fields:
-        if field in row:
-            value = row.get(field)
-            if not _is_null(value):
-                text = str(value).strip()
-                if text and text.lower() not in {"nan", "none", "null", "-"}:
-                    return text
-    return None
+    return _shared_first_non_empty(row, *fields)
 
 
 def _source_url_for_row(row) -> Optional[str]:
-    return _first_non_empty(
-        row,
-        "dart_view_url",
-        "outer_dart_view_url",
-        "source_url",
-        "source_uri",
-    ) or _dart_view_url(row.get("rcept_no"))
+    return _shared_source_url_from_metadata(row)
 
 
 def _source_line(row, indent: str = "  ") -> str:
-    url = _source_url_for_row(row)
-    return f"\n{indent}원문: {url}" if url else ""
+    return _shared_source_line(row, indent=indent)
 
 
 _FINANCIAL_KEY_ACCOUNTS = [

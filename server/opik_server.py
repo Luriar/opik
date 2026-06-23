@@ -43,6 +43,7 @@ from dart_query import query_dart as query_dart_engine
 
 # Conversation memory — session-based context management (v2)
 from conversation_store import store as conversation_store
+from source_links import source_line, source_url_from_metadata
 
 # Phase 2a: LangGraph multi-agent framework (optional — toggled by OPIK_AGENT_ENABLED)
 from agent_integration import init_agents, v2_chat_handler, get_agent_status
@@ -58,6 +59,9 @@ BEDROCK_MODEL = os.environ.get("BEDROCK_MODEL", "apac.anthropic.claude-3-haiku-2
 SEARCH_TOP_K = int(os.environ.get("SEARCH_TOP_K", "10"))
 AGENT_ENABLED_STR = os.environ.get("OPIK_AGENT_ENABLED", "true")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+DART_RAG_EMBEDDING_PREFIX = (
+    "gold/dart/rag/embedding/model=intfloat_multilingual-e5-small/version=v1/"
+)
 
 from db import (upsert_subscriber, is_approved, approve_subscriber,
                 add_briefing_recipient, remove_briefing_recipient,
@@ -163,18 +167,10 @@ def _search_faiss_for_companies(companies: list, base_query: str, top_k: int = 2
                 if rid in seen_ids:
                     continue
                 seen_ids.add(rid)
-                all_results.append(
-                    SearchResult(
-                        report_id=rid,
-                        score=round(float(distances[0][i]), 4),
-                        종목코드=report_texts.get(rid, {}).get("종목코드"),
-                        reason=report_texts.get(rid, {}).get("reason"),
-                        keywords=report_texts.get(rid, {}).get("keywords"),
-                        risks=report_texts.get(rid, {}).get("risks"),
-                        year=report_texts.get(rid, {}).get("year"),
-                        month=report_texts.get(rid, {}).get("month"),
-                    )
-                )
+                all_results.append(_search_result_from_metadata(
+                    rid,
+                    score=round(float(distances[0][i]), 4),
+                ))
         except Exception as e:
             logger.warning("Multi-ticker search failed for %s: %s", company, e)
     
@@ -370,6 +366,12 @@ class SearchResult(BaseModel):
     risks: Optional[List[str]] = None
     year: Optional[int] = None
     month: Optional[int] = None
+    source_type: Optional[str] = None
+    rcept_no: Optional[str] = None
+    rcept_dt: Optional[str] = None
+    corp_name: Optional[str] = None
+    report_nm: Optional[str] = None
+    url: Optional[str] = None
 
 
 class SearchResponse(BaseModel):
@@ -403,6 +405,34 @@ class ChatResponse(BaseModel):
     # v2: conversation metadata
     context_full: bool = False
     turn_count: int = 0
+
+
+def _search_result_from_metadata(report_id: str, score: Optional[float] = None,
+                                 overrides: Optional[dict] = None) -> SearchResult:
+    info = report_texts.get(str(report_id), {}) or {}
+    data = {
+        "report_id": str(report_id),
+        "score": score,
+        "종목코드": info.get("종목코드"),
+        "reason": info.get("reason"),
+        "keywords": info.get("keywords"),
+        "risks": info.get("risks"),
+        "year": info.get("year"),
+        "month": info.get("month"),
+        "source_type": info.get("source_type"),
+        "rcept_no": info.get("rcept_no"),
+        "rcept_dt": info.get("rcept_dt"),
+        "corp_name": info.get("corp_name"),
+        "report_nm": info.get("report_nm"),
+        "url": source_url_from_metadata(info),
+    }
+    if overrides:
+        for key, value in overrides.items():
+            if value is not None:
+                data[key] = value
+    if not data.get("url"):
+        data["url"] = source_url_from_metadata(data)
+    return SearchResult(**data)
 
 
 # lifecycle
@@ -551,18 +581,10 @@ async def search(req: SearchRequest):
             continue
         rid = report_ids[idx]
         score = float(distances[0][i])
-        results.append(
-            SearchResult(
-                report_id=rid,
-                score=round(score, 4),
-                종목코드=report_texts.get(rid, {}).get("종목코드"),
-                reason=report_texts.get(rid, {}).get("reason"),
-                keywords=report_texts.get(rid, {}).get("keywords"),
-                risks=report_texts.get(rid, {}).get("risks"),
-                year=report_texts.get(rid, {}).get("year"),
-                month=report_texts.get(rid, {}).get("month"),
-            )
-        )
+        results.append(_search_result_from_metadata(
+            rid,
+            score=round(score, 4),
+        ))
 
     # date filter
     if req.date_from or req.date_to:
@@ -597,6 +619,7 @@ Answer investment questions based on provided data (analyst reports and/or DART 
 Rules:
 - Answer only based on the provided content. Do not speculate beyond the data.
 - Cite sources (report_id or disclosure number) in your answer.
+- If a DART item includes "DART URL:", show that exact URL below the corresponding item.
 - Write answers in Korean, deliver the key point first then explain details.
 - Present investment opinions (Buy/Sell/Hold) as stated in the reports, do not give direct trading advice.
 - For financial data (revenue, profit, etc.), provide exact figures from the DART data.
@@ -679,14 +702,19 @@ def _build_context(results: List[SearchResult], max_items: int = None) -> str:
         kw = _safe_join(info.get("keywords", r.keywords))
         rs = _safe_join(info.get("risks", r.risks))
         reason = info.get("reason", r.reason)
+        url = r.url or source_url_from_metadata(info)
+        source_ref = source_line({"url": url}, indent="") if url else ""
         if reason is not None and not isinstance(reason, str):
             reason = str(reason)
         parts.append(
             "[report_id: {}]\n".format(r.report_id) +
             "종목코드: {}\n".format(r.종목코드 or "") +
+            "공시번호: {}\n".format(r.rcept_no or info.get("rcept_no") or "") +
+            "공시명: {}\n".format(r.report_nm or info.get("report_nm") or "") +
             "투자이유: {}\n".format(reason or "") +
             "키워드: {}\n".format(kw) +
-            "리스크: {}\n".format(rs)
+            "리스크: {}\n".format(rs) +
+            source_ref
         )
     return "\n---\n".join(parts)
 
@@ -1054,18 +1082,10 @@ async def chat(req: ChatRequest):
                 if idx == -1 or idx >= len(report_ids):
                     continue
                 rid = report_ids[idx]
-                report_sources.append(
-                    SearchResult(
-                        report_id=rid,
-                        score=round(float(distances[0][i]), 4),
-                        종목코드=report_texts.get(rid, {}).get("종목코드"),
-                        reason=report_texts.get(rid, {}).get("reason"),
-                        keywords=report_texts.get(rid, {}).get("keywords"),
-                        risks=report_texts.get(rid, {}).get("risks"),
-                        year=report_texts.get(rid, {}).get("year"),
-                        month=report_texts.get(rid, {}).get("month"),
-                    )
-                )
+                report_sources.append(_search_result_from_metadata(
+                    rid,
+                    score=round(float(distances[0][i]), 4),
+                ))
 
             if date_from or date_to:
                 report_sources = _filter_by_date(report_sources, date_from, date_to)
@@ -1522,7 +1542,8 @@ async def index_status():
 def build_index_from_s3():
     global faiss_index, report_ids, report_texts
 
-    logger.info("Building FAISS index from S3: s3://%s/gold/embeddings/", S3_BUCKET)
+    logger.info("Building FAISS index from S3: s3://%s/gold/embeddings/ + %s",
+                S3_BUCKET, DART_RAG_EMBEDDING_PREFIX)
     s3 = boto3.client("s3", region_name=AWS_REGION)
 
     keys = []
@@ -1536,6 +1557,7 @@ def build_index_from_s3():
 
     all_embeddings = []
     all_ids = []
+    new_report_texts = {}
 
     for key in keys:
         try:
@@ -1553,18 +1575,89 @@ def build_index_from_s3():
                 if emb is None or len(emb) == 0:
                     continue
                 all_embeddings.append(np.array(emb, dtype=np.float32))
-                rid = row["report_id"]
+                rid = str(row["report_id"])
                 all_ids.append(rid)
-                report_texts[rid] = {
+                new_report_texts[rid] = {
                     "종목코드": row.get("종목코드"),
                     "reason": row.get("reason"),
                     "keywords": row.get("keywords"),
                     "risks": row.get("risks"),
                     "year": year,
                     "month": month,
+                    "source_type": "report",
                 }
         except Exception as e:
             logger.warning("Error reading %s: %s", key, e)
+
+    keys_dart = []
+    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=DART_RAG_EMBEDDING_PREFIX):
+        for obj in page.get("Contents", []):
+            if obj["Key"].endswith(".parquet"):
+                keys_dart.append(obj["Key"])
+    logger.info("Found %d DART embedding parquet files", len(keys_dart))
+
+    dart_loaded = 0
+    for key in keys_dart:
+        try:
+            ym = re.search(r"rcept_year=(\d{4})/rcept_month=(\d{2})", key)
+            year = int(ym.group(1)) if ym else None
+            month = int(ym.group(2)) if ym else None
+
+            obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
+            buf = io.BytesIO(obj["Body"].read())
+            table = pq.read_table(buf)
+            df = table.to_pandas()
+
+            for _, row in df.iterrows():
+                is_latest = row.get("is_latest")
+                if is_latest is None or not bool(is_latest):
+                    continue
+                valid_to = row.get("valid_to")
+                if valid_to is not None and str(valid_to) != "None":
+                    continue
+
+                emb = row["embedding"]
+                if emb is None or len(emb) == 0:
+                    continue
+
+                chunk_id = str(row["chunk_id"])
+                all_embeddings.append(np.array(emb, dtype=np.float32))
+                all_ids.append(chunk_id)
+
+                rcept_no = str(row.get("rcept_no", "")) if row.get("rcept_no") is not None else ""
+                rcept_dt = str(row.get("rcept_dt", "")) if row.get("rcept_dt") is not None else ""
+                base_type = str(row.get("base_report_type", "")) if row.get("base_report_type") is not None else ""
+                dart_kw = row.get("keywords")
+                source_url = source_url_from_metadata(row)
+                reason_parts = [f"[DART {base_type}]"]
+                if rcept_dt:
+                    reason_parts.append(f"접수일: {rcept_dt}")
+                if rcept_no:
+                    reason_parts.append(f"공시번호: {rcept_no}")
+
+                new_report_texts[chunk_id] = {
+                    "종목코드": str(row.get("stock_code", "")) if row.get("stock_code") is not None else None,
+                    "reason": " ".join(reason_parts),
+                    "keywords": [str(x) for x in dart_kw] if dart_kw is not None and len(dart_kw) > 0 else None,
+                    "risks": None,
+                    "year": year,
+                    "month": month,
+                    "source_type": "dart",
+                    "rcept_no": rcept_no or None,
+                    "rcept_dt": rcept_dt or None,
+                    "corp_code": str(row.get("corp_code", "")) if row.get("corp_code") is not None else None,
+                    "corp_name": str(row.get("corp_name", "")) if row.get("corp_name") is not None else None,
+                    "report_nm": str(row.get("report_nm", "")) if row.get("report_nm") is not None else None,
+                    "base_report_type": base_type or None,
+                    "dart_view_url": source_url,
+                    "source_url": source_url,
+                    "source_uri": str(row.get("source_uri", "")) if row.get("source_uri") is not None else None,
+                }
+                dart_loaded += 1
+        except Exception as e:
+            logger.warning("Error reading DART %s: %s", key, e)
+
+    logger.info("Loaded DART embeddings: %d", dart_loaded)
 
     n = len(all_embeddings)
     if n == 0:
@@ -1585,9 +1678,10 @@ def build_index_from_s3():
     with open(FAISS_IDMAP_PATH, "w", encoding="utf-8") as f:
         json.dump(all_ids, f, ensure_ascii=False)
     with open("/data/opik/report_info.json", "w", encoding="utf-8") as f:
-        json.dump(report_texts, f, ensure_ascii=False, default=str)
+        json.dump(new_report_texts, f, ensure_ascii=False, default=str)
 
     faiss_index = new_index
     report_ids = all_ids
+    report_texts = new_report_texts
     logger.info("FAISS index built from S3: %d vectors, dim=%d", n, dim)
     return n

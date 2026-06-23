@@ -18,6 +18,10 @@ FILES = [
     ("agent_integration.py", f"{BASE_DIR}/agent_integration.py"),
     ("conversation_store.py", f"{BASE_DIR}/conversation_store.py"),
     ("dart_query.py", f"{BASE_DIR}/dart_query.py"),
+    # Shared DART source-URL helpers. Imported at module top by opik_server.py,
+    # dart_query.py and agents/report_agent.py — omitting it crashes startup
+    # (ModuleNotFoundError) and the front proxy returns 502.
+    ("source_links.py", f"{BASE_DIR}/source_links.py"),
     ("prompts/system.md", f"{BASE_DIR}/prompts/system.md"),
     ("prompts/intent_parser.md", f"{BASE_DIR}/prompts/intent_parser.md"),
     ("prompts/answer_generator.md", f"{BASE_DIR}/prompts/answer_generator.md"),

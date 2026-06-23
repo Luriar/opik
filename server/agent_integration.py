@@ -457,6 +457,8 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
             if search_results:
                 # If ticker_names specified, filter results by ticker name match
                 _tn_list = params.get("ticker_names", [])
+                _faiss_fallback_used = False
+                _faiss_hits = []
                 if _tn_list:
                     _filtered = []
                     for r in search_results:
@@ -473,10 +475,50 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
                                     len(search_results), len(_filtered), _tn_list)
                         search_results = _filtered
                     else:
-                        # Fallback: ticker not found by name -> show all results
-                        logger.info("Ticker filter: no match for %s in %d results, showing all",
+                        # Fallback: ticker not found by name in date-browse results
+                        # -> do a targeted FAISS search with the company name
+                        logger.info("Ticker filter: no match for %s in %d date results, trying FAISS",
                                     _tn_list, len(search_results))
-                answer = _format_date_browse(params["date_from"], params.get("date_to", params["date_from"]), search_results)
+                        _faiss_fallback_used = False
+                        _tk_query = " ".join(_tn_list) + " 리포트"
+                        _faiss_hits = _report.search(_tk_query, top_k=10)
+                        _has_year_ref_fb = bool(__import__("re").search(r"\b(20\d{2})년", user_message))
+                        if not _has_year_ref_fb and _faiss_hits:
+                            _faiss_hits = _filter_recent(_faiss_hits)
+                        if _faiss_hits:
+                            logger.info("Ticker FAISS fallback: %d results for %s",
+                                        len(_faiss_hits), _tn_list)
+                            # Rebuild answer from FAISS results
+                            report_summary_fb = _report.summarise(user_message, _faiss_hits)
+                            # Auto-compare for FAISS results too
+                            _fb_brokerages = set()
+                            for _fr in _faiss_hits:
+                                _fb = _fr.get("증권사") or _fr.get("brokerage", "")
+                                if _fb:
+                                    _fb_brokerages.add(_fb)
+                            analysis_fb = ""
+                            if len(_fb_brokerages) >= 2 and len(_faiss_hits) >= 2:
+                                analysis_fb = _analysis.compare_reports(_faiss_hits, _tn_list[0] if _tn_list else "")
+                            if analysis_fb:
+                                answer = _composer.compose_chat_response(
+                                    intent="report_search",
+                                    report_summary=report_summary_fb,
+                                    analysis=analysis_fb,
+                                    sources=[_fr.get("report_id", "") for _fr in _faiss_hits],
+                                    confidence="medium",
+                                )
+                            else:
+                                answer = report_summary_fb
+                            sources = [_fr.get("report_id", "") for _fr in _faiss_hits]
+                            search_results = _faiss_hits
+                            _faiss_fallback_used = True
+                if not _faiss_fallback_used:
+                    answer = _format_date_browse(params["date_from"], params.get("date_to", params["date_from"]), search_results)
+                elif not _faiss_hits:
+                    # FAISS fallback also returned nothing
+                    answer = f"'{' '.join(_tn_list)}' 관련 최근 리포트를 찾을 수 없습니다."
+                    sources = []
+                    confidence = "low"
                 # Related-company context: group by ticker code
                 _ticker_groups = {}
                 for r in search_results:
@@ -561,6 +603,47 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
         if params.get("compare") and len(search_results) >= 2:
             analysis = _analysis.compare_reports(search_results, ticker_name)
         elif params.get("cause_tracking"):
+            # Filter reports to only those mentioning the ticker
+            _ct_reports = []
+            if ticker_name:
+                _tn_upper_ct = ticker_name.upper()
+                for r in search_results:
+                    _r_ct = (r.get("reason", "") or "").upper()
+                    _kw_ct = str(r.get("keywords", "") or "").upper()
+                    if _tn_upper_ct in (_r_ct + " " + _kw_ct):
+                        _ct_reports.append(r)
+                # Fallback: if no ticker-specific reports, use all
+                if not _ct_reports:
+                    logger.info("Cause tracking: no %s-specific reports in %d, using all",
+                                ticker_name, len(search_results))
+                    _ct_reports = search_results
+                else:
+                    logger.info("Cause tracking: filtered %d -> %d reports for %s",
+                                len(search_results), len(_ct_reports), ticker_name)
+            else:
+                _ct_reports = search_results
+
+            # Convert search_by_date results to format trace_cause expects
+            # search_by_date returns {report_id, reason: "[brokerage] title", keywords, year, month}
+            # trace_cause expects [{date, brokerage, summary}]
+            _report_events = []
+            for r in _ct_reports:
+                _reason = r.get("reason", "") or ""
+                _brokerage_ct = ""
+                # Extract brokerage from "[brokerage] title" format
+                if _reason.startswith("[") and "]" in _reason:
+                    _brokerage_ct = _reason[1:_reason.index("]")]
+                    _title_ct = _reason[_reason.index("]")+1:].strip()
+                else:
+                    _title_ct = _reason
+                _date_ct = f"{r.get('year', '')}-{str(r.get('month', '')).zfill(2)}"
+                _report_events.append({
+                    "date": _date_ct,
+                    "brokerage": _brokerage_ct,
+                    "summary": _title_ct[:200],
+                    "keywords": r.get("keywords", ""),
+                })
+
             # Fetch DART disclosures for richer cause analysis
             _dart_events = []
             if ticker_name:
@@ -570,7 +653,7 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
                         date_from=params.get("date_from"),
                         date_to=params.get("date_to"),
                     )
-                    if _de and "데이터가 없습니다" not in _de:
+                    if _de and "데이터가 없습니다" not in _de and len(str(_de)) > 80:
                         _lines = _de.strip().split("\n")
                         for _l in _lines:
                             if ":" in _l and len(_l) > 15:
@@ -590,7 +673,7 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
                                 len(_dart_events), ticker_name)
                 except Exception as _ce:
                     logger.warning("Cause tracking dart error: %s", _ce)
-            analysis = _analysis.trace_cause(ticker_name, "최근 1주일", search_results, _dart_events)
+            analysis = _analysis.trace_cause(ticker_name, "최근 1주일", _report_events, _dart_events)
 
         if params.get("cause_tracking") and analysis:
             # Cause tracking: build focused response front and center

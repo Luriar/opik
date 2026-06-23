@@ -14,6 +14,7 @@ Saves:
 """
 import io, json, os, sys, time, re
 import boto3, numpy as np, faiss, pyarrow.parquet as pq
+from source_links import source_url_from_metadata
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "s3-opik-bucket")
 OUT_DIR = "/data/opik"
@@ -130,6 +131,7 @@ for i, key in enumerate(keys_dart):
             rcept_dt = str(row.get("rcept_dt", ""))
             base_type = str(row.get("base_report_type", ""))
             dart_kw = row.get("keywords")
+            source_url = source_url_from_metadata(row)
 
             reason_parts = [f"[DART {base_type}]"]
             if rcept_dt:
@@ -145,6 +147,16 @@ for i, key in enumerate(keys_dart):
                 "risks": None,
                 "year": year,
                 "month": month,
+                "source_type": "dart",
+                "rcept_no": rcept_no or None,
+                "rcept_dt": rcept_dt or None,
+                "corp_code": str(row.get("corp_code", "")) if row.get("corp_code") is not None else None,
+                "corp_name": str(row.get("corp_name", "")) if row.get("corp_name") is not None else None,
+                "report_nm": str(row.get("report_nm", "")) if row.get("report_nm") is not None else None,
+                "base_report_type": base_type or None,
+                "dart_view_url": source_url,
+                "source_url": source_url,
+                "source_uri": str(row.get("source_uri", "")) if row.get("source_uri") is not None else None,
             }
             dart_loaded += 1
 
