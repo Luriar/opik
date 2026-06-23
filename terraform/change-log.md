@@ -799,3 +799,61 @@ terraform plan -var=repo_url=https://github.com/Luriar/opik.git -detailed-exitco
 - 현재 API EC2에는 SSM hotfix로 즉시 반영했다. 인스턴스가 교체되면 Git/배포 코드 기준으로 다시 적용되므로 `server/opik_server.py` 변경을 commit/push해야 유지된다.
 - `GOLD_PREFIX=gold/dart`는 DART/storage 계층용 env이고, 현재 FastAPI FAISS rebuild 코드는 `gold/embeddings/`를 하드코딩으로 읽는다. 이 동작은 현재 코드 기준 확인 내용이다.
 - 검색 결과의 일부 한글 필드명이 깨져 보이는 현상은 별도 인코딩/컬럼명 정리 이슈로 보인다. 이번 조치는 FAISS index 적재/검색 가능 상태 복구에 한정했다.
+## 2026-06-23 — Chat URL 접근 이슈 진단
+
+### Date
+
+2026-06-23
+
+### Goal
+
+- Terraform으로 배포된 FastAPI chat public URL 접근 불가 보고를 확인한다.
+- 현재 Terraform state 기준 public endpoint와 실제 AWS/HTTP 상태를 대조한다.
+
+### Current phase
+
+- 원인 확인 완료. 인프라 변경 없음.
+
+### Findings
+
+- 로컬 Terraform state 기준 현재 public chat URL은 `http://43.202.62.6`이다.
+- 기존 change-log에 기록된 `http://15.165.237.95`는 이전 front proxy IP이며 현재 타임아웃된다.
+- 현재 public entrypoint는 HTTPS가 아니라 HTTP다. `https://43.202.62.6/`는 타임아웃된다.
+- 웹 UI는 `GET http://43.202.62.6/`, API 호출은 `POST http://43.202.62.6/chat`이다.
+- `POST http://43.202.62.6/api/chat`는 현재 서버 코드 기준 존재하지 않아 HTTP 404가 정상이다.
+- Airflow UI는 별도 포트 `http://43.202.62.6:8080`이며 chat URL이 아니다.
+
+### Commands run
+
+- Local state output extraction from `terraform/envs/dev/terraform.tfstate`.
+- `Invoke-WebRequest http://43.202.62.6/`
+- `Invoke-WebRequest http://43.202.62.6/health`
+- `Invoke-WebRequest -Method POST http://43.202.62.6/chat`
+- `Invoke-WebRequest http://15.165.237.95/`
+- `Invoke-WebRequest https://43.202.62.6/`
+- `Invoke-WebRequest -Method POST http://43.202.62.6/api/chat`
+- `Invoke-WebRequest http://43.202.62.6:8080/health`
+- `aws sts get-caller-identity`
+- `aws ec2 describe-instances` for API, Airflow, and front proxy instances.
+
+### Validation result
+
+- `GET http://43.202.62.6/` → HTTP 200, `chat.html` 반환.
+- `GET http://43.202.62.6/health` → HTTP 200, `index_size=51662`.
+- `POST http://43.202.62.6/chat` → HTTP 200, JSON 응답 반환.
+- `GET http://43.202.62.6:8080/health` → HTTP 200, Airflow health JSON 반환.
+- `GET http://15.165.237.95/` → timeout.
+- `GET https://43.202.62.6/` → timeout.
+- `POST http://43.202.62.6/api/chat` → HTTP 404.
+
+### AWS verification result
+
+- AWS caller: `de-ai-02` in account `827913617635`.
+- API EC2 `i-081080e857262a5c0` is running, private IP `10.20.11.61`.
+- Airflow EC2 `i-0e82571b21cf68442` is running, private IP `10.20.10.73`.
+- Front proxy EC2 `i-0ad7a41e7a6fdab40` is running, public IP `43.202.62.6`.
+
+### Remaining blockers / next action
+
+- If a stable URL is required, attach an Elastic IP or put an ALB/Route53 name in front of the proxy. Current public IP changes whenever the front proxy instance is replaced.
+- If HTTPS is required, configure `certificate_arn` and an HTTPS-capable public entrypoint.

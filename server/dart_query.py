@@ -195,6 +195,40 @@ def _fmt_won(val):
     return f"{v//100_000_000:,}억원"
 
 
+def _dart_view_url(rcept_no) -> Optional[str]:
+    """Build the DART filing viewer URL from a receipt number."""
+    s = str(rcept_no or "").strip()
+    if not s or s.lower() in {"nan", "none", "null", "-"}:
+        return None
+    return f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={s}"
+
+
+def _first_non_empty(row, *fields) -> Optional[str]:
+    for field in fields:
+        if field in row:
+            value = row.get(field)
+            if not _is_null(value):
+                text = str(value).strip()
+                if text and text.lower() not in {"nan", "none", "null", "-"}:
+                    return text
+    return None
+
+
+def _source_url_for_row(row) -> Optional[str]:
+    return _first_non_empty(
+        row,
+        "dart_view_url",
+        "outer_dart_view_url",
+        "source_url",
+        "source_uri",
+    ) or _dart_view_url(row.get("rcept_no"))
+
+
+def _source_line(row, indent: str = "  ") -> str:
+    url = _source_url_for_row(row)
+    return f"\n{indent}원문: {url}" if url else ""
+
+
 _FINANCIAL_KEY_ACCOUNTS = [
     ("매출액", ["매출액"]),
     ("영업이익", ["영업이익(손실)"]),
@@ -328,6 +362,9 @@ def query_financials(companies, codes, date_from=None, date_to=None,
 
         lines.append(f"\n[{year}년] {reprt_code} ({fs_label})")
         lines.append(f"  접수일자: {rcept_dt}")
+        source_line = _source_line(grp.iloc[0])
+        if source_line:
+            lines.append(source_line.strip("\n"))
 
         for label, patterns in _FINANCIAL_KEY_ACCOUNTS:
             val = _find_account_value(grp, patterns)
@@ -433,6 +470,7 @@ def query_disclosure_events(companies, codes, date_from=None, date_to=None,
             f"{report_nm} | "
             f"유형: {category}\n"
             f"  내용: {text}"
+            f"{_source_line(row)}"
         )
 
     lines.append(f"\n[페이지 {page}/{total_pages}, 총 {total_count}건]")
@@ -550,6 +588,7 @@ def query_insider_transactions(companies, codes, date_from=None, date_to=None,
             f"{direction} {abs(irds):,}주 | "
             f"보유 {stkqy:,}주 | "
             f"사유: {report_resn}"
+            f"{_source_line(row)}"
         )
 
     lines.append(f"\n[페이지 {page}/{total_pages}, 총 {total_count}건]")
@@ -606,6 +645,7 @@ def query_major_shareholders(companies, codes, date_from=None, date_to=None,
             f"{repror} ({report_tp}) | "
             f"보유 {stkqy:,}주 ({stkrt:.2f}%){change_str} | "
             f"사유: {report_resn}"
+            f"{_source_line(row)}"
         )
 
     lines.append(f"\n[페이지 {page}/{total_pages}, 총 {total_count}건]")
