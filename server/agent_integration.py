@@ -90,12 +90,17 @@ def get_agent_status() -> dict:
     }
 
 
-def _format_date_browse(date_str: str, results: list) -> str:
+def _format_date_browse(date_from: str, date_to: str, results: list) -> str:
     """Format date-based browse results directly — no LLM summarise needed."""
     if not results:
-        return f"해당 날짜({date_str})의 증권사 리포트 데이터가 없습니다."
+        return f"해당 날짜({date_from}~{date_to})의 증권사 리포트 데이터가 없습니다."
 
-    lines = [f"*{date_str} 증권사 리포트* ({len(results)}건)", ""]
+    # Show date range, or single date if from==to
+    if date_from == date_to:
+        date_label = date_from
+    else:
+        date_label = f"{date_from} ~ {date_to}"
+    lines = [f"*{date_label} 증권사 리포트* ({len(results)}건)", ""]
     for r in results[:20]:
         reason = r.get("reason", "") or ""
         kw = r.get("keywords", "") or ""
@@ -442,8 +447,11 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
                     _filtered = []
                     for r in search_results:
                         _reason = (r.get("reason", "") or "").upper()
+                        _keywords = str(r.get("keywords", "") or "").upper()
+                        _search_text = _reason + " " + _keywords
                         for _tn in _tn_list:
-                            if _tn.upper() in _reason:
+                            _tn_upper = _tn.upper()
+                            if _tn_upper in _search_text:
                                 _filtered.append(r)
                                 break
                     if _filtered:
@@ -451,8 +459,10 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
                                     len(search_results), len(_filtered), _tn_list)
                         search_results = _filtered
                     else:
-                        search_results = _filtered  # empty list, will show no results
-                answer = _format_date_browse(params["date_from"], search_results)
+                        # Fallback: ticker not found by name -> show all results
+                        logger.info("Ticker filter: no match for %s in %d results, showing all",
+                                    _tn_list, len(search_results))
+                answer = _format_date_browse(params["date_from"], params.get("date_to", params["date_from"]), search_results)
                 # Related-company context: group by ticker code
                 _ticker_groups = {}
                 for r in search_results:
@@ -468,7 +478,7 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
                 sources = [r.get("report_id", "") for r in search_results]
                 confidence = "high"
             else:
-                answer = f"해당 날짜({params['date_from']})의 증권사 리포트 데이터가 없습니다."
+                answer = f"해당 날짜({params['date_from']}~{params.get('date_to', params['date_from'])})의 증권사 리포트 데이터가 없습니다."
                 sources = []
                 confidence = "low"
         else:
@@ -521,7 +531,7 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
         if params.get("date_from"):
             search_results = _report.search_by_date(params["date_from"], params["date_to"], limit=50)
             logger.info("Using date-based browse for %s (%d results)", params["date_from"], len(search_results))
-            report_summary = _format_date_browse(params["date_from"], search_results) if search_results else ""
+            report_summary = _format_date_browse(params["date_from"], params.get("date_to", params["date_from"]), search_results) if search_results else ""
         else:
             search_results = _report.search(user_message, top_k=10)
             _has_year_ref = bool(__import__("re").search(r"\b(20\d{2})년", user_message))
@@ -606,7 +616,7 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
         # Auto-interpret disclosures: users always want to know meaning.
         # - Explicit interpret=True -> detailed Sonnet analysis
         # - Default -> basic Haiku impact assessment
-        has_data = bool(dart_result and "데이터가 없습니다" not in dart_result)
+        has_data = bool(dart_result and "데이터가 없습니다" not in dart_result and len(str(dart_result)) > 80)
         if has_data:
             if params.get("interpret"):
                 interpretation = _dart.summarize_disclosure(dart_result, "")
@@ -623,7 +633,7 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
                     confidence="medium",
                 )
         else:
-            answer = dart_result
+            answer = dart_result or "해당 조건의 공시 데이터가 없습니다."
             confidence = "low"
 
     elif route == "hybrid_parallel":
@@ -632,7 +642,7 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
         if params.get("date_from") and not params.get("ticker_names"):
             search_results = _report.search_by_date(params["date_from"], params["date_to"], limit=50)
             logger.info("Using date-based browse for %s (%d results)", params["date_from"], len(search_results))
-            report_summary = _format_date_browse(params["date_from"], search_results) if search_results else ""
+            report_summary = _format_date_browse(params["date_from"], params.get("date_to", params["date_from"]), search_results) if search_results else ""
         else:
             search_results = _report.search(user_message, top_k=10)
             _has_year_ref = bool(__import__("re").search(r"\b(20\d{2})년", user_message))
