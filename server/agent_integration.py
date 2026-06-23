@@ -423,6 +423,11 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
     # Step 3: Route and execute
     route = _supervisor.route(True, intent, params)
 
+    # cause_tracking always routes to report_with_analysis (IntentAgent misclassifies "왜올랐어" as dart_query)
+    if params.get("cause_tracking") and route not in ("report_with_analysis",):
+        logger.info("Agent pipeline: cause_tracking=True overriding route %s -> report_with_analysis", route)
+        route = "report_with_analysis"
+
     logger.info("Agent pipeline: intent=%s route=%s compare=%s cause=%s interpret=%s",
                  intent, route,
                  params.get("compare"),
@@ -584,7 +589,83 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
                 confidence = "low"
 
     elif route == "report_with_analysis":
-        if params.get("date_from"):
+        ticker_name = params.get("ticker_names", [""])[0] if params.get("ticker_names") else ""
+
+        # --- CAUSE TRACKING: direct Delta query by ticker name ---
+        if params.get("cause_tracking") and ticker_name and params.get("date_from"):
+            _ct_from = params["date_from"]
+            _ct_to = params.get("date_to", _ct_from)
+            logger.info("Cause tracking: direct Delta query for %s (%s~%s)", ticker_name, _ct_from, _ct_to)
+            _report_events = []
+            try:
+                from agents.data_helper import read_gold_data
+                _df = read_gold_data("structured")
+                if _df is not None and len(_df) > 0 and "종목명" in _df.columns and "발행일" in _df.columns:
+                    _df["발행일"] = _df["발행일"].astype(str)
+                    _ct_dot_from = _ct_from.replace("-", ".")
+                    _ct_dot_to = _ct_to.replace("-", ".")
+                    _df = _df[_df["종목명"].str.contains(ticker_name.replace(" ", ""), na=False)]
+                    _df = _df[(_df["발행일"] >= _ct_dot_from) & (_df["발행일"] <= _ct_dot_to)]
+                    _df = _df.sort_values("발행일", ascending=False)
+                    logger.info("Cause tracking: Delta -> %d %s reports in range", len(_df), ticker_name)
+                    for _, row in _df.iterrows():
+                        _sec = str(row.get("증권사", "")) if row.get("증권사") is not None else ""
+                        _title = str(row.get("title", "")) if row.get("title") is not None else ""
+                        _opinion = str(row.get("투자의견", "")) if row.get("투자의견") is not None else ""
+                        _upside = row.get("상승여력_pct", None)
+                        _tp = row.get("목표주가", None)
+                        _date = str(row.get("발행일", ""))
+                        _report_events.append({
+                            "date": _date.replace(".", "-"),
+                            "brokerage": _sec,
+                            "summary": _title[:200] if _title else _sec,
+                            "opinion": _opinion if _opinion and _opinion not in ("nan", "None") else "",
+                            "upside": f"+{_upside:.1f}%" if _upside is not None and str(_upside) not in ("nan", "None", "") else "",
+                            "target_price": str(int(_tp)) if _tp is not None and str(_tp) not in ("nan", "None", "") else "",
+                        })
+            except Exception as _e:
+                logger.warning("Cause tracking Delta query failed: %s", _e)
+
+            if not _report_events:
+                # Fallback: FAISS targeted search
+                logger.info("Cause tracking: Delta empty, trying FAISS")
+                _ct_faiss = _report.search(f"{ticker_name} 증권사 리포트", top_k=20)
+                for r in (_ct_faiss or []):
+                    _r = r.get("reason", "") or ""
+                    _b = ""
+                    if _r.startswith("[") and "]" in _r:
+                        _b = _r[1:_r.index("]")]
+                        _s = _r[_r.index("]")+1:].strip()
+                    else:
+                        _s = _r
+                    _report_events.append({
+                        "date": f"{r.get('year', '')}-{str(r.get('month', '')).zfill(2)}",
+                        "brokerage": _b, "summary": _s[:200],
+                        "opinion": "", "upside": "", "target_price": "",
+                    })
+                if not _report_events:
+                    # Last resort: date-browse + ticker filter
+                    _db = _report.search_by_date(_ct_from, _ct_to, limit=50)
+                    for r in (_db or []):
+                        _r2 = r.get("reason", "") or ""
+                        if ticker_name.upper() not in (_r2.upper() + " " + str(r.get("keywords", "")).upper()):
+                            continue
+                        _b2 = ""
+                        if _r2.startswith("[") and "]" in _r2:
+                            _b2 = _r2[1:_r2.index("]")]
+                            _s2 = _r2[_r2.index("]")+1:].strip()
+                        else:
+                            _s2 = _r2
+                        _report_events.append({
+                            "date": f"{r.get('year', '')}-{str(r.get('month', '')).zfill(2)}",
+                            "brokerage": _b2, "summary": _s2[:200],
+                            "opinion": "", "upside": "", "target_price": "",
+                        })
+
+            search_results = [{"report_id": ""} for _ in _report_events]
+            report_summary = ""  # trace_cause output will be used instead
+
+        elif params.get("date_from"):
             search_results = _report.search_by_date(params["date_from"], params["date_to"], limit=50)
             logger.info("Using date-based browse for %s (%d results)", params["date_from"], len(search_results))
             report_summary = _format_date_browse(params["date_from"], params.get("date_to", params["date_from"]), search_results) if search_results else ""
@@ -597,64 +678,38 @@ def _run_agent_pipeline(user_message: str, session_id: str = "default") -> dict:
                 if _before > len(search_results):
                     logger.info("Recency filter (analysis): %d → %d results", _before, len(search_results))
             report_summary = _report.summarise(user_message, search_results) if search_results else ""
-        ticker_name = params.get("ticker_names", [""])[0] if params.get("ticker_names") else ""
 
         analysis = ""
         if params.get("compare") and len(search_results) >= 2:
             analysis = _analysis.compare_reports(search_results, ticker_name)
         elif params.get("cause_tracking"):
-            # Filter reports to only those mentioning the ticker
-            _ct_reports = []
-            if ticker_name:
-                _tn_upper_ct = ticker_name.upper()
-                for r in search_results:
-                    _r_ct = (r.get("reason", "") or "").upper()
-                    _kw_ct = str(r.get("keywords", "") or "").upper()
-                    if _tn_upper_ct in (_r_ct + " " + _kw_ct):
-                        _ct_reports.append(r)
-                # Fallback: if no ticker-specific reports, use all
-                if not _ct_reports:
-                    logger.info("Cause tracking: no %s-specific reports in %d, using all",
-                                ticker_name, len(search_results))
+            # _report_events was already built by Delta query block above
+            # Only fallback to search_results conversion if not populated
+            if "_report_events" not in locals() or not _report_events:
+                _ct_reports = []
+                if ticker_name:
+                    _tn_u = ticker_name.upper()
+                    for r in search_results:
+                        if _tn_u in ((r.get("reason", "") or "") + " " + str(r.get("keywords", "") or "")):
+                            _ct_reports.append(r)
+                    if not _ct_reports:
+                        _ct_reports = search_results
+                else:
                     _ct_reports = search_results
-                # Low report count (<5): supplement with FAISS search for this ticker
-                if len(_ct_reports) < 5 and ticker_name:
-                    logger.info("Cause tracking: only %d reports, supplementing with FAISS", len(_ct_reports))
-                    _ct_faiss = _report.search(f"{ticker_name} 증권사 리포트", top_k=15)
-                    if _ct_faiss:
-                        _ct_existing_ids = {r.get("report_id", "") for r in _ct_reports}
-                        for _cf in _ct_faiss:
-                            _cf_id = _cf.get("report_id", "")
-                            if _cf_id and _cf_id not in _ct_existing_ids:
-                                _ct_reports.append(_cf)
-                                _ct_existing_ids.add(_cf_id)
-                        logger.info("Cause tracking: supplemented -> %d reports total", len(_ct_reports))
-                else:
-                    logger.info("Cause tracking: filtered %d -> %d reports for %s",
-                                len(search_results), len(_ct_reports), ticker_name)
-            else:
-                _ct_reports = search_results
-
-            # Convert search_by_date results to format trace_cause expects
-            # search_by_date returns {report_id, reason: "[brokerage] title", keywords, year, month}
-            # trace_cause expects [{date, brokerage, summary}]
-            _report_events = []
-            for r in _ct_reports:
-                _reason = r.get("reason", "") or ""
-                _brokerage_ct = ""
-                # Extract brokerage from "[brokerage] title" format
-                if _reason.startswith("[") and "]" in _reason:
-                    _brokerage_ct = _reason[1:_reason.index("]")]
-                    _title_ct = _reason[_reason.index("]")+1:].strip()
-                else:
-                    _title_ct = _reason
-                _date_ct = f"{r.get('year', '')}-{str(r.get('month', '')).zfill(2)}"
-                _report_events.append({
-                    "date": _date_ct,
-                    "brokerage": _brokerage_ct,
-                    "summary": _title_ct[:200],
-                    "keywords": r.get("keywords", ""),
-                })
+                _report_events = []
+                for r in _ct_reports:
+                    _r = r.get("reason", "") or ""
+                    _b = ""
+                    if _r.startswith("[") and "]" in _r:
+                        _b = _r[1:_r.index("]")]
+                        _t = _r[_r.index("]")+1:].strip()
+                    else:
+                        _t = _r
+                    _report_events.append({
+                        "date": f"{r.get('year', '')}-{str(r.get('month', '')).zfill(2)}",
+                        "brokerage": _b, "summary": _t[:200],
+                        "keywords": r.get("keywords", ""),
+                    })
 
             # Fetch DART disclosures for richer cause analysis
             _dart_events = []
